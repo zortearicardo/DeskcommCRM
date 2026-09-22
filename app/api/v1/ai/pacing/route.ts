@@ -15,6 +15,10 @@ import { ok, fail } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { getRequestPool } from "@/lib/agent-engine/db/request-pool";
+import { janelaDeEnvioAberta, proximaAberturaDaJanela } from "@/lib/agent-engine/pacing/engine";
+import { acordarJobsAdiadosPorJanela } from "@/lib/agent-engine/pacing/aviso-de-janela";
+import { logger } from "@/lib/logger";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { PROVIDERS_DE_MENSAGEM } from "@/lib/channels/capabilities";
 import {
@@ -195,6 +199,36 @@ export async function PUT(req: NextRequest): Promise<Response> {
       return fail("internal_error", t("Falha ao salvar os knobs."), 500, {
         requestId,
         details: { motivo: upErr.message },
+      });
+    }
+
+    // Acorda jobs que dormiam pela janela ANTIGA — ver o cabeçalho de
+    // acordarJobsAdiadosPorJanela. Sem isto, "mudei a janela e não enviou" é o
+    // desfecho: o job represado só é reclamado na hora congelada da janela
+    // que estava valendo quando ele foi adiado, mesmo com a janela nova salva.
+    // Best-effort: os knobs JÁ foram salvos com sucesso acima; falhar em
+    // acordar jobs não pode derrubar essa resposta — o pior caso sem isto é o
+    // próximo turno de janela fechada acordar o job sozinho de qualquer jeito.
+    try {
+      const agora = new Date();
+      const novaAbertura = janelaDeEnvioAberta(agora, eff) ? agora : proximaAberturaDaJanela(agora, eff);
+      const acordados = await acordarJobsAdiadosPorJanela(getRequestPool(), {
+        tenantId: org.orgId,
+        channelSessionId: channel_session_id,
+        novaAbertura,
+      });
+      if (acordados > 0) {
+        logger.info("jobs represados pela janela anti-ban acordados após mudança de knobs", {
+          requestId,
+          channel_session_id,
+          acordados,
+        });
+      }
+    } catch (err) {
+      logger.warn("falha ao acordar jobs represados pela janela anti-ban — knobs já salvos", {
+        requestId,
+        channel_session_id,
+        error: err instanceof Error ? err.message : String(err),
       });
     }
   }

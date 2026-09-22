@@ -128,7 +128,11 @@ import { matchesHandoffKeyword } from './agent-config';
 import { msAteAJanelaAbrir } from './janela-de-atendimento';
 import { janelaDeEnvioAberta, proximaAberturaDaJanela } from '../pacing/engine';
 import { loadChannelKnobs } from '../pacing/store';
-import { avisarJanelaFechada, resolverAvisoDeJanela } from '../pacing/aviso-de-janela';
+import {
+  avisarJanelaFechada,
+  resolverAvisoDeJanela,
+  RAZAO_ADIAMENTO_POR_JANELA,
+} from '../pacing/aviso-de-janela';
 import { resolveConversationTurn, type TurnAgentResolution } from './resolve-turn-agent';
 import {
   hasOpenCaseForContact,
@@ -1945,7 +1949,7 @@ async function executarTurnoDoAgente(
       await rescheduleJob(pool, liveJob().id, ctx.workerId, {
         acquiredAt: claimOfJob(liveJob())?.acquired_at,
         delayMs: Math.max(abertura.getTime() - agora.getTime(), 1_000),
-        reason: 'fora da janela anti-ban de envio — turno adiado para a abertura',
+        reason: RAZAO_ADIAMENTO_POR_JANELA,
       });
       runLog.info('turno adiado — fora da janela anti-ban de envio', {
         janela: `${knobs.windowStartHour}h-${knobs.windowEndHour}h`,

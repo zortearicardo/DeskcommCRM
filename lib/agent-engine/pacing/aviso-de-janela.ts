@@ -50,6 +50,62 @@ import type { Queryable } from '../queue/queue';
 /** O `ref_kind` que identifica este aviso — a chave de dedup e de resolução. */
 export const REF_KIND_JANELA = 'janela_de_envio_fechada';
 
+/**
+ * O `last_error` gravado por `rescheduleJob` (queue.ts) quando `inbound-turn.ts`
+ * adia um turno por janela fechada — constante compartilhada, nunca string
+ * literal duplicada, porque `acordarJobsAdiadosPorJanela` abaixo depende de
+ * bater exatamente com o que foi gravado.
+ */
+export const RAZAO_ADIAMENTO_POR_JANELA =
+  'fora da janela anti-ban de envio — turno adiado para a abertura';
+
+/**
+ * Recalcula o `run_after` dos jobs que dormem por causa da janela ANTIGA.
+ *
+ * ## O defeito que isto conserta
+ *
+ * `rescheduleJob` grava um `run_after` CONGELADO, calculado com a janela
+ * vigente no INSTANTE do adiamento (`proximaAberturaDaJanela` em
+ * `inbound-turn.ts`). O worker só reclama o job quando esse timestamp vence
+ * (`claimJobs`, `run_after <= now()`). Salvar uma janela nova em Conexões ›
+ * Anti-ban (`PUT /api/v1/ai/pacing`) não toca essa coluna sozinho — então
+ * ampliar/adiantar a janela não acorda quem já estava dormindo com o
+ * `run_after` antigo. "Mudei a janela e não enviou" é exatamente esse
+ * sintoma: o job existe, está `pending`, e só vai ser reclamado na hora
+ * congelada da janela VELHA.
+ *
+ * Chamada pela rota logo após salvar os knobs, com a janela EFETIVA nova já
+ * calculada (`effectiveKnobs` + `janelaDeEnvioAberta`/`proximaAberturaDaJanela`
+ * do chamador).
+ *
+ * Só ADIANTA (`least`), nunca atrasa: apertar a janela empurrando pra mais
+ * tarde um job que já estava represado seria um efeito colateral que ninguém
+ * pediu ao salvar a tela — o próprio worker reavalia a janela no claim
+ * (`inbound-turn.ts`) e reagenda de novo se ainda estiver fechada.
+ *
+ * Devolve quantos jobs acordou (0 é o caso comum: nada represado).
+ */
+export async function acordarJobsAdiadosPorJanela(
+  db: Queryable,
+  input: { tenantId: string; channelSessionId: string; novaAbertura: Date },
+): Promise<number> {
+  const { rowCount } = await db.query(
+    `update job_queue
+        set run_after = least(run_after, $3::timestamptz)
+      where organization_id = $1
+        and status = 'pending'
+        and payload->>'channel_session_id' = $2
+        and last_error = $4`,
+    [
+      input.tenantId,
+      input.channelSessionId,
+      input.novaAbertura.toISOString(),
+      RAZAO_ADIAMENTO_POR_JANELA,
+    ],
+  );
+  return rowCount ?? 0;
+}
+
 export interface AvisoDeJanelaInput {
   tenantId: string;
   channelSessionId: string;
