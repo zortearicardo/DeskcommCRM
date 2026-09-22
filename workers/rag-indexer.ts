@@ -60,6 +60,26 @@ const LAG_WARN_MS = 5 * 60 * 1000;
 /** Sem chave, o evento volta daqui a uma hora. Tempo de alguém cadastrar. */
 const RETRY_SEM_CHAVE_MS = 60 * 60 * 1000;
 
+/**
+ * A OpenAI devolve isto quando a CHAVE existe mas o PROJETO dela não tem o
+ * modelo de embedding liberado (restrição em Settings › Project › Limits, ou
+ * projeto sem billing habilitado) — diferente de "sem_credencial", onde não
+ * há chave nenhuma. Sem esta tradução, o texto cru da API ("Project proj_...
+ * does not have access to model...") era tudo que o operador leigo via em
+ * "Por que não entrou", sem nenhuma pista do que fazer.
+ */
+function traduzirErroDeEmbedding(mensagem: string): string {
+  if (/does not have access to model/i.test(mensagem)) {
+    return (
+      "A chave da OpenAI não tem acesso ao modelo de embedding necessário. Em " +
+      "platform.openai.com › Settings › Projects, abra o projeto da chave e confirme " +
+      `em "Limits" que o modelo está liberado (ou gere uma chave sem essa restrição). ` +
+      `Detalhe original: ${mensagem}`
+    );
+  }
+  return mensagem;
+}
+
 // ---------------------------------------------------------------------------
 // Tipos
 // ---------------------------------------------------------------------------
@@ -400,7 +420,7 @@ export async function indexarFonte(
       });
       embedding = r.embedding;
     } catch (err) {
-      const detalhe = err instanceof Error ? err.message : String(err);
+      const detalhe = traduzirErroDeEmbedding(err instanceof Error ? err.message : String(err));
       await markVersionFailed(versionId, fonte.organization_id, `embed@${i}: ${detalhe}`);
       return { tipo: "erro", detalhe: `embedding falhou no trecho ${i}: ${detalhe}` };
     }
