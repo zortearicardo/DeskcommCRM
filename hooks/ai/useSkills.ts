@@ -4,11 +4,27 @@ import { apiClient } from "@/lib/api/client";
 import { ApiError, type ApiErrorBody } from "@/lib/api/types";
 import { randomId } from "@/lib/random-id";
 
+export interface ComparativoSkill {
+  descricao_mudou: boolean;
+  matcher_mudou: boolean;
+  any_adicionadas: string[];
+  any_removidas: string[];
+  corpo_mudou: boolean;
+  linhas_adicionadas: number;
+  linhas_removidas: number;
+  mudou_em: Array<"descricao" | "matcher" | "corpo">;
+  resumo: string;
+}
+
 export interface InstalledSkill {
   name: string;
   description: string;
   version_id: string;
   source: "manual" | "catalog";
+  /** True quando o catálogo publicou versão nova depois da cópia da org (só p/ source 'catalog'). */
+  versao_nova_catalogo: boolean;
+  /** Comparativo (o que mudou) entre a cópia da org e a versão nova do catálogo; null quando não há versão nova. */
+  comparativo: ComparativoSkill | null;
   updated_at: string;
 }
 export interface CatalogSkill {
@@ -20,6 +36,31 @@ export interface SkillsState {
   catalog: CatalogSkill[];
 }
 
+export interface SkillMatcher {
+  any_keywords: string[];
+  probe_keywords?: string[];
+}
+
+/** Corpo completo de uma skill instalada, para o editor. */
+export interface SkillComCorpo {
+  name: string;
+  description: string;
+  body: string;
+  matcher: SkillMatcher;
+  version_id: string;
+  updated_at?: string;
+  /** Skill de pacote (.zip com arquivos): o texto é editável e o PUT herda manifesto + arquivos na versão nova (#2047). */
+  tem_arquivos_do_pacote?: boolean;
+  /** Paths do manifesto (`references/` e `assets/`) — a UI mostra como somente leitura. */
+  arquivos_do_pacote?: string[];
+}
+
+export interface SalvarSkillBody {
+  description: string;
+  body: string;
+  matcher: SkillMatcher;
+}
+
 const KEY = ["skills"];
 
 export function useSkills(initial?: SkillsState) {
@@ -27,6 +68,69 @@ export function useSkills(initial?: SkillsState) {
     queryKey: KEY,
     ...(initial !== undefined ? { initialData: initial } : {}),
     queryFn: () => apiClient.get<{ data: SkillsState }>("/api/v1/ai/skills").then((r) => r.data),
+  });
+}
+
+/** GET do corpo/matcher de UMA skill instalada (abre o editor). */
+export function useSkill(name: string | null) {
+  return useQuery({
+    queryKey: ["skills", "detail", name],
+    enabled: name !== null,
+    queryFn: () =>
+      apiClient
+        .get<{ data: SkillComCorpo }>(`/api/v1/ai/skills/${encodeURIComponent(name ?? "")}`)
+        .then((r) => r.data),
+  });
+}
+
+export interface SkillVersionResumo {
+  id: string;
+  created_at: string;
+  forked_from_version_id: string | null;
+  atual: boolean;
+}
+
+/** GET das versões da skill (histórico para rollback). */
+export function useSkillVersions(name: string | null) {
+  return useQuery({
+    queryKey: ["skills", "versions", name],
+    enabled: name !== null,
+    queryFn: () =>
+      apiClient
+        .get<{ data: { versions: SkillVersionResumo[] } }>(
+          `/api/v1/ai/skills/${encodeURIComponent(name ?? "")}/versions`,
+        )
+        .then((r) => r.data.versions),
+  });
+}
+
+/** POST — restaura uma versão anterior (move o ponteiro). */
+export function useRestaurarSkill() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ name, versionId }: { name: string; versionId: string }) =>
+      apiClient.post<{ data: { name: string; version_id: string } }>(
+        `/api/v1/ai/skills/${encodeURIComponent(name)}/restore`,
+        { version_id: versionId },
+      ),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: KEY });
+      void qc.invalidateQueries({ queryKey: ["skills", "versions"] });
+      void qc.invalidateQueries({ queryKey: ["skills", "detail"] });
+    },
+  });
+}
+
+/** PUT — salva uma versão NOVA do corpo e move o ponteiro da organização. */
+export function useSalvarSkill() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ name, body }: { name: string; body: SalvarSkillBody }) =>
+      apiClient.put<{ data: { name: string; version_id: string } }>(
+        `/api/v1/ai/skills/${encodeURIComponent(name)}`,
+        body,
+      ),
+    onSuccess: () => void qc.invalidateQueries({ queryKey: KEY }),
   });
 }
 

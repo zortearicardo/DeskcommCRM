@@ -10,9 +10,9 @@
  * Pré-requisitos: Supabase local com Mailpit + app `next start` (ver README
  * da suíte / playwright.config.ts).
  */
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./helpers/test";
 
-import { waitForEmail, extractAuthConfirmLink, uniqueEmail } from "./helpers/auth";
+import { waitForEmail, extractAuthConfirmLink, seguirLinkDeAcesso, uniqueEmail } from "./helpers/auth";
 
 test("criar conta: signup → e-mail de confirmação → onboarding → re-login", async ({
   page,
@@ -39,7 +39,7 @@ test("criar conta: signup → e-mail de confirmação → onboarding → re-logi
   // 3. Abre o e-mail real no Mailpit e segue o link
   const html = await waitForEmail(email, "Confirme seu e-mail");
   const link = extractAuthConfirmLink(html, baseURL!);
-  await page.goto(link);
+  await seguirLinkDeAcesso(page, link);
 
   // 4. Autenticado no onboarding — tenant provisionado
   await expect(page).toHaveURL(/\/onboarding\/welcome/);
@@ -51,7 +51,7 @@ test("criar conta: signup → e-mail de confirmação → onboarding → re-logi
   await page.goto("/login");
   await page.getByLabel("Email").fill(email);
   await page.getByLabel("Senha").fill(password);
-  await page.getByRole("button", { name: "Entrar" }).click();
+  await page.getByRole("button", { name: "Entrar", exact: true }).click();
   await page.waitForURL(/\/(app|onboarding)\//, { timeout: 30_000 });
   await expect(page).not.toHaveURL(/\/login/);
 });

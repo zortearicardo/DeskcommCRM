@@ -42,8 +42,21 @@ export const ERROS_DA_ENTREGA_DE_AVISO = [
   "canal_desconectado",
   "canal_arquivado",
   "canal_nao_aceita_aviso_livre",
+  /** O operador PAUSOU a conexão escolhida para os avisos (`metadata.disabled`, migration 0545). */
+  "canal_desativado",
   "transporte_ausente",
   "destino_invalido",
+  /**
+   * O número de destino voltou a ser de uma conexão ATIVA da própria
+   * organização.
+   *
+   * A guarda de "número da própria organização" da 0292 roda só ao DEFINIR o
+   * aviso. Uma conexão ARQUIVADA deixa de contar (ela não envia nem recebe), o
+   * número dela pode virar destino e, se a conexão for REATIVADA depois,
+   * nenhuma checagem volta a rodar — o aviso sairia para um número atendido por
+   * um agente desta organização. Este código é o registro da recusa no ENVIO.
+   */
+  "destino_da_propria_organizacao",
   "teto_diario_do_numero",
   "sem_endereco_publico",
   "titular_anonimizado",
@@ -65,8 +78,14 @@ export const FRASE_DO_ERRO_DO_AVISO = {
   canal_arquivado: "A conexão de WhatsApp escolhida para os avisos foi removida.",
   canal_nao_aceita_aviso_livre:
     "A conexão escolhida só envia mensagens aprovadas — ela não serve para o aviso de caso.",
+  canal_desativado:
+    "A conexão escolhida para os avisos está pausada. Retome-a na Central de Conexões para os avisos voltarem a sair.",
   transporte_ausente: "O serviço de WhatsApp desta instalação não está configurado.",
   destino_invalido: "O número de aviso não foi aceito pelo WhatsApp.",
+  // Sem o número na frase: a configuração é de `admin`, mas a Central é lida
+  // por qualquer membro, e o telefone do plantão não é assunto de todos.
+  destino_da_propria_organizacao:
+    "O número escolhido para os avisos virou o número de uma conexão ativa da sua conta — o aviso não foi enviado.",
   teto_diario_do_numero:
     "O número que envia os avisos atingiu o limite diário do período de aquecimento.",
   sem_endereco_publico:

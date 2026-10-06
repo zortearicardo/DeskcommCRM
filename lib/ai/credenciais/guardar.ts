@@ -20,7 +20,8 @@
  */
 import { audit } from "@/lib/audit";
 import { bufToBytea, encryptKey } from "@/lib/crypto/aes_gcm";
-import { validateProviderKey, type Provider } from "@/lib/ai/provider-validators";
+import { PROVEDOR_POR_ASSINATURA, type ProvedorComChave } from "@/lib/ai/pontos/provedores";
+import { validateProviderKey } from "@/lib/ai/provider-validators";
 import type { createAdminClient } from "@/lib/supabase/admin";
 
 export type ResultadoDeGuardar =
@@ -52,10 +53,17 @@ export interface PedidoDeGuardar {
   admin: ReturnType<typeof createAdminClient>;
   orgId: string;
   userId: string;
-  provider: Provider;
+  provider: ProvedorComChave;
   label: string;
   /** Plaintext. Vive só no escopo desta chamada — nunca persistido nem logado. */
   apiKey: string;
+  /**
+   * O endereço do provedor personalizado (#1642), GRAVADO na mesma linha da
+   * chave — sem ele a validação em segundo plano lê `base_url` nulo e a
+   * credencial nasce `base_url_ausente`. `undefined` para os nativos: o
+   * endereço deles é intrínseco e esta coluna não é deles.
+   */
+  baseUrl?: string;
   requestId?: string;
 }
 
@@ -65,21 +73,44 @@ export interface PedidoDeGuardar {
  * diferentes (ou, pior, um caminho que gravasse plaintext) divergiria em
  * silêncio, e o ajuste que divergisse seria o de segurança.
  */
-function colunasCifradas(apiKey: string) {
+function colunasCifradas(apiKey: string, provider: ProvedorComChave) {
   const encrypted = encryptKey(apiKey);
+  const last4 = provider === PROVEDOR_POR_ASSINATURA ? ultimo4DoLogin(apiKey) : encrypted.last4;
   return {
     api_key_encrypted: bufToBytea(encrypted.ciphertext),
     api_key_iv: bufToBytea(encrypted.iv),
     api_key_tag: bufToBytea(encrypted.tag),
-    api_key_last4: encrypted.last4,
-    last4: encrypted.last4,
+    api_key_last4: last4,
+    last4,
   };
+}
+
+/**
+ * O RAMO DO LOGIN POR ASSINATURA em `api_key_last4` (#1672, item 3).
+ *
+ * O plaintext desta credencial é `JSON.stringify({access_token, refresh_token})`,
+ * e o `slice(-4)` de um JSON seria o fim do objeto (`":}`) — um "últimos 4"
+ * que não identifica nada. Aqui são os últimos 4 do ACCESS_TOKEN, que é o
+ * token que a tela pode mostrar sem entregar o refresh. Se o JSON não tiver o
+ * formato esperado, cai no mesmo recorte do resto: a coluna é NOT NULL e um
+ * valor honesto vale mais que um erro de coluna.
+ */
+function ultimo4DoLogin(json: string): string {
+  try {
+    const bruto = JSON.parse(json) as Partial<{ access_token: unknown }>;
+    if (typeof bruto.access_token === "string" && bruto.access_token.length > 0) {
+      return bruto.access_token.slice(-4);
+    }
+  } catch {
+    // Não é o JSON do login — o recorte de baixo responde.
+  }
+  return json.slice(-4);
 }
 
 export async function guardarCredencial(p: PedidoDeGuardar): Promise<ResultadoDeGuardar> {
   let cifrada: ReturnType<typeof colunasCifradas>;
   try {
-    cifrada = colunasCifradas(p.apiKey);
+    cifrada = colunasCifradas(p.apiKey, p.provider);
   } catch (err) {
     // Sem `console.error` com a chave por perto: o que interessa é que falhou.
     return { ok: false, motivo: "cifragem", detalhe: err instanceof Error ? err.message : undefined };
@@ -95,6 +126,12 @@ export async function guardarCredencial(p: PedidoDeGuardar): Promise<ResultadoDe
       api_key_iv: cifrada.api_key_iv,
       api_key_tag: cifrada.api_key_tag,
       api_key_last4: cifrada.api_key_last4,
+      ...(p.baseUrl !== undefined ? { base_url: p.baseUrl } : {}),
+      // O LOGIN POR ASSINATURA nasce VALIDADO (#1672, item 4): quem prova o
+      // login é a troca do código colado, que acabou de acontecer aqui em
+      // cima. `loadCredential` recusa credencial sem `validated_at`, então
+      // gravar sem isto faria a fiação encontrar a credencial e recusá-la.
+      ...(p.provider === PROVEDOR_POR_ASSINATURA ? { validated_at: new Date().toISOString() } : {}),
       is_active: true,
       created_by: p.userId,
     })
@@ -144,9 +181,10 @@ export async function guardarCredencial(p: PedidoDeGuardar): Promise<ResultadoDe
 export interface PedidoDeRotacionar {
   admin: ReturnType<typeof createAdminClient>;
   orgId: string;
-  userId: string;
+  /** `null` só na renovação automática do login por assinatura: a coluna é uuid. */
+  userId: string | null;
   credentialId: string;
-  provider: Provider;
+  provider: ProvedorComChave;
   /** Presente = trocar a chave. Ausente = manter a atual. Plaintext: nunca logado. */
   apiKey?: string;
   /** Presente = trocar o rótulo. Ausente = manter. */
@@ -163,7 +201,7 @@ export async function rotacionarCredencial(
   if (p.apiKey !== undefined) {
     let cifrada: ReturnType<typeof colunasCifradas>;
     try {
-      cifrada = colunasCifradas(p.apiKey);
+      cifrada = colunasCifradas(p.apiKey, p.provider);
     } catch (err) {
       return { ok: false, motivo: "cifragem", detalhe: err instanceof Error ? err.message : undefined };
     }
@@ -172,12 +210,23 @@ export async function rotacionarCredencial(
     patch.api_key_iv = cifrada.api_key_iv;
     patch.api_key_tag = cifrada.api_key_tag;
     patch.api_key_last4 = cifrada.api_key_last4;
-    // Chave nova = veredito antigo deixa de valer. Sem zerar, a tela mostraria
-    // "Validada" (e os modelos da chave anterior) sobre uma chave que ninguém
-    // testou ainda — mentira com cara de confirmação.
-    patch.validated_at = null;
-    patch.validation_error = null;
-    patch.models_available = null;
+    if (p.provider === PROVEDOR_POR_ASSINATURA) {
+      // O RAMO DO LOGIN (#1672, item 3): aqui não entra chave nova de API,
+      // entra o par de tokens RENOVADO — e o refresh aceito PROVA o login.
+      // Logo o `validated_at` passa a valer agora, em vez de zerar: zerar
+      // faria `loadCredential` recusar justamente a credencial que a
+      // renovação acabou de confirmar (item 4).
+      patch.validated_at = new Date().toISOString();
+      patch.validation_error = null;
+      patch.models_available = null;
+    } else {
+      // Chave nova = veredito antigo deixa de valer. Sem zerar, a tela mostraria
+      // "Validada" (e os modelos da chave anterior) sobre uma chave que ninguém
+      // testou ainda — mentira com cara de confirmação.
+      patch.validated_at = null;
+      patch.validation_error = null;
+      patch.models_available = null;
+    }
   }
 
   if (p.label !== undefined) patch.label = p.label;
@@ -222,15 +271,48 @@ export async function rotacionarCredencial(
   return { ok: true, id: p.credentialId, last4, trocouChave: p.apiKey !== undefined };
 }
 
+/**
+ * O `base_url` gravado do provedor personalizado — e só dele.
+ *
+ * Coluna nova (migration 0413): a leitura devolve erro em vez de lançar, e o
+ * `undefined` faz o validador responder `base_url_ausente` — a tela diz qual
+ * endereço falta em vez de marcar "validada" uma credencial que ninguém testou.
+ */
+export async function lerBaseUrlDaCredencial(
+  admin: ReturnType<typeof createAdminClient>,
+  credentialId: string,
+): Promise<string | undefined> {
+  const { data, error } = await admin
+    .from("ai_provider_credentials")
+    .select("base_url")
+    .eq("id", credentialId)
+    .maybeSingle();
+  if (error) return undefined;
+  const url = typeof data?.base_url === "string" ? data.base_url.trim() : "";
+  return url === "" ? undefined : url;
+}
+
 async function validarEmSegundoPlano(
   admin: ReturnType<typeof createAdminClient>,
   credentialId: string,
   organizationId: string,
-  provider: Provider,
+  provider: ProvedorComChave,
   apiKey: string,
 ): Promise<void> {
+  // O RAMO DO LOGIN POR ASSINATURA (#1672, item 3): não existe endpoint de
+  // CHAVE para pingar neste provider. Quem prova o login é a troca do código
+  // colado (ou a renovação do refresh), e é ela quem grava `validated_at`.
+  // Chamar `validateProviderKey` aqui devolveria
+  // `unknown_provider:openai-assinatura` e ZERARIA o `validated_at` que a
+  // prova acabou de gravar — a fiação encontraria a credencial e a recusaria.
+  if (provider === PROVEDOR_POR_ASSINATURA) return;
   try {
-    const r = await validateProviderKey(provider, apiKey);
+    // O endereço do provedor personalizado vem DA LINHA gravada, nunca do
+    // chamador: cadastrar e revalidar testam exatamente o que o runtime vai
+    // usar, e a rotação (que não mexe no endereço) continua revalidando com ele.
+    const baseUrl =
+      provider === "custom" ? await lerBaseUrlDaCredencial(admin, credentialId) : undefined;
+    const r = await validateProviderKey(provider, apiKey, baseUrl);
     await admin
       .from("ai_provider_credentials")
       .update(

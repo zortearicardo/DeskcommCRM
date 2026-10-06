@@ -21,6 +21,7 @@ import type { Logger } from '../../obs/logger';
 import type { ProviderRegistry } from '../../edge/llm/providers';
 import { LlmBudgetExceededError, runModelCall, type LlmEdgeConfig } from '../../edge/llm/run-model-call';
 import type { LlmResolveOverride } from '../../edge/llm/credentials';
+import { extrairObjetoJsonDoTexto } from '@/lib/agent-engine/texto/extrair-json-do-texto';
 
 /** Severidade do sinal: none (limpo) < low (suspeito) < high (jailbreak/injeção claro). */
 export type JailbreakLevel = 'none' | 'low' | 'high';
@@ -34,6 +35,12 @@ export interface JailbreakClassification {
   level: JailbreakLevel;
   /** categoria curta do modelo (pode ecoar a mensagem — NUNCA logada nem no inbox_item). */
   reason: string | null;
+  /**
+   * O classificador NÃO decidiu (fornecedor caiu, saída ilegível): o `none` acima é o
+   * degrade, não um veredito. Quem soma outro sinal ao dele precisa da diferença — sem
+   * veredito vale `none`, e o Jev não entra no lugar (`lib/ai/decisao/manipulacao.ts`).
+   */
+  falhou?: true;
 }
 
 /** Knobs do classificador (env JAILBREAK_CLASSIFIER_*; defaults conservadores no .env.example). */
@@ -72,20 +79,21 @@ function buildJailbreakMessage(message: string): string {
 /**
  * Extrai {flag, level, reason} do texto do modelo (tolerante a code-fence/prosa em volta
  * do JSON). Saída não-parseável ou nível desconhecido → degrada para "none" (advisório: o
- * classificador NUNCA bloqueia por falha de parse do auxiliar).
+ * classificador NUNCA bloqueia por falha de parse do auxiliar), marcado `falhou`.
  */
 export function parseJailbreakClassification(text: string): JailbreakClassification {
   const clean = (): JailbreakClassification => ({ flag: false, level: 'none', reason: null });
-  const match = /\{[\s\S]*\}/.exec(text);
-  if (match === null) return clean();
-  let obj: Record<string, unknown>;
-  try {
-    obj = JSON.parse(match[0]) as Record<string, unknown>;
-  } catch {
-    return clean();
-  }
+  const semVeredito = (): JailbreakClassification => ({ ...clean(), falhou: true });
+  // O parser robusto devolve o PRIMEIRO objeto parseável (prosa, cerca de código
+  // e JSON REPETIDO — a saída ecoada derrubava o recorte antigo). O que NÃO muda:
+  // sem objeto parseável o veredito é `semVeredito()` — flag:false, level:'none',
+  // falhou:true —, ou seja, o fail-open de sempre; nenhuma regra de bloqueio mudou.
+  const bruto = extrairObjetoJsonDoTexto(text);
+  if (bruto === null || typeof bruto !== 'object') return semVeredito();
+  const obj = bruto as Record<string, unknown>;
   const raw = typeof obj.level === 'string' ? obj.level.trim().toLowerCase() : '';
-  const level: JailbreakLevel = raw === 'high' ? 'high' : raw === 'low' ? 'low' : 'none';
+  if (raw !== 'none' && raw !== 'low' && raw !== 'high') return semVeredito();
+  const level: JailbreakLevel = raw;
   if (level === 'none') return clean();
   const reason = typeof obj.reason === 'string' && obj.reason.trim() !== '' ? obj.reason.trim() : null;
   return { flag: true, level, reason };
@@ -145,7 +153,7 @@ export async function classifyJailbreak(
     deps.log.warn('jailbreak: classificador falhou — turno segue sem sinal', {
       error: (err instanceof Error ? err.message : String(err)).slice(0, 200),
     });
-    return { flag: false, level: 'none', reason: null };
+    return { flag: false, level: 'none', reason: null, falhou: true };
   }
   return parseJailbreakClassification(call.result.text);
 }

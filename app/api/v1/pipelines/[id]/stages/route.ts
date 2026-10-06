@@ -36,7 +36,53 @@ interface RouteCtx {
 
 // `.max(80)`: o nome é o topo de uma coluna do quadro, não um parágrafo. O banco
 // não limita, mas a tela quebra muito antes disso.
-const bodySchema = z.object({ name: z.string().min(1).max(80) }).strict();
+//
+// `expected_duration_hours` é opcional e aceita `null`: uma etapa nasce sem
+// janela configurada e o radar cai no padrão de 24 h/72 h. 1 a 8760 inteiro
+// (uma hora a um ano) — a coluna é `numeric` sem CHECK, então este Zod é a
+// primeira rede (a migration com CHECK ficou fora deste escopo, #1532).
+const bodySchema = z
+  .object({
+    name: z.string().min(1).max(80),
+    expected_duration_hours: z.number().int().min(1).max(8760).nullable().optional(),
+  })
+  .strict();
+
+/**
+ * GET — as etapas vivas do funil, na ordem do quadro.
+ *
+ * Existia criação de etapa e nenhuma LEITURA: quem precisava oferecer "escolha
+ * a etapa" numa tela (a campanha, agora) não tinha de onde tirar a lista, e a
+ * saída seria cada tela consultar o banco por conta própria — duas réguas para
+ * "quais etapas existem", que divergem no primeiro arquivamento.
+ *
+ * Ganho e perda entram: quem escolhe etapa para FILTRAR público quer poder
+ * dizer "quem está em Perdido". Quem escolhe etapa de NASCIMENTO é recusado
+ * antes, pela regra de que card não nasce fechado.
+ */
+export async function GET(_req: NextRequest, ctx: RouteCtx): Promise<Response> {
+  const requestId = randomUUID();
+  const authz = await requireRole("manager", { requestId, resource: "pipeline_stages" });
+  if (!authz.ok) return authz.response;
+  const t = (texto: string) => traduzir(texto, authz.user.idioma);
+  const { id } = await ctx.params;
+
+  const supabase = await createClient();
+  const { data, error } = await supabase
+    .from("crm_stages")
+    // A janela de esfriando entra na leitura como as demais colunas de
+    // configuração: quem precisa "escolha a etapa" também precisa saber quanto
+    // tempo cada uma leva — e sem ela aqui, o POST de criação seria a única
+    // superfície que escreve um dado que nenhuma leitura devolve.
+    .select("id, name, position, is_won, is_lost, expected_duration_hours")
+    .eq("organization_id", authz.org.orgId)
+    .eq("pipeline_id", id)
+    .eq("is_archived", false)
+    .order("position", { ascending: true });
+  if (error) return fail("internal_error", t("Falha ao listar etapas."), 500, { requestId });
+
+  return ok(data ?? [], { requestId });
+}
 
 export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
   const supportDenied = await requireSupportWrite();
@@ -73,7 +119,14 @@ export async function POST(req: NextRequest, ctx: RouteCtx): Promise<Response> {
         actor: { type: "user", id: authz.user.id, role: authz.org.role },
         requestId,
       },
-      { pipelineId, nome: parsed.data.name },
+      {
+        pipelineId,
+        nome: parsed.data.name,
+        // Só quando veio pedido: a chave ausente é o comportamento de hoje.
+        ...(parsed.data.expected_duration_hours !== undefined
+          ? { expected_duration_hours: parsed.data.expected_duration_hours }
+          : {}),
+      },
     );
     return ok(funil, { status: 201, requestId });
   } catch (err) {

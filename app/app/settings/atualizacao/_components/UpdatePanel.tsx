@@ -164,6 +164,11 @@ export function UpdatePanel() {
   // retentativas custou e em qual passada fechou. Sem registro na rodada isto é
   // `null`, e a tela fica calada em vez de afirmar zero.
   const contaDoBanco = textoDaRodadaDoBanco(data.run?.rodada_do_banco);
+  // O ponteiro para o `.update.log` vem junto do resumo, mas só quando a
+  // rodada REGISTROU disputa — é aí que existe passada por passada para ler.
+  // Rodada medida e limpa fica com o resumo só: endereço de log que ninguém
+  // precisa abrir é linha a mais para ignorar, e quem ignora uma ignora a próxima.
+  const detalheNoLog = data.run?.rodada_do_banco?.disputa === true;
 
   if (data.just_updated) {
     const pedida = semV(data.run?.to_version);
@@ -182,6 +187,18 @@ export function UpdatePanel() {
         </p>
         {contaDoBanco ? (
           <p className="mt-3 text-sm text-muted-foreground">{t(contaDoBanco)}</p>
+        ) : null}
+        {/* O resumo é a ponta; quem quer ver passada por passada precisa saber
+            ONDE. Esse endereço até aqui só existia no log do servidor — quem
+            apertou o botão não tinha como chegar lá sem SSH. Só quando HÁ o que
+            procurar lá (disputa registrada): ponteiro em rodada limpa é ruído, e
+            quem para de ler o ruído para de ler o aviso. */}
+        {detalheNoLog ? (
+          <p className="mt-3 text-sm text-muted-foreground">
+            {t(
+              "O detalhe de cada passada está no arquivo .update.log, na pasta do projeto no servidor.",
+            )}
+          </p>
         ) : null}
       </Layout>
     );
@@ -211,6 +228,13 @@ export function UpdatePanel() {
         </p>
         {contaDoBanco ? (
           <p className="mt-3 text-sm text-muted-foreground">{t(contaDoBanco)}</p>
+        ) : null}
+        {detalheNoLog ? (
+          <p className="mt-3 text-sm text-muted-foreground">
+            {t(
+              "O detalhe de cada passada está no arquivo .update.log, na pasta do projeto no servidor.",
+            )}
+          </p>
         ) : null}
         <DetalhesTecnicos texto={data.run.log_tail} />
         <Saida
@@ -422,6 +446,19 @@ export function UpdatePanel() {
         </p>
       )}
 
+      {/* O botão fica ANTES do changelog, não depois: com várias versões
+          acumuladas ele descia para o fim de uma lista longa, e quem só
+          queria clicar "Atualizar agora" precisava rolar por tudo. Os avisos
+          que pesam na decisão (`off_release`, `requires_attention` e o de
+          histórico incompleto) continuam antes DELE — só o "O que muda", que é
+          consulta, não decisão, desceu para depois. O de histórico incompleto
+          entra na lista porque, com `complete === false`, o "Requer atenção"
+          só junta as versões presentes no texto: pode estar faltando aviso, e
+          esse parágrafo é a única pista disso. */}
+      <div className="mb-6">
+        <BotaoAtualizar mutate={() => atualizar.mutate()} isPending={atualizar.isPending} erro={erro} />
+      </div>
+
       {data.notes?.sections.length ? (
         <div className="mb-6">
           <p className="mb-2 text-sm font-medium">{t("O que muda")}</p>
@@ -448,8 +485,6 @@ export function UpdatePanel() {
           ))}
         </div>
       ) : null}
-
-      <BotaoAtualizar mutate={() => atualizar.mutate()} isPending={atualizar.isPending} erro={erro} />
     </Layout>
   );
 }

@@ -14,6 +14,10 @@ import { audit } from "@/lib/audit";
 import { requireRole } from "@/lib/auth/require-role";
 import { byteaToBuffer, decryptKey } from "@/lib/crypto/aes_gcm";
 import { validateProviderKey } from "@/lib/ai/provider-validators";
+import { lerBaseUrlDaCredencial } from "@/lib/ai/credenciais/guardar";
+import { renovarComTravaDeBanco } from "@/lib/ai/credenciais/login-codex";
+import { renovarPorRefreshToken } from "@/lib/ai/pontos/pkce-da-assinatura";
+import { PROVEDOR_POR_ASSINATURA } from "@/lib/ai/pontos/provedores";
 import { logger } from "@/lib/logger";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { traduzir } from "@/lib/i18n/dicionario";
@@ -60,6 +64,54 @@ export async function POST(
     return fail("credential_inactive", t("Credential desativada."), 409, { requestId });
   }
 
+  // O RAMO DO LOGIN POR ASSINATURA (#1672, item 3): não existe endpoint de
+  // CHAVE para pingar — a única prova que este provider aceita é o refresh
+  // aceito. A renovação passa pela TRAVA DO BANCO (nenhum outro processo pode
+  // rodar o POST ao mesmo tempo) e regrava o par na MESMA linha, com
+  // `validated_at` renovado.
+  if (row.provider === PROVEDOR_POR_ASSINATURA) {
+    const renovado = await renovarComTravaDeBanco({
+      admin,
+      orgId: activeOrg.orgId,
+      credentialId: id,
+      userId: authUser.id,
+      renovar: (atuais) => renovarPorRefreshToken({ refreshToken: atuais.refresh_token }),
+    });
+    if (renovado.ok) {
+      const { data: safe } = await admin
+        .from("ai_provider_credentials_safe")
+        .select(SAFE_COLUMNS)
+        .eq("id", id)
+        .single();
+      await audit({
+        action: "ai.credential_revalidated",
+        actorUserId: authUser.id,
+        organizationId: activeOrg.orgId,
+        resourceType: "ai_provider_credential",
+        resourceId: id,
+        requestId,
+        metadata: { provider: row.provider, label: row.label, ok: true, error: null },
+      });
+      return ok(safe, { requestId });
+    }
+    if (renovado.motivo === "em_curso" || renovado.motivo === "modulo_desligado") {
+      return fail(
+        "revalidate_in_progress",
+        t(
+          "Outra renovação desta conta está em curso (ou o recurso está desligado). Aguarde alguns segundos e tente de novo.",
+        ),
+        409,
+        { requestId },
+      );
+    }
+    return fail(
+      "revalidate_failed",
+      t("A OpenAI recusou a renovação do login. Gere o link de novo e conecte a conta outra vez."),
+      409,
+      { requestId },
+    );
+  }
+
   // Leitura direta + decifragem (sem passar pelo gate `validated_at` do
   // loadCredential — revalidate aceita credenciais ainda não validadas).
   let apiKey: string;
@@ -77,7 +129,11 @@ export async function POST(
     return fail("decrypt_failed", t("Falha ao decifrar credential."), 500, { requestId });
   }
 
-  const result = await validateProviderKey(row.provider, apiKey);
+  // O provedor personalizado (#1642) valida pelo endereço GRAVADO na linha —
+  // sem ele, revalidar marcaria como inválida a credencial que funciona.
+  const baseUrl =
+    row.provider === "custom" ? await lerBaseUrlDaCredencial(admin, row.id) : undefined;
+  const result = await validateProviderKey(row.provider, apiKey, baseUrl);
   const patch = result.ok
     ? {
         validated_at: new Date().toISOString(),

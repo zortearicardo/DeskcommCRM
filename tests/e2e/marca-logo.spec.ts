@@ -11,7 +11,7 @@
  * navegador de fato baixa do bucket **público** (uma URL assinada vencida, ou um
  * bucket privado, aparece exatamente aqui e em lugar nenhum antes).
  *
- * ═══ AS TRÊS PROPRIEDADES, E A ORDEM EM QUE ELAS SE PROVAM ═══
+ * ═══ AS QUATRO PROPRIEDADES, E A ORDEM EM QUE ELAS SE PROVAM ═══
  *
  *   1. **A camada da instalação pinta a fachada.** O logo do dono do servidor
  *      aparece na barra lateral E no `/login` de quem não entrou — a P0 de
@@ -22,6 +22,9 @@
  *      repinta a instalação".
  *   3. **O que não é imagem não entra.** Um SVG renomeado para `.png` é recusado
  *      pelos BYTES, com a razão dita em português, e nada muda na tela.
+ *   4. **Logo grande é ajustado antes de subir, e o teto continua de pé.** Um
+ *      PNG acima de 512 KB com margem transparente é recortado e reduzido pelo
+ *      `<canvas>` do navegador, e o arquivo gravado cabe no teto (issue #1655).
  *
  * ═══ CADA CASO MONTA A PRÓPRIA PRECONDIÇÃO (issue #306) ═══
  *
@@ -69,9 +72,11 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import * as zlib from "node:zlib";
 
-import { test, expect, type Page, type Browser, type Locator } from "@playwright/test";
+import { test, expect, type Page, type Browser, type Locator } from "./helpers/test";
 
 import { generateTotp, msUntilNextTotpWindow } from "./utils/totp";
+import { TAMANHO_MAXIMO_DO_LOGO } from "@/lib/branding/logo";
+import { lerPng, montarPng, ruidoQuantizado } from "../helpers/png-sintetico";
 
 const CREDS_PATH = path.join(process.cwd(), ".e2e-creds.json");
 const EVIDENCIA = path.join(process.cwd(), "evidence", "marca-logo");
@@ -159,6 +164,31 @@ const SVG_DISFARCADO = Buffer.from(
   "utf8",
 );
 
+/**
+ * O PNG da issue #1655: 1536×1024, logo 704×286 no meio, volta 100% transparente
+ * com RGB sujo (é o que infla o arquivo) e um furo transparente DENTRO do logo.
+ * Mesma geometria de `tests/unit/ajuste-de-logo.test.ts`, que mede o ajuste com o
+ * motor sintético; o caso (7) mede o mesmo arquivo com o `<canvas>` real.
+ */
+const CAIXA_DO_DESIGNER = { x: 416, y: 369, largura: 704, altura: 286 };
+const FURO_DO_DESIGNER = { x: 100, y: 60, lado: 24 };
+
+function pngDoDesigner(): Buffer {
+  const [largura, altura] = [1536, 1024];
+  const rgba = ruidoQuantizado(largura, altura, 0x1671);
+  const c = CAIXA_DO_DESIGNER;
+  const f = FURO_DO_DESIGNER;
+  for (let y = 0; y < altura; y++) {
+    for (let x = 0; x < largura; x++) {
+      const [rx, ry] = [x - c.x, y - c.y];
+      const noLogo = rx >= 0 && rx < c.largura && ry >= 0 && ry < c.altura;
+      const noFuro = rx >= f.x && rx < f.x + f.lado && ry >= f.y && ry < f.y + f.lado;
+      rgba[(y * largura + x) * 4 + 3] = noLogo && !noFuro ? 255 : 0;
+    }
+  }
+  return Buffer.from(montarPng(largura, altura, rgba));
+}
+
 // ── Helpers de tela ─────────────────────────────────────────────────────────
 
 /**
@@ -205,7 +235,7 @@ async function loginComTotp(page: Page, email: string, secret: string): Promise<
   await page.goto("/login");
   await page.locator("#email").fill(email);
   await page.locator("#password").fill(creds.password);
-  await page.getByRole("button", { name: /entrar/i }).click({ timeout: 15_000 });
+  await page.getByRole("button", { name: "Entrar", exact: true }).click({ timeout: 15_000 });
   await page.waitForURL(/\/login\/mfa/);
 
   const digito1 = page.locator('input[aria-label="Dígito 1"]');
@@ -300,10 +330,10 @@ interface LogoNaTela {
  * Mede um `<img>` DEPOIS de o navegador terminar com ele.
  *
  * ⚠️ Quem prova o download é `naturalWidth`, e NÃO a altura na tela — o contrário
- * do que esta spec afirmou. Os dois `<img>` de marca do produto têm altura fixada
- * por CSS (`h-7` em `components/shell/Sidebar.tsx:82`, `h-10` em
- * `app/(public)/layout.tsx:54`), e altura fixa mede o mesmo para quem baixou e
- * para quem não baixou. MEDIDO em chromium, dois `<img>` sob `height: 1.75rem`
+ * do que esta spec afirmou. A barra lateral fixa a altura
+ * por CSS (`h-7` em `components/shell/Sidebar.tsx`); a fachada limita o tamanho
+ * sem ampliar arquivos pequenos (`app/(public)/layout.tsx`). Altura renderizada
+ * não comprova o download. MEDIDO em chromium, dois `<img>` sob `height: 1.75rem`
  * (o `h-7`), um com PNG válido e outro apontando para um endereço morto:
  *
  *   boa={"nat":1,"altura":28}   quebrada={"nat":0,"altura":28}
@@ -587,6 +617,67 @@ function evidencia(nome: string): string {
   return path.join(EVIDENCIA, nome);
 }
 
+/** Mede só a apresentação; trocar src no navegador não grava arquivos no banco. */
+async function provarTamanhosNaFachada(browser: Browser): Promise<void> {
+  for (const tema of ["light", "dark"] as const) {
+    for (const larguraDaTela of [360, 1280]) {
+      const contexto = await browser.newContext({
+        viewport: { width: larguraDaTela, height: 900 },
+        colorScheme: tema,
+      });
+      try {
+        await contexto.addInitScript(
+          (valor) => localStorage.setItem("deskcomm-theme", valor),
+          tema,
+        );
+        const pagina = await contexto.newPage();
+        await pagina.goto("/login");
+        const img = pagina.getByTestId("logo-da-fachada");
+        await expect(img).toBeVisible();
+        for (const [largura, altura] of [
+          [368, 182],
+          [256, 256],
+          [640, 80],
+          [64, 512],
+          [32, 16],
+        ]) {
+          const medida = await img.evaluate(
+            async (elemento, tamanho) => {
+              const canvas = document.createElement("canvas");
+              canvas.width = tamanho.largura;
+              canvas.height = tamanho.altura;
+              const pincel = canvas.getContext("2d")!;
+              pincel.fillStyle = "#276ba4";
+              pincel.fillRect(0, 0, canvas.width, canvas.height);
+              const imagem = elemento as HTMLImageElement;
+              imagem.src = canvas.toDataURL("image/png");
+              await imagem.decode();
+              const caixa = imagem.getBoundingClientRect();
+              return { largura: caixa.width, altura: caixa.height };
+            },
+            { largura: largura!, altura: altura! },
+          );
+          const escala = Math.min(1, 192 / largura!, 80 / altura!);
+          expect(
+            medida.largura,
+            `${tema}/${larguraDaTela}: largura de ${largura}×${altura}`,
+          ).toBeCloseTo(largura! * escala, 1);
+          expect(
+            medida.altura,
+            `${tema}/${larguraDaTela}: altura de ${largura}×${altura}`,
+          ).toBeCloseTo(altura! * escala, 1);
+          expect(
+            await pagina.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
+          ).toBe(true);
+        }
+        await pagina.screenshot({ path: evidencia(`tamanho-logo-${tema}-${larguraDaTela}.png`) });
+      } finally {
+        await contexto.close();
+      }
+    }
+  }
+}
+
 // ── A spec ──────────────────────────────────────────────────────────────────
 
 /**
@@ -645,6 +736,95 @@ test.describe("o logo subido pela tela chega à tela", () => {
    * caso faz, e o teto dele acompanha o trabalho.
    */
   test.setTimeout(180_000);
+
+  test("o CSS personalizado salvo na tela aparece no login e pode ser removido", async ({
+    page,
+    browser,
+  }) => {
+    const secret = creds.dono_totp?.secret;
+    expect(secret, "sem `dono_totp` no .e2e-creds.json — rode seed-e2e-credentials.ts").toBeTruthy();
+    await loginComTotp(page, creds.users.dono!.email, secret!);
+    await page.goto("/admin/marca");
+
+    const editor = page.locator("#custom_css");
+    await expect(editor).toBeVisible();
+    await editor.fill(".text-muted-foreground { color: rgb(1, 2, 3); }");
+    await page.getByRole("button", { name: "Salvar CSS", exact: true }).click();
+    await expect(page.getByText("CSS personalizado salvo.")).toBeVisible({ timeout: 15_000 });
+
+    const visitante = await browser.newContext();
+    try {
+      const paginaLogin = await visitante.newPage();
+      await paginaLogin.goto("/login");
+      // `toContainText` lê o texto VISÍVEL, e o Playwright ignora o conteúdo de
+      // <style>: o elemento estava lá com a folha inteira e a asserção recebia "".
+      // O texto da folha se lê pelo DOM; o efeito, pela cor computada abaixo.
+      await expect
+        .poll(() =>
+          paginaLogin.locator("#marca-css-personalizado").evaluate((element) => element.textContent ?? ""),
+        )
+        .toContain(":root:root .text-muted-foreground");
+      await expect
+        .poll(() =>
+          paginaLogin.locator(".text-muted-foreground").first().evaluate((element) =>
+            getComputedStyle(element).color,
+          ),
+        )
+        .toBe("rgb(1, 2, 3)");
+    } finally {
+      await visitante.close();
+      await page.goto("/admin/marca");
+      await page.locator("#custom_css").fill("");
+      await page.getByRole("button", { name: "Salvar CSS", exact: true }).click();
+      await expect(page.getByText("CSS personalizado salvo.")).toBeVisible({ timeout: 15_000 });
+    }
+  });
+
+  /**
+   * O cruzamento com verdade INDEPENDENTE. O texto sob "Entrar" e o título da
+   * aba passaram a ler a MESMA pilha (`marcaDaSaida(null)` → `marcaDaInstalacao()`),
+   * então `icone-da-marca.spec.ts`, que compara um com o outro, fica verde com o
+   * resolvedor compartilhado quebrado. Aqui a verdade é o literal que ESTE caso
+   * digita na tela de marca, e o login de quem não entrou tem de mostrá-lo.
+   */
+  test("o nome trocado em /admin/marca chega ao login e à aba de quem não entrou", async ({
+    page,
+    browser,
+  }) => {
+    const secret = creds.dono_totp?.secret;
+    expect(secret, "sem `dono_totp` no .e2e-creds.json — rode seed-e2e-credentials.ts").toBeTruthy();
+    const nome = `Marca E2E ${Date.now().toString(36)}`;
+    const hidratado = page.locator("[data-campo-de-logo='instalacao'][data-hidratado]");
+
+    await loginComTotp(page, creds.users.dono!.email, secret!);
+    await page.goto("/admin/marca");
+    await expect(hidratado, "o formulário de marca não hidratou").toBeVisible({ timeout: 15_000 });
+    const anterior = await page.locator("#app_name").inputValue();
+
+    try {
+      await page.locator("#app_name").fill(nome);
+      await page.getByRole("button", { name: "Salvar", exact: true }).click();
+      await expect(page.getByText("Marca salva.")).toBeVisible({ timeout: 15_000 });
+
+      const visitante = await browser.newContext();
+      try {
+        const login = await visitante.newPage();
+        await login.goto("/login");
+        await expect(login).toHaveTitle(`Entrar · ${nome}`);
+        await expect(login.getByText(nome, { exact: true }).first()).toBeVisible();
+      } finally {
+        await visitante.close();
+      }
+    } finally {
+      // O nome volta pela TELA, nunca por SQL: quem invalida o memo da marca é
+      // o código do produto (`invalidarMarcaDaInstalacao`).
+      await page.goto("/admin/marca");
+      await expect(hidratado).toBeVisible({ timeout: 15_000 });
+      await page.locator("#app_name").fill(anterior);
+      await page.getByRole("button", { name: "Salvar", exact: true }).click();
+      await expect(page.getByText("Marca salva.")).toBeVisible({ timeout: 15_000 });
+    }
+  });
 
   test("(1) o dono do servidor sobe o logo e ele aparece na barra lateral", async ({ page }) => {
     // ESTE CASO NÃO USA `subirLogoDaCamada`, de propósito: a subida é o que ele
@@ -742,6 +922,8 @@ test.describe("o logo subido pela tela chega à tela", () => {
     // indistinguíveis daqui, e o caso reprovava por causa de outro.
     await entrarNaCamada(page, "instalacao");
     await subirLogoDaCamada(page, "instalacao");
+
+    await provarTamanhosNaFachada(browser);
 
     const fachada = await logoDoLogin(browser);
     expect(fachada, "a tela de acesso não renderizou logo nenhum").not.toBeNull();
@@ -994,6 +1176,109 @@ test.describe("o logo subido pela tela chega à tela", () => {
     }
   });
 
+  test("(7) logo acima do teto é recortado e reduzido no navegador, e o que chega cabe", async ({
+    page,
+  }) => {
+    // O caso da issue #1655, agora com o `<canvas>` DE VERDADE: as suítes de unidade
+    // do PR #1671 trocam o motor por um codec PNG sintético, então `createImageBitmap`
+    // e `toBlob` só rodam aqui. Camada da EMPRESA, com o `admin`: a conta dele fica
+    // em 6 trocas (7 no pior caso) no teto de 10 — ver a NOTA DO TETO no caso (1).
+    const original = pngDoDesigner();
+    expect(original.length, "a precondição: o arquivo passa do teto ANTES do ajuste").toBeGreaterThan(
+      TAMANHO_MAXIMO_DO_LOGO,
+    );
+
+    await entrarNaCamada(page, "organizacao");
+    await page.goto(CAMADAS.organizacao.tela);
+    const resposta = page.waitForResponse(
+      (r) => r.url().includes("/api/v1/marca/logo") && r.request().method() === "POST",
+      { timeout: 30_000 },
+    );
+    await subir(page, "organizacao", {
+      nome: "logo-do-designer.png",
+      mime: "image/png",
+      bytes: original,
+    });
+    const post = await resposta;
+    expect(post.status(), "o servidor recusou o que o navegador ajustou").toBe(200);
+    await expect(page.getByText(/logo atualizado/i)).toBeVisible({ timeout: 15_000 });
+
+    const { data } = (await post.json()) as { data: { logo_url: string } };
+    const gravado = await page.request.get(data.logo_url);
+    expect(gravado.ok(), `o arquivo gravado não baixou: ${data.logo_url}`).toBe(true);
+    const bytes = await gravado.body();
+    expect(bytes.length, "o que chegou ao bucket passa do teto").toBeLessThanOrEqual(
+      TAMANHO_MAXIMO_DO_LOGO,
+    );
+
+    // O recorte se prova pela PROPORÇÃO: o arquivo inteiro é 3:2, a caixa útil
+    // 704×286. A largura é uma das da escada que cabem abaixo da caixa (704, 640,
+    // 512) — qual delas depende do encoder PNG do Chromium, e não é o que se mede.
+    const png = lerPng(bytes);
+    expect([704, 640, 512], `largura gravada ${png.largura}`).toContain(png.largura);
+    expect(
+      Math.abs(png.largura / png.altura - CAIXA_DO_DESIGNER.largura / CAIXA_DO_DESIGNER.altura),
+      `${png.largura}×${png.altura} não tem a proporção da caixa útil — o recorte não aconteceu`,
+    ).toBeLessThan(0.02);
+
+    // PNG continua PNG COM transparência: o furo dentro do logo não virou fundo.
+    const escala = png.largura / CAIXA_DO_DESIGNER.largura;
+    const cx = Math.round((FURO_DO_DESIGNER.x + FURO_DO_DESIGNER.lado / 2) * escala);
+    const cy = Math.round((FURO_DO_DESIGNER.y + FURO_DO_DESIGNER.lado / 2) * escala);
+    expect(png.rgba[(cy * png.largura + cx) * 4 + 3], "o furo do logo perdeu a transparência").toBe(0);
+
+    // Sem `limparCamada` aqui: o teto de trocas por usuário do produto — ver a
+    // NOTA DO TETO no caso (1).
+  });
+
+  test("o ícone enviado pela tela identifica também o aplicativo instalado", async ({ page }) => {
+    await entrarNaCamada(page, "instalacao");
+    await page.goto("/admin/marca");
+    await expect(page.locator("[data-campo-de-logo='instalacao'][data-hidratado]")).toBeVisible({
+      timeout: 15_000,
+    });
+    const campo = page.locator("[data-campo-do-icone-da-aba]");
+    await expect(
+      campo.getByText("Ícone do aplicativo e do navegador", { exact: true }),
+    ).toBeVisible();
+    try {
+      await campo
+        .locator("input[type=file]")
+        .setInputFiles({
+          name: "icone-do-app.png",
+          mimeType: "image/png",
+          buffer: PNG_DA_PLATAFORMA,
+        });
+      await expect(page.getByText("Ícone da aba atualizado.", { exact: true })).toBeVisible({
+        timeout: 15_000,
+      });
+      await expect(campo.locator("[data-previa-do-icone='arquivo'] img")).toBeVisible();
+      const manifest = await (await page.request.get("/manifest.webmanifest")).json();
+      for (const [indice, lado] of [192, 512].entries()) {
+        expect(manifest.icons[indice].src).toContain("?v=platform%2F");
+        const resposta = await page.request.get(manifest.icons[indice].src);
+        expect(resposta.status()).toBe(200);
+        const png = await resposta.body();
+        expect(png.readUInt32BE(16)).toBe(lado);
+        expect(png.readUInt32BE(20)).toBe(lado);
+        const imagem = lerPng(png);
+        const centro = 4 * (Math.floor(lado / 2) * lado + Math.floor(lado / 2));
+        expect([...imagem.rgba.subarray(centro, centro + 3)]).toEqual([0x1d, 0x4e, 0xd8]);
+      }
+      await page.screenshot({ path: path.join(EVIDENCIA, "icone-app-pela-tela.png") });
+    } finally {
+      const remover = campo.getByRole("button", { name: "Remover ícone", exact: true });
+      if (await remover.count()) {
+        await remover.click();
+        await expect(page.getByText("Ícone da aba removido.", { exact: true })).toBeVisible({
+          timeout: 15_000,
+        });
+      }
+    }
+    const manifest = await (await page.request.get("/manifest.webmanifest")).json();
+    expect(manifest.icons[0].src).toBe("/app-icon/192");
+  });
+
   /**
    * A RESTAURAÇÃO — e ela é um `afterAll`, ao contrário do que este arquivo
    * afirmou.
@@ -1035,6 +1320,13 @@ test.describe("o logo subido pela tela chega à tela", () => {
     try {
       const pagina = await contexto.newPage();
       await loginComTotp(pagina, creds.users.dono!.email, creds.dono_totp!.secret);
+      await pagina.goto("/admin/marca");
+      const cssPersonalizado = pagina.locator("#custom_css");
+      if ((await cssPersonalizado.inputValue()) !== "") {
+        await cssPersonalizado.fill("");
+        await pagina.getByRole("button", { name: "Salvar CSS", exact: true }).click();
+        await expect(pagina.getByText("CSS personalizado salvo.")).toBeVisible({ timeout: 15_000 });
+      }
       await removerLogoSeHouver(pagina, "/app/settings/marca", "organizacao");
       await removerLogoSeHouver(pagina, "/admin/marca", "instalacao");
     } finally {

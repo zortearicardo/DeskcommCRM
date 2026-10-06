@@ -36,6 +36,8 @@ services:
     pull_policy: ${APP_PULL_POLICY:-always}
     restart: unless-stopped
     env_file: .env
+    environment:
+      SUPABASE_DB_ADMIN_URL: ""
     depends_on:
       srh:
         condition: service_started
@@ -99,6 +101,7 @@ services:
     environment:
       # dentro da rede do compose, o WAHA é o serviço 'waha' na porta interna 3000
       WAHA_API_BASE_URL: http://waha:3000
+      SUPABASE_DB_ADMIN_URL: ""
     networks:
       - internal
     healthcheck:
@@ -124,11 +127,10 @@ services:
     # precisar de multi-número/retry/S3 (licença paga).
     #
     # Tag PINADA: `devlikeapro/waha` sem tag é `:latest`, e o `dc pull` do
-    # update.sh entregava ao cliente qualquer versão que o upstream tivesse
-    # publicado — inclusive uma nunca testada por nós, no meio de uma
-    # atualização. `latest-2026.7.2` é o mesmo digest de `latest` hoje
-    # (65e593e30bb7…), então o pin não muda um bit; muda quem escolhe quando
-    # o WhatsApp do cliente troca de motor. Bumpar faz parte do release.
+    # update.sh entregaria ao cliente qualquer versão que o upstream tivesse
+    # publicado. O instalador grava `latest-2026.7.2` em x86 e
+    # `noweb-arm-2026.7.2` em ARM64; as duas tags fixam a versão NOWEB.
+    # Bumpar faz parte do release.
     image: ${WAHA_IMAGE:-devlikeapro/waha:latest-2026.7.2}
     restart: unless-stopped
     environment:
@@ -148,7 +150,9 @@ services:
       # SÓ por `message` foram ZERO, e 1.642 chegaram só por `message.any` (os
       # que saíram de nós, que `message` não cobre). Superconjunto estrito.
       WHATSAPP_HOOK_EVENTS: "message.any,message.ack,message.edited,message.revoked,session.status,state.change"
-      WHATSAPP_HOOK_HMAC: ${WAHA_HMAC_SECRET}
+      # Nome EXATO da doc do WAHA (events#hmac-authentication): WHATSAPP_HOOK_HMAC
+      # não existe nele — sem o _KEY ele ignora e nunca assina.
+      WHATSAPP_HOOK_HMAC_KEY: ${WAHA_HMAC_SECRET}
       # WAHA lê WHATSAPP_DEFAULT_ENGINE (NÃO WAHA_DEFAULT_ENGINE — o nome errado
       # fazia cair no default WEBJS, engine com browser que trava/corrompe a sessão
       # quando o WhatsApp Web atualiza; NOWEB é websocket direto, estável e leve).
@@ -393,6 +397,9 @@ services:
       ARI_URL: "http://asterisk:8088"
       ARI_WS_URL: "ws://asterisk:8088/ari/events"
       ARI_APP: "voice-agent"
+      # Como no app e no worker: a conexão do dono do banco fica no .env só
+      # para o kit no host (update.sh do cron); nenhum código de workers/ a lê.
+      SUPABASE_DB_ADMIN_URL: ""
     logging: *default-logging
     networks: [internal]
 

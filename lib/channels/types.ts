@@ -9,7 +9,7 @@ import type { OutboundMedia } from "@/lib/waha/media-send";
 
 export type { OutboundMedia };
 
-export type ChannelProvider = "waha" | "meta_cloud" | "zernio" | "zernio_social" | "wacalls";
+export type ChannelProvider = "waha" | "meta_cloud" | "zernio" | "zernio_social" | "wacalls" | "datafy";
 
 /**
  * Os providers que transportam MENSAGEM — o subconjunto sobre o qual a matriz
@@ -54,6 +54,8 @@ export interface ChannelCapabilities {
   groups: "full" | "limited" | "none";
   /** Mensagem entregue gera custo → decisões de envio precisam considerar orçamento. */
   costPerMessage: boolean;
+  /** O atendente pode editar e apagar para todos uma mensagem já enviada. */
+  alteraMensagemEnviada: boolean;
 }
 
 /**
@@ -86,6 +88,12 @@ export interface OutboundContact {
   phoneNumber: string;
   whatsappId: string;
   vcard: string;
+}
+
+/** Um grupo em que o número está. Só canais com capacidade `groups` diferente de "none". */
+export interface ChannelGroup {
+  chatId: string;
+  subject: string | null;
 }
 
 /**
@@ -157,6 +165,30 @@ export interface OutboundEnvelope extends ChannelTenantScope {
    */
   replyToExternalId?: string | null;
 }
+
+/**
+ * Uma conversão (hoje, a venda) no vocabulário neutro que o canal traduz — ver
+ * `ChannelAdapter.reportConversion`.
+ */
+export interface ChannelConversionInput extends ChannelTenantScope {
+  sessionRef: string;
+  /** Id da conversa NO provedor — o vínculo mais forte com o clique do anúncio. */
+  providerConversationId: string | null;
+  /** Só dígitos (E.164 sem `+`). Reforço de casamento, nunca o único. */
+  phone: string | null;
+  event: "Purchase";
+  /** Chave de deduplicação na plataforma: o mesmo id nunca conta duas vezes. */
+  eventId: string;
+  occurredAt: Date;
+  valueCents: number;
+  currency: string;
+}
+
+/** O desfecho já classificado pelo canal, que é quem lê a resposta crua. */
+export type ChannelConversionResult =
+  | { outcome: "ok"; detail?: string }
+  | { outcome: "retry"; detail: string; retryInMs?: number }
+  | { outcome: "rejected"; detail: string };
 
 /**
  * O tradutor de formato de UM canal — e nada mais.
@@ -265,6 +297,22 @@ export interface ChannelAdapter {
   templates?: ChannelTemplateOps;
 
   /**
+   * Reporta uma venda à plataforma de anúncios PELO CANAL, quando o canal
+   * intermediado já tem a ponte configurada do lado dele (o conjunto de dados
+   * da plataforma ligado ao número, na tela do provedor).
+   *
+   * Existe porque, nesse arranjo, quem guarda o vínculo com o anúncio é o
+   * canal: o CRM não precisa de token nem de dataset próprios para a venda
+   * chegar. Quem chama (`lib/conversoes/`, via `conversao-pelo-canal.ts`) testa
+   * a presença do método em vez de perguntar QUAL provider é — o lint de canal
+   * proíbe o nome fora daqui.
+   *
+   * NUNCA lança: devolve o desfecho classificado. A diferença entre "tente de
+   * novo" e "precisa de gente" é do canal, que é quem lê a resposta crua.
+   */
+  reportConversion?(input: ChannelConversionInput): Promise<ChannelConversionResult>;
+
+  /**
    * Acende o "digitando…" na conversa do cliente.
    *
    * Existe porque o agente de IA responde no instante em que o modelo termina,
@@ -281,10 +329,42 @@ export interface ChannelAdapter {
    * LANÇA quando o transporte recusa, e é de propósito: a decisão de engolir é
    * de quem chama (o indicador é decoração; a mensagem é o produto), e engolir
    * aqui esconderia de todo chamador futuro que a chamada nem chega.
+   *
+   * `inboundExternalId` é o `messages.external_id` da última mensagem que o
+   * cliente mandou nesta conversa, ou `null` quando não há. Há canal que não
+   * acende presença por conversa, e sim "respondendo a esta mensagem" — o
+   * oficial é assim, e sem o id ele não tem o que sinalizar. Quem não precisa
+   * ignora o campo.
    */
   signalTyping?(input: ChannelTenantScope & {
     sessionRef: string;
     recipient: string;
+    inboundExternalId: string | null;
+  }): Promise<void>;
+
+  /**
+   * Troca o texto de uma mensagem que o próprio atendente já enviou.
+   *
+   * `externalId` é o que o CRM gravou (`messages.external_id`); `recipient` é o
+   * endereço de `resolveRecipient`, ou `null` quando não há. Como o canal monta
+   * o id completo a partir dos dois é conhecimento dele, não da rota. Lança
+   * `recipient_unavailable` quando não dá para endereçar a mensagem.
+   *
+   * OPCIONAL como os demais: a tela pergunta `alteraMensagemEnviada` e a rota
+   * testa a presença do método em vez de perguntar QUAL provider é.
+   */
+  editMessage?(input: ChannelTenantScope & {
+    sessionRef: string;
+    recipient: string | null;
+    externalId: string;
+    text: string;
+  }): Promise<void>;
+
+  /** Apaga para todos uma mensagem enviada. Mesmo contrato de `editMessage`. */
+  revokeMessage?(input: ChannelTenantScope & {
+    sessionRef: string;
+    recipient: string | null;
+    externalId: string;
   }): Promise<void>;
 
   /**
@@ -306,6 +386,12 @@ export interface ChannelAdapter {
    * quem chama testa a presença em vez de perguntar QUAL provider é.
    */
   checkHealth?(input: ChannelTenantScope & { sessionRef: string }): Promise<ChannelHealth>;
+
+  /** Grupos do número. Ausente = o canal não lista grupos. */
+  listGroups?(input: { sessionRef: string }): Promise<ChannelGroup[]>;
+
+  /** Liga/desliga o recebimento de grupos na sessão; `true` só com a troca confirmada. */
+  setGroupIntake?(input: { sessionRef: string; receive: boolean }): Promise<boolean>;
 
   /**
    * Envia uma DEFINIÇÃO APROVADA — o único caminho de volta quando a janela de
@@ -408,9 +494,24 @@ export interface ChannelTemplateOps {
   update(input: ChannelTenantScope & {
     sessionRef: string;
     name: string;
+    /**
+     * OBRIGATÓRIO: com variantes de idioma, o PATCH por nome do provedor
+     * intermediado exige `language` no corpo (changelog de 28/08/2026) — sem ele
+     * a chamada falha, ou pior, edita a variante errada. Um modelo sem variantes
+     * aceita o idioma que ele tem, então mandar sempre é o caminho sem armadilha.
+     */
+    language: string;
     patch: Partial<Pick<ChannelTemplateDraft, "components" | "category">>;
   }): Promise<ChannelTemplate>;
+  /**
+   * ⚠️ `language` é OBRIGATÓRIO aqui por segurança, não por exigência da API:
+   * no provedor intermediado, DELETE por nome SEM idioma apaga TODAS as
+   * variantes (changelog de 28/08/2026). A assinatura obriga quem chama (a
+   * gestão de modelos da tela, `lib/channels/gestao-de-modelos.ts`) a dizer
+   * QUAL variante morre — apagar todas de uma vez é decisão que merece um
+   * método próprio, não um parâmetro esquecido.
+   */
   remove(
-    input: ChannelTenantScope & { sessionRef: string; name: string; language?: string },
+    input: ChannelTenantScope & { sessionRef: string; name: string; language: string },
   ): Promise<void>;
 }

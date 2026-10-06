@@ -20,6 +20,9 @@
  * As duas metades precisam concordar, e é justamente esse tipo de par que este
  * repo já viu divergir em silêncio (catálogo × preço). Por isso
  * `tests/unit/provedores-x-registry.test.ts` casa uma com a outra.
+ *
+ * `PROVEDORES` é só quem ESCREVE texto. Provedor que só decide (o Jev) mora em
+ * `PROVEDORES_DE_DECISAO`, no fim deste arquivo — e o porquê está lá.
  */
 
 /** Como a chave daquele provedor é validada e o que a tela precisa pedir. */
@@ -42,6 +45,23 @@ export interface ProvedorSuportado {
   prefixoDaChave: string;
 }
 
+/**
+ * O LOGIN POR ASSINATURA (#1639) — vocabulário da credencial E da conversa.
+ *
+ * A linha em `ai_provider_credentials` deste provedor guarda um PAR DE TOKENOS
+ * (access + refresh), não uma chave de API: quem a lê é o painel de conexão da
+ * empresa, a renovação e o resolvedor da assinatura — nunca um leitor genérico
+ * (`lib/ai/credentials.ts` recusa este provider de propósito: mandaria o JSON
+ * dos tokens como se fosse chave).
+ *
+ * A constante mora aqui (e não em `./reserva-da-assinatura`) porque é
+ * vocabulário: quem escreve e quem lê importam do mesmo lugar, sem ciclo. Ela
+ * vem ANTES de `PROVEDORES` porque é dentro da lista, na entrada do provedor,
+ * que este id é usado — um `const` declarado depois da lista estouraria em TDZ
+ * na hora de avaliar o próprio array.
+ */
+export const PROVEDOR_POR_ASSINATURA = "openai-assinatura";
+
 export const PROVEDORES = [
   {
     id: "anthropic",
@@ -57,11 +77,30 @@ export const PROVEDORES = [
     id: "openai",
     rotulo: "OpenAI (GPT)",
     quandoUsar:
-      "Necessário para transcrever áudio e para indexar o seu material — esses dois pontos usam tecnologia da OpenAI mesmo quando o resto está em outro provedor.",
+      "Na configuração padrão, transcreve áudio. Para indexar material, uma chave OpenAI ou OpenRouter atende ao mesmo modelo de embedding.",
     aceitaEndpointProprio: true,
     catalogoSincronizavel: false,
     ondePegarAChave: "https://platform.openai.com/api-keys",
     prefixoDaChave: "sk-…",
+  },
+  {
+    id: PROVEDOR_POR_ASSINATURA,
+    rotulo: "OpenAI pela assinatura (ChatGPT)",
+    quandoUsar:
+      "Para quem já paga o ChatGPT: a conversa sai pela mesma conta do Codex, sem chave de API nenhuma — e, se a assinatura não estiver disponível ou falhar, a chamada cai sozinha na chave da empresa.",
+    // A assinatura não se aponta para outro endereço nem sincroniza catálogo:
+    // o endpoint é o da própria OpenAI e o modelo vem do que a conta tem.
+    aceitaEndpointProprio: false,
+    catalogoSincronizavel: false,
+    // Não existe chave a copiar aqui: quem conecta é o painel de Credenciais
+    // desta instalação (OAuth por PKCE com o mesmo login do Codex). O link
+    // aponta para o serviço cuja ASSINATURA este provedor usa — o host é o
+    // mesmo da fiação (`OPENAI_CODEX_ENDPOINT`), por isso a catraca de marca
+    // vê um destino só, já declarado como FORNECEDOR.
+    ondePegarAChave: "https://chatgpt.com/",
+    // Placeholder do campo de chave, que para este provedor não tem o que
+    // colar: o texto já diz a recusa antes de a pessoa tentar.
+    prefixoDaChave: "conectado pelo login — não se cola chave",
   },
   {
     id: "google",
@@ -93,6 +132,33 @@ export const PROVEDORES = [
     ondePegarAChave: "https://platform.deepseek.com/api_keys",
     prefixoDaChave: "sk-…",
   },
+  {
+    id: "requesty",
+    rotulo: "Requesty",
+    quandoUsar:
+      "Uma chave só para centenas de modelos de vários fabricantes, com a opção de manter o tráfego na Europa. Bom para comparar modelos sem abrir conta em cada provedor.",
+    aceitaEndpointProprio: true,
+    catalogoSincronizavel: true,
+    ondePegarAChave: "https://app.requesty.ai/api-keys",
+    prefixoDaChave: "rqsty-…",
+  },
+  {
+    id: "custom",
+    rotulo: "Provedor personalizado (compatível com OpenAI)",
+    quandoUsar:
+      "Endpoint seu que fala a API da OpenAI — OmniRouter, 9Router, LiteLLM hospedado ou proxy corporativo, num endereço público. Você informa o endereço (base URL) e a chave, e o CRM conversa com ele como conversa com a OpenAI.",
+    aceitaEndpointProprio: true,
+    catalogoSincronizavel: false,
+    // O provedor personalizado NÃO tem portal de chave — quem emite a chave é
+    // o gateway do próprio operador. O valor fica só porque o tipo exige um
+    // endereço para os outros; o diálogo esconde o link "Onde pegar a chave"
+    // quando este provedor está escolhido, e a página que explica o recurso é
+    // `docs/features/provedor-personalizado.md`. TLD `.example` de propósito:
+    // é o reservado para documentação (RFC 2606/6761), que a catraca de marca
+    // não trata como host de terceiro — e o link não é clicável, é escondido.
+    ondePegarAChave: "https://docs.example/provedor-personalizado",
+    prefixoDaChave: "sk-…",
+  },
 ] as const satisfies readonly ProvedorSuportado[];
 // `as const satisfies` e não anotação de tipo: a anotação apagaria os literais
 // e `Provider` viraria `string`, deixando o compilador aceitar qualquer texto
@@ -118,4 +184,79 @@ export const PROVEDOR_POR_ID: ReadonlyMap<string, ProvedorSuportado> = new Map(
 
 export function ehProvedorSuportado(id: string): boolean {
   return PROVEDOR_POR_ID.has(id);
+}
+
+/**
+ * OS PROVEDORES QUE TÊM CHAVE MAS NÃO CONVERSAM — lista IRMÃ, não um campo.
+ *
+ * O Jev devolve decisão tipada (nota, escolha, sim/não), nunca texto. Se ele
+ * entrasse em `PROVEDORES`, os doze consumidores de "quem escreve" (seletor do
+ * agente, "Qual você contratou" do onboarding, Modelo padrão da empresa,
+ * seletor de cada ponto) o ofereceriam como cérebro do atendimento, e todo
+ * turno morreria em `LlmProviderUnknownError`.
+ *
+ * Por isso a separação é por LISTA e não por um campo `natureza` na lista
+ * única: um consumidor NOVO de `PROVEDORES` simplesmente não vê o Jev, que é o
+ * lado seguro. Quem precisa dele — só as superfícies de CHAVE — pede a união
+ * explicitamente, e `tests/unit/provedores-de-decisao-catraca.test.ts` cobra
+ * que ninguém mais a peça.
+ */
+export const PROVEDORES_DE_DECISAO = [
+  {
+    id: "typesafe",
+    rotulo: "Jev (TypeSafe AI)",
+    quandoUsar:
+      "Não conversa com o cliente: toma decisões rápidas e baratas — como perceber se o cliente está irritado — geralmente em menos de um segundo. Trabalha junto com a sua IA principal.",
+    aceitaEndpointProprio: false,
+    catalogoSincronizavel: false,
+    ondePegarAChave: "https://console.typesafe.ai/keys",
+    prefixoDaChave: "apikey_…",
+  },
+] as const satisfies readonly ProvedorSuportado[];
+
+export const IDS_DE_PROVEDOR_DE_DECISAO = PROVEDORES_DE_DECISAO.map(
+  (p) => p.id,
+) as unknown as readonly [
+  (typeof PROVEDORES_DE_DECISAO)[number]["id"],
+  ...(typeof PROVEDORES_DE_DECISAO)[number]["id"][],
+];
+
+/** Tudo o que tem chave cadastrável: a tela de Credenciais e a rota dela. */
+export const PROVEDORES_COM_CHAVE = [...PROVEDORES, ...PROVEDORES_DE_DECISAO] as const;
+
+/**
+ * O LOGIN POR ASSINATURA — por que esta entrada fica em `PROVEDORES_COM_CHAVE`
+ * embora não se pareça com uma chave.
+ *
+ * `PROVEDORES_COM_CHAVE` é a união das duas listas (`tests/unit/provedores-de-decisao-catraca.test.ts`
+ * cobra que seja exatamente elas), e a assinatura entrou em `PROVEDORES`
+ * porque o seletor do agente, o padrão da empresa e o validador de escrita
+ * derivam de lá: é a lista de quem CONVERSA, e este provedor conversa.
+ *
+ * O que NÃO mudou: colar o par de tokens como chave continua sendo o erro que
+ * este provider existe para não cometer — quem lê a linha é o painel de
+ * conexão, a renovação e `resolveOrgLlmConfig` (um leitor genérico mandaria o
+ * JSON dos tokens no lugar da chave), e `validateProviderKey` devolve recusa
+ * explicando que a credencial nasce pelo login.
+ */
+export type ProvedorComChave =
+  | (typeof PROVEDORES_COM_CHAVE)[number]["id"]
+  | typeof PROVEDOR_POR_ASSINATURA;
+
+export const IDS_COM_CHAVE = PROVEDORES_COM_CHAVE.map((p) => p.id) as unknown as readonly [
+  ProvedorComChave,
+  ...ProvedorComChave[],
+];
+
+export function ehProvedorDeDecisao(id: string): boolean {
+  return (IDS_DE_PROVEDOR_DE_DECISAO as readonly string[]).includes(id);
+}
+
+/**
+ * O nome de gente de qualquer provedor que aparece numa execução, inclusive o
+ * Jev. Devolve só o rótulo, e não a lista: quem precisa NOMEAR (a tela de
+ * Execuções) não pede a união, e a catraca continua valendo só para CHAVE.
+ */
+export function rotuloDoProvedor(id: string): string | undefined {
+  return PROVEDORES_COM_CHAVE.find((p) => p.id === id)?.rotulo;
 }

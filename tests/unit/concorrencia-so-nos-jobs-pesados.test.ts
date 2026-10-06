@@ -27,13 +27,33 @@ const PESADOS: Record<string, string[]> = {
   "ci.yml": ["verify-parte", "invariants-majors"],
   "e2e.yml": ["e2e-parte"],
   "perf.yml": ["build-and-size"],
-  "publish-image.yml": ["build-and-push", "imagem-do-app-sobe", "imagens-de-fundo-sobem"],
+  "publish-image.yml": ["build-and-push", "juntar-manifestos", "imagem-do-app-sobe", "imagens-de-fundo-sobem"],
 };
 const SEM_GRUPO: Record<string, string[]> = {
   "ci.yml": ["verify", "invariants", "invariants-alcance"],
   "e2e.yml": ["e2e", "e2e-alcance"],
   "publish-image.yml": ["imagens-ok", "promover-stable", "a-tag-veio-da-main"],
 };
+
+// Todos os jobs declarados de um workflow — o bloco `jobs:`, recortado pela
+// mesma indentação de dois espaços do `blocoDoJob` (nenhum parser YAML aqui).
+// Serve para a conta dos dois mapas fechar: hoje os 16 jobs dos quatro
+// workflows da #1159 estão nos dois lados, mas nada impedia um job NOVO de
+// nascer fora dos dois.
+function jobsDoWorkflow(texto: string): string[] {
+  const marca = /^jobs:$/m.exec(texto);
+  if (!marca) throw new Error("bloco jobs: não encontrado");
+  const nomes: string[] = [];
+  for (const linha of texto.slice(marca.index + "jobs:".length).split("\n")) {
+    // O bloco `jobs:` vai até a primeira linha de coluna 0 que não seja
+    // comentário nem vazia — `on:`, `permissions:` etc. já passaram.
+    if (linha && !linha.startsWith(" ") && !linha.startsWith("#")) break;
+    const job = /^ {2}([A-Za-z0-9_-]+):\s*$/.exec(linha);
+    const nome = job?.[1];
+    if (nome) nomes.push(nome);
+  }
+  return nomes;
+}
 
 describe("concurrency: só nos jobs pesados", () => {
   it.each(Object.keys(PESADOS))("%s não declara concurrency no nível do workflow", (arq) => {
@@ -45,6 +65,12 @@ describe("concurrency: só nos jobs pesados", () => {
     (arq, job) => {
       const bloco = blocoDoJob(ler(arq), job);
       expect(bloco).toMatch(/^ {4}concurrency:\n {6}group: .*github\.event\.pull_request\.number \|\| github\.ref/m);
+      // Reentrada (aprovação de `action_required`, rerun) não cancela o head
+      // atual de outro commit. Medido em 22/09/2026 (#1446, #1431). A razão
+      // inteira está no cabeçalho do ci.yml.
+      expect(bloco).toContain(
+        "${{ github.event_name == 'pull_request' && github.run_attempt != '1' && format('-reentrada-{0}', github.event.pull_request.head.sha) || '' }}",
+      );
       const cancela = bloco.match(/^ {6}cancel-in-progress: (.*)$/m)?.[1];
       expect(cancela).toBe(
         arq === "publish-image.yml"
@@ -62,4 +88,22 @@ describe("concurrency: só nos jobs pesados", () => {
       expect(blocoDoJob(ler(arq), job)).not.toMatch(/^ {4}concurrency:/m);
     },
   );
+
+  // A conta fecha, e ela é o que faltava para a guarda valer amanhã: PESADOS e
+  // SEM_GRUPO cobrem os 16 jobs de hoje, mas nada aqui impedia um job NOVO de
+  // nascer fora dos dois — e aí ele nasce SEM grupo, sem que nenhum teste
+  // repare. É o defeito da #1159 entrando por um arquivo que ninguém leu, com
+  // os dois testes de cima continuando verdes. Falta decidir um lado só.
+  it.each(Object.keys(PESADOS))("%s: todo job tem uma decisão de concurrency declarada", (arq) => {
+    const decididos = [...(PESADOS[arq] ?? []), ...(SEM_GRUPO[arq] ?? [])];
+    const existentes = jobsDoWorkflow(ler(arq));
+    // O job nasceu e ninguém decidiu o lado dele: sem grupo, sem reprovação.
+    expect(existentes.filter((j) => !decididos.includes(j))).toEqual([]);
+    // O recíproco: entrada nos mapas apontando para job que já não existe é
+    // silêncio pior que ausência — a lista diz que há guarda e não há.
+    expect(decididos.filter((j) => !existentes.includes(j))).toEqual([]);
+    // E os dois lados não podem se contradizer: pesado SEM grupo é o defeito
+    // aberto, agregador COM grupo é o #1190 voltando.
+    expect((PESADOS[arq] ?? []).filter((j) => (SEM_GRUPO[arq] ?? []).includes(j))).toEqual([]);
+  });
 });

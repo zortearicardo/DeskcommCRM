@@ -26,6 +26,7 @@ vi.mock("@/lib/followup/engine", () => ({ createSupabaseAdminClient: () => ({}) 
 vi.mock("@/lib/logger", () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } }));
 
 import { enviarTextoFixoPendente } from "./enviar-texto-fixo";
+import { OrgNaoOperanteError } from "@/lib/organizacao/operante";
 
 const boundary = { organization_id: "org-1", contact_id: "contact-1", conversation_id: "conv-1", service_revision: 1, demanda_id: null, demanda_revision: null };
 const JOB = {
@@ -36,6 +37,7 @@ const JOB = {
 };
 
 const statusUpdates: string[] = [];
+const filtrosRunAfter: { op: string; col: string; v: string }[] = [];
 
 /** Admin stub: job_queue (select pending / claim / status) + followup_enrollments. */
 function admin() {
@@ -46,7 +48,8 @@ function admin() {
       _upd: null as Record<string, unknown> | null,
       select: () => chain,
       eq: () => chain,
-      lte: () => chain,
+      lte: (col: string, v: string) => (filtrosRunAfter.push({ op: "lte", col, v }), chain),
+      lt: (col: string, v: string) => (filtrosRunAfter.push({ op: "lt", col, v }), chain),
       in: () => chain,
       single: () => Promise.resolve({data:table==="send_ledger"?{id:"ledger-1"}:{settings:{}},error:null}),
       insert: () => chain,
@@ -74,6 +77,7 @@ function admin() {
   };
   return { from: (t: string) => make(t), rpc: async (name:string,args:Record<string,unknown>) => {
     if(name==="fn_followup_inline_settle") {statusUpdates.push(args.p_done?"done":"pending");return {data:true,error:null};}
+    if(name==="fn_followup_turno_descartado") {statusUpdates.push(`descartado:${args.p_org}:${args.p_job}`);return {data:true,error:null};}
     if(name==="fn_appointment_enrollment_current" || name==="fn_followup_job_current") return {data:true,error:null};
     return {data:{...boundary,status:"open",demanda_fechada_em:null},error:null};
   }} as never;
@@ -82,6 +86,7 @@ function admin() {
 beforeEach(() => {
   vi.clearAllMocks();
   statusUpdates.length = 0;
+  filtrosRunAfter.length = 0;
 });
 
 describe("enviarTextoFixoPendente · gate de elegibilidade", () => {
@@ -113,4 +118,39 @@ it.each(["queued","failed"])("%s não conta envio nem avança o fluxo",async sta
  decidir.mockResolvedValue({permite:true});sendMessageHandler.mockResolvedValueOnce({id:"msg-1",status});
  expect(await enviarTextoFixoPendente(admin())).toBe(0);
  expect(completeTurnForEnrollment).not.toHaveBeenCalled();expect(statusUpdates).toContain("pending");
+});
+
+it("org suspensa entre o gate e o envio → job encerrado (done), sem reenvio nem avanço do fluxo", async () => {
+  decidir.mockResolvedValue({ permite: true, motivo: "gate_aberto", bloqueioPorAllowlist: false });
+  sendMessageHandler.mockRejectedValueOnce(new OrgNaoOperanteError("org-1"));
+  expect(await enviarTextoFixoPendente(admin())).toBe(0);
+  expect(completeTurnForEnrollment).not.toHaveBeenCalled();
+  expect(statusUpdates).toContain("done");
+  expect(statusUpdates).not.toContain("pending");
+  // O evento vem ANTES do settle: sem ele, a reativação lê o job cancelado como
+  // worker morto e o dead-man mata a inscrição (action_turn_never_completed).
+  expect(statusUpdates).toEqual(["running", "descartado:org-1:job-1", "done"]);
+});
+
+it("falha que não é suspensão NÃO grava turn_discarded", async () => {
+  decidir.mockResolvedValue({ permite: true });
+  sendMessageHandler.mockRejectedValueOnce(new Error("canal fora"));
+  await enviarTextoFixoPendente(admin());
+  expect(statusUpdates.some((s) => s.startsWith("descartado"))).toBe(false);
+});
+
+// O banco grava run_after em µs; o JS lê o relógio em ms. Job gravado com
+// run_after=now() há menos de 1 ms (ex.: ...00.000500Z com o JS em ...00.000Z)
+// está vencido, e o filtro não pode escondê-lo: o corte é o FIM do ms corrente.
+it("filtro de vencimento cobre o milissegundo corrente inteiro (run_after em µs)", async () => {
+  vi.useFakeTimers({ now: new Date("2026-09-26T10:04:46.558Z"), toFake: ["Date"] });
+  try {
+    decidir.mockResolvedValue({ permite: true });
+    await enviarTextoFixoPendente(admin());
+  } finally {
+    vi.useRealTimers();
+  }
+  const run = filtrosRunAfter.filter((f) => f.col === "run_after");
+  expect(run.length).toBeGreaterThanOrEqual(2); // seleção e reivindicação
+  for (const f of run) expect(f).toEqual({ op: "lt", col: "run_after", v: "2026-09-26T10:04:46.559Z" });
 });

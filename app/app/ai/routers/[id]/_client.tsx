@@ -31,7 +31,7 @@ import { Textarea } from "@/components/ui/textarea";
 import { showApiError } from "@/components/feedback/ApiErrorToast";
 import { ArrowRight, CaretLeft, Info, Plus, Trash } from "@/lib/ui/icons";
 import { randomId } from "@/lib/random-id";
-import { usePermission } from "@/hooks/auth/AuthProvider";
+import { useAuth, usePermission } from "@/hooks/auth/AuthProvider";
 import {
   useRouter as useRouterData,
   useUpdateRouter,
@@ -44,6 +44,9 @@ import {
 } from "@/hooks/ai/useRouters";
 import type { ClassifierModelOption } from "@/lib/ai/classifier-models";
 import type { ChannelSessionLite } from "../../agents/[id]/_components/AgentForm";
+import { useFollowupFlows } from "@/hooks/followup/useFollowupFlows";
+// #2155 — funil/etapa de DESTINO da intenção: o card vai para o funil do produto.
+import { usePipelines, usePipelineStages } from "@/hooks/webhooks/useWebhookSources";
 import { useT } from "@/hooks/i18n/useT";
 
 interface AgentLite {
@@ -106,6 +109,8 @@ export function RouterEditorClient({
   // Uma chave só para os dois campos: escolher modelo sem levar o provedor junto
   // manda o id para o provedor da ORG, e a classificação falha sempre.
   const [classifier, setClassifier] = React.useState(() => classifierKeyFrom(router.config));
+  const [contextMessageCount, setContextMessageCount] = React.useState(() =>
+    typeof router.config?.context_message_count === "number" ? router.config.context_message_count : 4);
   const [draftMembers, setDraftMembers] = React.useState<DraftMember[]>(() =>
     members.map((m) => ({ ...m, key: m.id })),
   );
@@ -116,6 +121,12 @@ export function RouterEditorClient({
   const deleteRouter = useDeleteRouter();
   const saveMembers = useSaveMembers(routerId);
   const testRouter = useTestRouter(routerId);
+  // Fluxos de atendimento disponíveis para amarrar a uma intenção (surface=atendimento).
+  // Com o módulo desligado o seletor não existe: amarrar a um roteiro que não roda
+  // seria prometer um comportamento que a instalação não tem.
+  const { activeOrg } = useAuth();
+  const roteirosLigados = activeOrg?.modulos_ligados?.includes("fluxos_atendimento") === true;
+  const { data: atendimentoFlows } = useFollowupFlows({ surface: "atendimento", enabled: roteirosLigados });
 
   const baseline = React.useMemo(
     () => ({
@@ -123,28 +134,38 @@ export function RouterEditorClient({
       isActive: router.is_active,
       fallbackAgentId: router.fallback_agent_id ?? "",
       classifier: classifierKeyFrom(router.config),
-      members: members.map(({ agent_id, intent_name, intent_description, examples }) => ({
+      contextMessageCount: typeof router.config?.context_message_count === "number" ? router.config.context_message_count : 4,
+      members: members.map(({ agent_id, intent_name, intent_description, examples, flow_pointer_id, pipeline_id, stage_id }) => ({
         agent_id,
         intent_name,
         intent_description,
         examples,
+        flow_pointer_id: flow_pointer_id ?? null,
+        pipeline_id: pipeline_id ?? null,
+        stage_id: stage_id ?? null,
       })),
     }),
     [router, members],
   );
 
-  const currentMembers = draftMembers.map(({ agent_id, intent_name, intent_description, examples }) => ({
-    agent_id,
-    intent_name,
-    intent_description,
-    examples,
-  }));
+  const currentMembers = draftMembers.map(
+    ({ agent_id, intent_name, intent_description, examples, flow_pointer_id, pipeline_id, stage_id }) => ({
+      agent_id,
+      intent_name,
+      intent_description,
+      examples,
+      flow_pointer_id: flow_pointer_id ?? null,
+      pipeline_id: pipeline_id ?? null,
+      stage_id: stage_id ?? null,
+    }),
+  );
 
   const dirty =
     name !== baseline.name ||
     isActive !== baseline.isActive ||
     fallbackAgentId !== baseline.fallbackAgentId ||
     classifier !== baseline.classifier ||
+    contextMessageCount !== baseline.contextMessageCount ||
     JSON.stringify(currentMembers) !== JSON.stringify(baseline.members);
 
   const memberErrors = draftMembers.map((m) => {
@@ -179,6 +200,9 @@ export function RouterEditorClient({
         intent_name: "",
         intent_description: "",
         examples: [],
+        flow_pointer_id: null,
+        pipeline_id: null,
+        stage_id: null,
       },
     ]);
   }
@@ -197,7 +221,8 @@ export function RouterEditorClient({
         name !== baseline.name ||
         isActive !== baseline.isActive ||
         fallbackAgentId !== baseline.fallbackAgentId ||
-        classifier !== baseline.classifier
+        classifier !== baseline.classifier ||
+        contextMessageCount !== baseline.contextMessageCount
       ) {
         const [provider, modelId] = classifier.split("::");
         await updateRouter.mutateAsync({
@@ -206,10 +231,12 @@ export function RouterEditorClient({
           fallback_agent_id: fallbackAgentId || null,
           // O PATCH mescla `config` com a existente, então mandar só estes dois
           // campos preserva sticky/min_confidence.
-          config:
-            classifier === AUTO
+          config: {
+            ...(classifier === AUTO
               ? { classifier_model: null, classifier_provider: null }
-              : { classifier_model: modelId, classifier_provider: provider },
+              : { classifier_model: modelId, classifier_provider: provider }),
+            context_message_count: contextMessageCount,
+          },
         });
       }
       if (JSON.stringify(currentMembers) !== JSON.stringify(baseline.members)) {
@@ -331,6 +358,16 @@ export function RouterEditorClient({
                     )}
               </p>
             </div>
+            <div className="space-y-1">
+              <Label htmlFor="router-context-count">{t("Mensagens anteriores para o roteamento")}</Label>
+              <Input id="router-context-count" type="number" min={0} max={16} step={1}
+                value={contextMessageCount} disabled={!canManage}
+                onChange={(e) => setContextMessageCount(Math.max(0, Math.min(16, Number(e.target.value) || 0)))} />
+              <p className="text-xs text-muted-foreground">{t("Além da mensagem atual; inclui cliente e atendente.")}</p>
+              <details className="text-xs text-muted-foreground"><summary className="cursor-pointer">{t("Como funciona")}</summary>
+                {t("Vale para a sua IA de sempre, que classifica com estas mensagens anteriores. O Jev recebe só a mensagem atual. Mais mensagens podem aumentar custo e demora.")}
+              </details>
+            </div>
           </Card>
 
           <Card className="space-y-3 p-4">
@@ -404,6 +441,7 @@ export function RouterEditorClient({
                     <IntentRow
                       member={m}
                       agents={agents}
+                      flows={roteirosLigados ? (atendimentoFlows ?? []) : null}
                       disabled={!canManage}
                       error={memberErrors[i] ?? null}
                       duplicate={duplicateNames.has(m.intent_name.trim().toLowerCase())}
@@ -448,9 +486,84 @@ export function RouterEditorClient({
   );
 }
 
+
+/**
+ * #2155 — para onde o CARD vai quando a intenção casa. Sem destino, o agente é
+ * escolhido e o negócio fica no funil de entrada (o defeito da issue): o agente
+ * do produto não escreve num funil que não é o dele. `pipeline_id` sozinho vale —
+ * a etapa vira a primeira aberta do funil.
+ */
+function DestinoDoCard({
+  pipelineId,
+  stageId,
+  disabled,
+  onChange,
+}: {
+  pipelineId: string | null;
+  stageId: string | null;
+  disabled: boolean;
+  onChange: (patch: Partial<DraftMember>) => void;
+}) {
+  const t = useT();
+  const { data: pipelinesRes } = usePipelines();
+  const pipelines = pipelinesRes?.data ?? [];
+  const { data: boardRes } = usePipelineStages(pipelineId);
+  const stages = boardRes?.data?.stages ?? [];
+  return (
+    <div className="flex flex-wrap items-end gap-2" data-testid="seletor-de-destino">
+      <div className="min-w-48 flex-1 space-y-1">
+        <Label>{t("Funil de destino (opcional)")}</Label>
+        <Select
+          value={pipelineId ?? NONE}
+          onValueChange={(v) =>
+            // trocar de funil invalida a etapa: ela não pertence ao funil novo.
+            onChange(v === NONE ? { pipeline_id: null, stage_id: null } : { pipeline_id: v, stage_id: null })
+          }
+          disabled={disabled}
+        >
+          <SelectTrigger aria-label={t("Funil de destino (opcional)")}>
+            <SelectValue placeholder={t("Sem destino — só escolher o agente")} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={NONE}>{t("Sem destino — só escolher o agente")}</SelectItem>
+            {pipelines.map((pl) => (
+              <SelectItem key={pl.id} value={pl.id}>
+                {pl.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      {pipelineId !== null && stages.length > 0 && (
+        <div className="min-w-40 flex-1 space-y-1">
+          <Label>{t("Etapa de destino")}</Label>
+          <Select
+            value={stageId ?? AUTO}
+            onValueChange={(v) => onChange({ stage_id: v === AUTO ? null : v })}
+            disabled={disabled}
+          >
+            <SelectTrigger aria-label={t("Etapa de destino")}>
+              <SelectValue placeholder={t("Primeira etapa aberta")} />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value={AUTO}>{t("Primeira etapa aberta")}</SelectItem>
+              {stages.map((st) => (
+                <SelectItem key={st.id} value={st.id}>
+                  {st.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function IntentRow({
   member,
   agents,
+  flows,
   disabled,
   error,
   duplicate,
@@ -459,6 +572,8 @@ function IntentRow({
 }: {
   member: DraftMember;
   agents: AgentLite[];
+  /** `null` = módulo de roteiros desligado: o seletor não aparece. */
+  flows: Array<{ id: string; name: string }> | null;
   disabled: boolean;
   error: string | null;
   duplicate: boolean;
@@ -520,6 +635,39 @@ function IntentRow({
           maxLength={2000}
         />
       </div>
+      {flows !== null && (
+      <div className="space-y-1" data-testid="seletor-de-roteiro">
+        <Label>{t("Fluxo de atendimento (opcional)")}</Label>
+        <Select
+          value={member.flow_pointer_id ?? NONE}
+          onValueChange={(v) => onChange({ flow_pointer_id: v === NONE ? null : v })}
+          disabled={disabled}
+        >
+          <SelectTrigger>
+            <SelectValue placeholder={t("Nenhum — só roteia o agente")} />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={NONE}>{t("Nenhum — só roteia o agente")}</SelectItem>
+            {flows.map((f) => (
+              <SelectItem key={f.id} value={f.id}>
+                {f.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <p className="text-xs text-muted-foreground">
+          {t(
+            "Quando a intenção casar, este fluxo começa e as perguntas dele guiam o atendimento até o cliente completar.",
+          )}
+        </p>
+      </div>
+      )}
+      <DestinoDoCard
+        pipelineId={member.pipeline_id ?? null}
+        stageId={member.stage_id ?? null}
+        disabled={disabled}
+        onChange={onChange}
+      />
       <ExamplesInput
         value={member.examples}
         onChange={(examples) => onChange({ examples })}
@@ -640,7 +788,13 @@ function TestPanel({
   // definição de padrão que volta pela porta dos fundos. A cerca em
   // `tests/unit/confianca-do-handoff-nao-e-similaridade.test.ts` passou a cobrir
   // `app/app/ai` por causa desta linha.
-  const confianca = result?.confidence ?? null;
+  //
+  // Decidindo (e com a IA de sempre respondendo), em produção vale a escolha do
+  // Jev — e este bloco diz o que ACONTECERIA, então lê inteiro o lado que vale.
+  // Lendo a intenção e a confiança da IA ao lado do agente do Jev, ele dizia
+  // "cairia no atendimento padrão" com o agente do Jev logo abaixo.
+  const vale = result?.jev?.decide ? result.jev : result;
+  const confianca = vale?.confidence ?? null;
   const abaixoDoMinimo =
     confianca !== null && result !== undefined && confianca < result.min_confidence;
   return (
@@ -678,9 +832,9 @@ function TestPanel({
           {!pending && <ArrowRight />}
         </Button>
         {result && (
-          <div className="rounded-md border border-border/60 p-3 text-sm">
+          <div className="rounded-md border border-border/60 p-3 text-sm" data-testid="teste-resultado">
             <p>
-              {t("Intenção")}: <span className="font-medium">{result.intent_name ?? t("nenhuma casou")}</span>
+              {t("Intenção")}: <span className="font-medium">{vale?.intent_name ?? t("nenhuma casou")}</span>
               {confianca !== null && (
                 <span className="ml-2 text-xs text-muted-foreground">
                   {t("confiança")} {(confianca * 100).toFixed(0)}%
@@ -695,11 +849,90 @@ function TestPanel({
             )}
             <p>
               {t("Agente que atenderia")}:{" "}
-              <span className="font-medium">{result.agent_name ?? t("nenhum (sem fallback)")}</span>
+              <span className="font-medium" data-testid="teste-agente-que-atenderia">
+                {vale?.agent_name ?? t("nenhum (sem fallback)")}
+              </span>
             </p>
           </div>
         )}
+        {result?.jev && <EscolhasLadoALado result={result} jev={result.jev} />}
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * A escolha da IA de sempre e a do Jev, lado a lado, na mesma frase — é aqui que
+ * quem configura vê se os dois levariam o cliente ao MESMO agente antes de
+ * deixar o Jev decidir. Nada disto é gravado como comparação (só o atendimento
+ * de verdade conta no cartão do Jev).
+ */
+function EscolhasLadoALado({
+  result,
+  jev,
+}: {
+  result: RouterTestResult;
+  jev: NonNullable<RouterTestResult["jev"]>;
+}) {
+  const t = useT();
+  const porcento = (n: number) => `${(n * 100).toFixed(0)}%`;
+  const jevAbaixoDoMinimo = jev.intent_name !== null && jev.confidence !== null && jev.confidence < result.min_confidence;
+  // A mesma marca dos dois lados: decidindo, o bloco de cima lê só o Jev, e a
+  // escolha da IA abaixo do mínimo (que leva ao de reserva) ficava sem motivo.
+  const iaAbaixoDoMinimo =
+    result.intent_name !== null && result.confidence !== null && result.confidence < result.min_confidence;
+  return (
+    <div className="grid gap-2 sm:grid-cols-2" data-testid="teste-com-o-jev">
+      <div className="rounded-md border border-border/60 p-3 text-sm" data-testid="teste-escolha-da-ia">
+        <p className="text-xs text-muted-foreground">{t("Sua IA escolheu")}</p>
+        <p className="font-medium">
+          {result.ia_consultada === false ? t("Não foi necessário consultar a IA de sempre.") : result.confidence === null ? t("não respondeu") : (result.agent_name ?? t("nenhum (sem fallback)"))}
+        </p>
+        {result.confidence !== null && (
+          <p className="text-xs text-muted-foreground">
+            {result.intent_name ?? t("nenhuma intenção")} · {porcento(result.confidence)}
+            {iaAbaixoDoMinimo && ` — ${t("abaixo do mínimo")}`}
+          </p>
+        )}
+      </div>
+      <div className="rounded-md border border-border/60 p-3 text-sm" data-testid="teste-escolha-do-jev">
+        <p className="text-xs text-muted-foreground">{t("O Jev escolheu")}</p>
+        <p className="font-medium">
+          {jev.respondeu ? (jev.agent_name ?? t("nenhum (sem fallback)")) : t("não respondeu")}
+        </p>
+        {/* Sem motivo, "não respondeu" não levava a lugar nenhum: o porquê (a
+            chave, o crédito, o roteador sem intenções) está no cartão dele. */}
+        {!jev.respondeu && (
+          <Link className="text-xs underline underline-offset-4" href="/app/ai/providers">
+            {t("Ver o motivo no cartão do Jev")}
+          </Link>
+        )}
+        {jev.respondeu && jev.confidence !== null && (
+          <p className="text-xs text-muted-foreground">
+            {jev.intent_name ?? t("nenhuma intenção")} · {porcento(jev.confidence)}
+            {jevAbaixoDoMinimo && ` — ${t("abaixo do mínimo")}`}
+          </p>
+        )}
+      </div>
+      <p className="text-xs text-muted-foreground sm:col-span-2" data-testid="teste-quem-decide">
+        {result.modo_roteador === "sob_demanda" && jev.estado === "decidindo"
+          ? jev.decide
+            ? t("O Jev decidiu sozinho; a IA de sempre não foi chamada.")
+            : t("O Jev precisou de reserva. A IA de sempre foi consultada; sem resposta válida, valem as regras de fallback do roteador.")
+          : jev.decide
+          ? t("O Jev decide esta tarefa: em produção, vale a escolha dele, e a sua IA fica de reserva.")
+          : jev.estado === "observando"
+            ? // Sem a resposta da IA não há "escolha da sua IA": vale a regra de sempre.
+              result.confidence === null
+              ? t(
+                  "O Jev só observa esta tarefa. Sem a resposta da sua IA, em produção vale a regra de sempre: o agente que já atendia a conversa ou o “Agente de fallback” do roteador.",
+                )
+              : t("O Jev só observa esta tarefa: em produção, vale a escolha da sua IA.")
+            : // Sem a resposta da IA, vale a regra de sempre, tenha o Jev respondido ou não (R2).
+              result.confidence === null
+              ? t("O Jev decide esta tarefa, mas sem a resposta da sua IA vale a regra de sempre — nunca só o Jev.")
+              : t("O Jev decide esta tarefa, mas não respondeu: em produção, a sua IA decidiria no lugar dele.")}
+      </p>
+    </div>
   );
 }

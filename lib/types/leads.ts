@@ -70,8 +70,9 @@ export interface Lead {
    *
    * Ausente é estado LEGÍTIMO e comum: lead criado à mão ou por webhook não tem
    * contato, e contato sem conversa existe. O card precisa saber a diferença
-   * entre "não há conversa" e "ainda não carregou" — por isso `undefined` e não
-   * um objeto vazio.
+   * entre "não há conversa" e "ainda não carregou": a rota do quadro devolve
+   * `null` para contato SEM conversa (o card mostra "Abrir conversa", #1993) e
+   * deixa ausente (`undefined`) para lead sem contato. Nunca um objeto vazio.
    */
   conversa?: {
     id: string;
@@ -90,6 +91,15 @@ export interface Lead {
   } | null;
   assigned_at: string | null;
   last_activity_at: string | null;
+  /**
+   * 0071: quando o lead ENTROU no estágio atual. Carimbado por trigger.
+   *
+   * É o relógio de "tempo no estágio" (`hoursInStage` do card do Kanban) e
+   * nada mais: `last_activity_at` é tempo SEM RESPOSTA, que é outra pergunta.
+   * Nullable porque a coluna é `timestamptz` sem `not null` — o backfill da 0071
+   * cobriu o que existia, mas lead escrito fora do trigger pode vir nulo.
+   */
+  stage_changed_at: string | null;
   expected_close_date: string | null;
   closed_at: string | null;
   source: string;

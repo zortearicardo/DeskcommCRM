@@ -89,7 +89,17 @@ export default async function PrivacyPage() {
           <li>{t("a plataforma de mensagens usada para conversar com o cliente;")}</li>
           <li>
             {t(
-              "o provedor de inteligência artificial contratado pelo operador, que recebe o trecho da conversa necessário para gerar a resposta;",
+              "o provedor de inteligência artificial contratado pelo operador, que recebe o trecho da conversa necessário para gerar a resposta ou avaliar a conversa;",
+            )}
+          </li>
+          <li>
+            {t(
+              "quando o operador liga o Jev (desligado por padrão), a TypeSafe AI, nos Estados Unidos, que recebe cada mensagem do cliente, sozinha e já sem CPF, telefone e e-mail, para avaliar se ele está irritado, se a mensagem tenta manipular o atendimento automático, a qual área da empresa ela se destina, se ela pede para falar com uma pessoa ou para parar de receber mensagens e, quando ela responde a um follow-up, em qual das saídas do fluxo ela se encaixa;",
+            )}
+          </li>
+          <li>
+            {t(
+              "quando o operador cadastra uma chave de Mapas (desligado por padrão), o Google, que recebe as coordenadas da localização que o cliente compartilhou, para devolver a rua e a cidade aproximadas;",
             )}
           </li>
           <li>{t("o provedor de infraestrutura onde o servidor está hospedado.")}</li>
@@ -125,7 +135,7 @@ export default async function PrivacyPage() {
         <h2 className="text-base font-semibold">{t("7. Segurança")}</h2>
         <p>
           {t(
-            "O acesso é controlado por conta, senha e papel, com verificação em duas etapas obrigatória para administradores. Cada organização hospedada só enxerga os próprios dados, e as chaves de integração são guardadas cifradas.",
+            "O acesso é controlado por conta, senha e papel. A verificação em duas etapas é opcional para todos e só pode ser exigida de quem administra. Cada organização hospedada só enxerga os próprios dados, e as chaves de integração são guardadas cifradas.",
           )}
         </p>
       </section>

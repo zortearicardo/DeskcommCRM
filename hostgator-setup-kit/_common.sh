@@ -2,6 +2,12 @@
 # Helpers compartilhados pelos scripts do kit. Sourced, não executado direto.
 set -euo pipefail
 
+# Idioma da CLI (t(), IDIOMA_CLI) — ver o cabeçalho de _i18n.sh. Sourced aqui
+# porque update.sh e os demais scripts do kit sourceiam _common.sh sem passar
+# por install.sh; instalação já em andamento no mesmo processo (install.sh)
+# mantém a escolha, já exportada em DESKCOMM_IDIOMA_CLI.
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_i18n.sh"
+
 COMPOSE="docker-compose.prod.yml"
 COMPOSE_TRAEFIK="docker-compose.traefik.yml"
 COMPOSE_NPM="docker-compose.npm.yml"
@@ -12,28 +18,203 @@ COMPOSE_NPM="docker-compose.npm.yml"
 COMPOSE_BUILD="docker-compose.build.yml"
 
 # ── Arquitetura das imagens publicadas ───────────────────────────────────────
-# O registry publica hoje somente linux/amd64. Sem esta guarda, ARM64 chega até
-# o pull e morre com "no matching manifest"; o update.sh traduzia isso como
-# pacote ainda publicando/privado, um diagnóstico que manda repetir algo que
-# nunca vai funcionar nessa máquina.
+# O CI publica app, worker, scheduler e agente de voz em linux/amd64 e
+# linux/arm64. O instalador escolhe também a imagem oficial WAHA NOWEB ARM64;
+# Redis, Caddy e SRH já publicam manifestos ARM64. Sem reconhecer a arquitetura
+# aqui, uma VPS A1 seria recusada antes de chegar ao fluxo que já tem imagens
+# nativas para ela.
 #
 # A decisão fica pura no argumento para os testes simularem a arquitetura sem
 # depender do runner. A leitura de `uname -m` é o único ponto ligado ao host.
 arquitetura_suportada_pelo_kit() {
   case "${1:-}" in
-    x86_64|amd64) return 0 ;;
+    x86_64|amd64|aarch64|arm64) return 0 ;;
     *) return 1 ;;
   esac
 }
 
+# WAHA publica NOWEB em tags distintas por arquitetura. O instalador grava
+# essa referência no .env; `enter_project` também cobre um .env antigo sem a
+# variável. A tag é fixa e corresponde à mesma versão funcional em ambas.
+imagem_waha_padrao_para_host() {
+  case "$(uname -m 2>/dev/null || true)" in
+    aarch64|arm64) printf '%s' 'devlikeapro/waha:noweb-arm-2026.7.2' ;;
+    *)             printf '%s' 'devlikeapro/waha:latest-2026.7.2' ;;
+  esac
+}
+
+# Quem já roda em ARM (#1266) tem no .env o WAHA que o install.sh antigo
+# gravava — `devlikeapro/waha` e, desde 13/08/2026, `latest-2026.7.2` —, e os
+# dois índices só têm linux/amd64. Troca SÓ esses valores conhecidos (e o vazio,
+# em que o default do compose seria o amd64); qualquer outra escolha do
+# operador, WAHA Plus inclusive, fica intacta. Pura no argumento, como a de cima.
+waha_amd64_conhecido_em_arm() {  # waha_amd64_conhecido_em_arm <arquitetura> <WAHA_IMAGE do .env> → 0 = trocar
+  case "${1:-}" in aarch64|arm64) ;; *) return 1 ;; esac
+  case "${2:-}" in
+    ""|devlikeapro/waha|devlikeapro/waha:latest|devlikeapro/waha:latest-2026.7.2) return 0 ;;
+  esac
+  return 1
+}
+
+# ── JÁ EXISTE UMA INSTALAÇÃO REAL AQUI? (#1266, corrigido pelo #1778) ───────
+#
+# A guarda do #1042 vivia no TOPO dos dois scripts, e por isso matava antes de
+# chegar ao `construir_aqui_e_subir` (#1060/#1143) — a recuperação por build
+# local para uma arquitetura sem imagem publicada. As duas mudanças tinham
+# teste verde isoladamente e ninguém rodou as duas juntas: o resultado foi um
+# `exit 1` na PRIMEIRA linha, que deixava uma instalação existente nessa
+# arquitetura sem poder rodar `update.sh` de novo, e sem bandeira nenhuma.
+#
+# O sinal NÃO pode ser o estado do DIRETÓRIO. "compose + `.env`" chega junto
+# numa instalação NOVA: o `.env` pode ter sido copiado de outra máquina, gerado
+# por automação, ou deixado por uma rodada anterior do `--yes` que parou no
+# meio. Com esse critério, um `install.sh --yes` numa VPS de arquitetura sem
+# imagem publicada e com o `.env` já preenchido passava pela guarda como se
+# fosse instalação existente e ia construir as imagens na própria VPS (15–25
+# min) — exatamente o que a guarda do #1042 existe para impedir. E o `.env` sozinho nunca provou nada: o
+# `git clone` de uma instalação nova pode trazer um `.env` de exemplo.
+#
+# O sinal do DIRETÓRIO entra como CONDIÇÃO, nunca como prova: sem compose nem
+# `.env` não há nem nome de projeto para procurar, e o marcador — que só o
+# install.sh escreve, e sempre ao lado do `.env` — é o mesmo par sem prova.
+#
+# O que prova é o que a instalação DEIXOU no Docker, e a guarda pergunta ao
+# Docker diretamente. `nome_do_projeto_compose` mora mais abaixo, no bloco de
+# proxy/nome de projeto; por isso o cálculo do nome fica em uma função só, e o
+# resto a chama por nome em tempo de execução (o shell resolve a chamada
+# quando ela acontece, não quando o arquivo é lido) — o que deixa esta função
+# aqui em cima, onde a guarda precisa dela, sem depender da ordem do arquivo.
+#
+# O volume do Postgres NÃO entra: ele só existe no modo single-server e some
+# junto com o `down -v` que o próprio kit ensina como receita de "recomeçar" —
+# quem o encontrasse seria uma instalação derrubada, não uma instalação real.
+MARCA_INSTALACAO_NOME=".deskcomm-instalado"
+
+# O nome do projeto Docker DESTA instalação, na ordem que importa. O
+# COMPOSE_PROJECT_NAME do `.env` manda quando existe (é o nome que os
+# contêineres carregam no label); o derivado do diretório é o que o Compose
+# usaria sem ele, e as duas entradas são testadas. Errar o nome faria a guarda
+# não achar o contêiner de quem JÁ TEM instalação — e a recusa voltaria a matar
+# a recuperação do #1775, que é exatamente o que o sinal de contêiner
+# existe para não fazer.
+#
+# O derivado do diretório é REPETIDO aqui, e não chamado de
+# `nome_do_projeto_compose`: essa função mora ~500 linhas abaixo deste ponto, e
+# a guarda roda no TOPO do arquivo, quando ela ainda não existe (chamar por nome
+# aqui daria "command not found" e a recusa do #1042 viraria um erro de
+# sintaxe). A fórmula é a de lá — minúsculo, só [a-z0-9_-], com os `_`/`-` do
+# INÍCIO aparados — e `tests/shell/` mede as duas cópias iguais.
+nomes_do_projeto_da_instalacao() {  # nomes_do_projeto_da_instalacao <diretório>
+  local dir="$1" declarado derivado
+  declarado="$(sed -n 's/^[[:space:]]*COMPOSE_PROJECT_NAME=//p' "$dir/.env" 2>/dev/null \
+    | head -1 | tr -d '\r' | tr -d '"'"'" | tr -d '[:space:]')"
+  derivado="$(basename "$dir" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9_-')"
+  derivado="${derivado#"${derivado%%[!_-]*}"}"
+  # Um valor fora do que o Compose aceita como nome é melhor ignorado do que
+  # procurado: o `--filter` não valida, e o nome errado devolve vazio — que é a
+  # mesma resposta de "não achei", e é a que manda recusar.
+  case "$declarado" in
+    ''|*[!a-z0-9_-]*) ;;
+    *) printf '%s\n%s\n' "$declarado" "$derivado" ; return 0 ;;
+  esac
+  printf '%s\n' "$derivado"
+}
+
+# Há contêiner (rodando OU parado) do projeto compose informado? O `-a` conta o
+# que está parado: quem instalou e parou o CRM tem instalação do mesmo jeito, e
+# parar o stack é uma pausa, não um desinstalar. `docker` fora do PATH (ou sem
+# permissão no socket) devolve 1, que é a resposta que manda RECUSAR — nunca
+# adivinhar instalação a partir de um `docker` que não respondeu.
+conteiner_do_projeto_existe() {  # conteiner_do_projeto_existe <projeto compose>
+  [ -n "${1:-}" ] || return 1
+  command -v docker >/dev/null 2>&1 || return 1
+  [ -n "$(docker ps -a -q --filter "label=com.docker.compose.project=$1" 2>/dev/null)" ]
+}
+
+instalacao_real_do_kit_aqui() {
+  local d nome
+  for d in "$PWD" "$PWD/deskcommcrm"; do
+    [ -f "$d/$COMPOSE" ] && [ -f "$d/.env" ] || continue
+    [ -f "$d/$MARCA_INSTALACAO_NOME" ] && return 0
+    while IFS= read -r nome; do
+      [ -n "$nome" ] || continue
+      conteiner_do_projeto_existe "$nome" && return 0
+      conteiner_do_projeto_existe "$nome-supabase" && return 0
+    done <<EOF
+$(nomes_do_projeto_da_instalacao "$d")
+EOF
+  done
+  return 1
+}
+
+# O install.sh grava este marcador com a stack no ar, para que a guarda de
+# arquitetura reconheça a instalação pelo QUE ELA DEIXOU, e não pelo que veio
+# pronto no diretório. `chmod 600` pelo mesmo rigor do `.env`: o arquivo não é
+# segredo, mas também não é para vazar.
+marcar_instalacao_feita() {  # marcar_instalacao_feita [versão]
+  # `local` um por linha, e o segundo já com o valor montado: no mesmo `local`,
+  # o nome da esquerda ainda não existe quando a direita é avaliada, e com
+  # `set -u` o `local dir=… marca="$dir/…"` morre em "unbound variable" — o
+  # arquivo nunca era gravado e a instalação que deu certo mesmo assim é que
+  # escondia o defeito.
+  local dir="${PROJECT_DIR:-$PWD}"
+  local marca="$dir/$MARCA_INSTALACAO_NOME"
+  { printf 'instalado_em=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo desconhecido)"
+    printf 'versao=%s\n' "${1:-}"; } > "$marca" 2>/dev/null || return 1
+  chmod 600 "$marca" 2>/dev/null || true
+}
+
+# Ecoa: amd64 | arm64 | recuperar | nova
+#
+# A decisão é PURA no que recebe: `uname` e a leitura do disco ficam fora, para
+# o teste simular as três respostas sem depender do runner nem de um diretório
+# de verdade. Quem traduz em mensagem é `verificar_arquitetura_do_kit`.
+veredito_da_arquitetura() {  # veredito_da_arquitetura <arquitetura> [0=nova | 1=instalação existente]
+  local arch="${1:-}" existe="${2:-0}"
+  case "$arch" in
+    x86_64|amd64) printf 'amd64'; return 0 ;;
+    aarch64|arm64) printf 'arm64'; return 0 ;;
+  esac
+  [ "$existe" = 1 ] && { printf 'recuperar'; return 0; }
+  printf 'nova'
+}
+
 verificar_arquitetura_do_kit() {
-  local arch
-  arch="$(uname -m 2>/dev/null || printf 'desconhecida')"
-  arquitetura_suportada_pelo_kit "$arch" && return 0
+  local arch existe=0
+  arch="$(uname -m 2>/dev/null || t "desconhecida")"
+  # O sinal de "instalação real" SÓ é perguntado quando a arquitetura não é
+  # suportada. Em amd64 ou arm64 o veredito já está definido e a guarda
+  # atravessa, então perguntar seria trabalho inútil — e, com o critério do
+  # #1778, trabalho que chama o `docker` no TOPO do install.sh, antes de
+  # qualquer passo do instalador. A seção 4 do teste de #1778 mede isso em
+  # x86_64.
+  if ! arquitetura_suportada_pelo_kit "$arch"; then
+    instalacao_real_do_kit_aqui && existe=1
+  fi
+
+  case "$(veredito_da_arquitetura "$arch" "$existe")" in
+    amd64|arm64) return 0 ;;
+    recuperar)
+      # O update.sh relê este arquivo depois do checkout da versão nova, e a
+      # guarda roda de novo no topo: sem esta trava o dono lia o mesmo aviso
+      # duas vezes na mesma atualização. A variável não é exportada, então a
+      # trava vale para ESTE processo e nenhum script filho herda o silêncio.
+      [ -n "${_DESKCOMM_AVISO_ARQ_DADO:-}" ] && return 0
+      _DESKCOMM_AVISO_ARQ_DADO=1
+      # `printf` e não c_ylw: este ponto roda no TOPO do arquivo, e as cores só
+      # são definidas algumas linhas abaixo (é a mesma razão do `printf` da
+      # recusa logo abaixo). O aviso vai para o STDERR, como a recusa: o
+      # agent.sh manda a saída do update.sh para arquivo e o dono lê o fim dela.
+      printf '%s\n' \
+        "⚠ $(t "Este servidor usa arquitetura '{1}', e as imagens publicadas do DeskcommCRM são linux/amd64 e linux/arm64." "$arch")" \
+        "  $(t "Como esta instalação JÁ EXISTE, sigo em frente: as imagens da versão alvo serão construídas nesta própria VPS.")" \
+        "  $(t "Leva de 15 a 25 minutos. Uma instalação NOVA exige x86_64/amd64 ou ARM64/aarch64 com imagens publicadas.")" >&2
+      return 0 ;;
+  esac
 
   printf '%s\n' \
-    "✖ Este servidor usa arquitetura '$arch', mas as imagens publicadas do DeskcommCRM hoje são linux/amd64." \
-    "  Use uma VPS x86_64/amd64. Repetir o download não resolve; ARM64 só será suportado quando houver imagens multi-arquitetura." >&2
+    "✖ $(t "Este servidor usa arquitetura '{1}', mas o DeskcommCRM não publica imagens para ela (linux/amd64 e linux/arm64 estão disponíveis)." "$arch")" \
+    "  $(t '  Use uma VPS x86_64/amd64 ou ARM64/aarch64. Repetir o download não resolve.' | sed 's/^  //')" >&2
   return 1
 }
 
@@ -64,10 +245,31 @@ unset _deskcomm_chamador
 # Todo `docker compose` do kit passa por aqui: com proxy externo, um comando sem
 # o override subiria o Caddy e ele iria bater de frente com o proxy da hospedagem.
 dc() {
+  # Overlay da CA do Supabase (#829): só com a variável declarada, o arquivo da
+  # CA existindo no disco (ca_do_supabase_ok) E o overlay no MESMO checkout — o
+  # install.sh chama dc() antes do clone, e um -f apontando para arquivo que
+  # não existe derruba o compose no meio da instalação. Entra por ÚLTIMO, depois
+  # dos overlays de modo e de proxy, que é a ordem em que o compose aplica.
+  local -a ca=()
+  if ca_do_supabase_ok && [ -f docker-compose.supabase-ca.yml ]; then ca=(-f docker-compose.supabase-ca.yml); fi
+  if [ "${SINGLE_SERVER:-0}" = "1" ]; then
+    # #2099: o single-server também respeita o proxy da hospedagem. Os dois
+    # ramos eram `if SINGLE_SERVER` → return ANTES do seletor, então o
+    # docker-compose.traefik.yml (ou npm) nunca entrava aqui: o Caddy do
+    # single-server subia e perdia o bind das 80/443 para o Traefik/NPM que já
+    # estava lá. Junta os dois: o overlay do proxy vem DEPOIS do overlay do
+    # single-server, e o padrão (sem a variável) continua só o single-server.
+    case "${REVERSE_PROXY:-caddy}" in
+    traefik) docker compose -f "$COMPOSE" -f docker-compose.single-server.yml -f "$COMPOSE_TRAEFIK" ${ca[@]+"${ca[@]}"} "$@" ;;
+    npm)     docker compose -f "$COMPOSE" -f docker-compose.single-server.yml -f "$COMPOSE_NPM" ${ca[@]+"${ca[@]}"} "$@" ;;
+    *)       docker compose -f "$COMPOSE" -f docker-compose.single-server.yml ${ca[@]+"${ca[@]}"} "$@" ;;
+    esac
+    return
+  fi
   case "${REVERSE_PROXY:-caddy}" in
-  traefik) docker compose -f "$COMPOSE" -f "$COMPOSE_TRAEFIK" "$@" ;;
-  npm)     docker compose -f "$COMPOSE" -f "$COMPOSE_NPM" "$@" ;;
-  *)       docker compose -f "$COMPOSE" "$@" ;;
+  traefik) docker compose -f "$COMPOSE" -f "$COMPOSE_TRAEFIK" ${ca[@]+"${ca[@]}"} "$@" ;;
+  npm)     docker compose -f "$COMPOSE" -f "$COMPOSE_NPM" ${ca[@]+"${ca[@]}"} "$@" ;;
+  *)       docker compose -f "$COMPOSE" ${ca[@]+"${ca[@]}"} "$@" ;;
   esac
 }
 
@@ -75,11 +277,361 @@ dc() {
 # dono. Se a mensagem omitisse o override numa instalação com proxy externo, o
 # próprio dono derrubaria o site seguindo a instrução do kit.
 dc_files() {
+  # Mesma condição do dc() (#829): a mensagem que ensina o comando tem de
+  # carregar o overlay da CA quando o kit mesmo o usaria — sem isso o dono
+  # refaz o `up -d` sem a CA e o app volta a sem-verificação.
+  local sufixo=""
+  if ca_do_supabase_ok && [ -f docker-compose.supabase-ca.yml ]; then
+    sufixo=" -f docker-compose.supabase-ca.yml"
+  fi
+  if [ "${SINGLE_SERVER:-0}" = "1" ]; then
+    # #2099: mesma junção de dc() — a lista de -f tem de bater com o que dc()
+    # realmente roda, ou a mensagem ensinaria o dono a omitir o overlay do
+    # proxy e o próprio dono derrubaria o site seguindo a instrução do kit.
+    case "${REVERSE_PROXY:-caddy}" in
+    traefik) printf -- '-f %s -f %s -f %s%s' "$COMPOSE" docker-compose.single-server.yml "$COMPOSE_TRAEFIK" "$sufixo" ;;
+    npm)     printf -- '-f %s -f %s -f %s%s' "$COMPOSE" docker-compose.single-server.yml "$COMPOSE_NPM" "$sufixo" ;;
+    *)       printf -- '-f %s -f %s%s' "$COMPOSE" docker-compose.single-server.yml "$sufixo" ;;
+    esac
+    return
+  fi
   case "${REVERSE_PROXY:-caddy}" in
-  traefik) printf -- '-f %s -f %s' "$COMPOSE" "$COMPOSE_TRAEFIK" ;;
-  npm)     printf -- '-f %s -f %s' "$COMPOSE" "$COMPOSE_NPM" ;;
-  *)       printf -- '-f %s' "$COMPOSE" ;;
+  traefik) printf -- '-f %s -f %s%s' "$COMPOSE" "$COMPOSE_TRAEFIK" "$sufixo" ;;
+  npm)     printf -- '-f %s -f %s%s' "$COMPOSE" "$COMPOSE_NPM" "$sufixo" ;;
+  *)       printf -- '-f %s%s' "$COMPOSE" "$sufixo" ;;
   esac
+}
+
+# ── A CA do Supabase, declarada UMA vez (#829) ────────────────────────────────
+#
+# O pooler da nuvem apresenta uma cadeia que a trust store padrão não conhece
+# (SELF_SIGNED_CERT_IN_CHAIN quando o cliente exige verificação). Fornecer a CA
+# oficial resolve — mas até aqui não existia caminho declarado: o runtime
+# (app/worker/scheduler) e os clientes Postgres EFÊMEROS do kit
+# (`docker run postgres:17-alpine psql`) moram em lugares diferentes e cada um
+# precisava do arquivo por conta própria, com override de Compose só para o
+# app/worker justamente não cobrindo os temporários.
+#
+# Daqui em diante é UMA chave no .env, lida pelos três consumidores:
+#
+#   SUPABASE_SSL_ROOT_CERT=/root/certs/prod-ca-2021.crt
+#
+# Caminho desta MÁQUINA (host), não do contêiner — o kit monta o arquivo
+# somente-leitura no caminho fixo abaixo e traduz para cada cliente:
+#   • psql/pg_dump efêmeros → -v ...:ro + PGSSLROOTCERT (libpq);
+#   • app/worker/scheduler  → overlay docker-compose.supabase-ca.yml
+#     (volume :ro + NODE_EXTRA_CA_CERTS), que dc() só acrescenta com a CA pronta;
+#   • quem lê .env direto (node, cliente Node fora do compose) → a própria
+#     chave, documentada em .env.example.
+# A verificação NUNCA é desligada. No Node (NODE_EXTRA_CA_CERTS) a CA soma à
+# trust store. Na libpq, o PGSSLROOTCERT apontando para um arquivo que existe
+# faz `sslmode=require` se comportar como verify-ca (comportamento documentado
+# da libpq): com a CA declarada, uma URL com require passa a verificar a cadeia
+# nos psql do kit — e uma CA errada faz esses psql falharem fechado.
+# Chave ausente = o kit faz o que sempre fez (o healthcheck só informa).
+#
+# O download oficial (a mesma CA da issue):
+#   curl -fsSL -o /root/certs/prod-ca-2021.crt \
+#     https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt
+CA_NO_CONTAINER="/etc/deskcomm/ca/supabase-ca.crt"
+
+# stdout: o caminho ABSOLUTO do arquivo (o docker recusa bind relativo).
+# stderr: o que falta, sempre com o nome da variável — é a frase que o
+# diagnóstico mostra quando há falha de certificado, no lugar do
+# `SELF_SIGNED_CERT_IN_CHAIN` cru que a issue reportou.
+# Quem só quer saber se está pronta: ca_do_supabase_ok.
+ca_do_supabase() {
+  local p="${SUPABASE_SSL_ROOT_CERT:-}"
+  if [ -z "$p" ]; then
+    printf '%s' "SUPABASE_SSL_ROOT_CERT não está declarada no .env — sem ela o kit não recebe a CA do Supabase. Declare SUPABASE_SSL_ROOT_CERT=/caminho/do/prod-ca-2021.crt (baixe com: curl -fsSL -o /root/certs/prod-ca-2021.crt https://supabase-downloads.s3-ap-southeast-1.amazonaws.com/prod/ssl/prod-ca-2021.crt)" >&2
+    return 1
+  fi
+  case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+  if [ ! -f "$p" ] || [ ! -r "$p" ]; then
+    printf '%s' "SUPABASE_SSL_ROOT_CERT aponta para '$p', e este arquivo não existe (ou não é legível). Corrija o caminho no .env — a CA fica FORA do checkout, e o kit só monta arquivo que existe." >&2
+    return 1
+  fi
+  printf '%s' "$p"
+}
+
+# Silenciosa, para as decisões de montagem (dc/pg_container): sem CA pronta o
+# overlay de runtime NÃO entra — um bind para arquivo inexistente faria o
+# compose criar um DIRETÓRIO no lugar da CA e subir o app sem ela.
+ca_do_supabase_ok() { ca_do_supabase >/dev/null 2>&1; }
+
+# psql/pg_dump efêmeros. No modo single-server o Postgres só é alcançável pela
+# bridge privada (supabase-db), nunca por porta pública.
+#
+# Com a CA declarada, todo contêiner efêmero nasce com o arquivo montado
+# somente-leitura e PGSSLROOTCERT apontando para ele: é o que faz uma connection
+# string com `sslmode=verify-full` (ou um teste `PGSSLMODE=verify-full`)
+# validar cadeia dentro do contêiner. Idempotente por construção — cada chamada
+# monta de novo o MESMO caminho fixo, sem acumular flag nenhuma.
+pg_container() {
+  local -a rede=() ca=()
+  local caminho=""
+  [ -n "${PSQL_DOCKER_NETWORK:-}" ] && rede=(--network "$PSQL_DOCKER_NETWORK")
+  # `local caminho` na linha de cima, não em `local caminho="$(...)"`: com a
+  # atribuição junto, o status do comando substituído some dentro do `local` e
+  # este `if` aceitaria uma CA quebrada como se estivesse pronta.
+  if caminho="$(ca_do_supabase 2>/dev/null)"; then
+    ca=(-v "$caminho:$CA_NO_CONTAINER:ro" -e "PGSSLROOTCERT=$CA_NO_CONTAINER")
+  fi
+  docker run --rm ${rede[@]+"${rede[@]}"} ${ca[@]+"${ca[@]}"} "$@"
+}
+
+# ── MODO SINGLE-SERVER: o Supabase que o kit instala e opera ─────────────────
+#
+# Só vale com SINGLE_SERVER=1 (install-single-server.sh). Nada aqui roda numa
+# instalação comum: todo call site pergunta pelo modo antes.
+#
+# A versão do Supabase self-hosted é UMA, e mora aqui: o instalador a instala e
+# o update.sh leva quem já instalou até ela (atualizar_supabase_single_server).
+# Sem `readonly`: o update.sh relê este arquivo depois do checkout.
+# Esta ref foi conferida em ARM64: todas as 11 imagens do compose oficial têm
+# manifesto linux/arm64. Antes de atualizar a ref, confira as imagens novamente;
+# o update automático também precisa continuar funcionando na VPS A1.
+SUPABASE_REF="self-hosted/v0.8.1"
+
+dir_do_supabase() { printf '%s/.runtime/supabase' "${PROJECT_DIR:-$PWD}"; }
+
+# O compose oficial declara `name: supabase` e `container_name` fixos
+# (supabase-db, supabase-envoy…). Dois Supabase na mesma VPS — o nosso e outro
+# qualquer, ou o de uma segunda árvore do CRM — brigariam pelos mesmos nomes. O
+# projeto leva o nome do projeto do CRM (o override tira os container_name), e
+# a identidade continua sendo a árvore: ver recusar_supabase_de_outra_arvore.
+projeto_do_supabase() { printf '%s-supabase' "$(nome_do_projeto_atual)"; }
+
+# `docker compose` do Supabase, com o ambiente LIMPO. O load_env exporta o .env
+# inteiro do CRM, e variável de ambiente vence o .env do projeto na
+# interpolação: sem o `env -i`, o SMTP_HOST/SMTP_PORT do CRM entrariam no lugar
+# dos do Supabase. O nome do projeto vai explícito pelo mesmo motivo.
+dc_supabase() {
+  (cd "$(dir_do_supabase)" && env -i PATH="$PATH" HOME="${HOME:-/root}" \
+    ${DOCKER_HOST:+DOCKER_HOST="$DOCKER_HOST"} \
+    ${DOCKER_CONTEXT:+DOCKER_CONTEXT="$DOCKER_CONTEXT"} \
+    ${DOCKER_CONFIG:+DOCKER_CONFIG="$DOCKER_CONFIG"} \
+    COMPOSE_PROJECT_NAME="$(projeto_do_supabase)" docker compose "$@")
+}
+
+# Invariante 8 (docs/doctrine/packaging.md) para o projeto do Supabase: o
+# mesmo guarda do CRM, perguntando pelos contêineres do Supabase e pela pasta
+# que os criou.
+recusar_supabase_de_outra_arvore() {  # recusar_supabase_de_outra_arvore [como reportar]
+  local projeto dir
+  projeto="$(projeto_do_supabase)"; dir="$(dir_do_supabase)"
+  COMPOSE_PROJECT_NAME="$projeto" PROJECT_DIR="$dir" COMPOSE=docker-compose.yml \
+    recusar_projeto_de_outra_arvore "$@"
+}
+
+# Valor para o .env do Supabase, que só o dotenv do Compose lê: aspas duplas
+# com `\`, `"` e `$` escapados (o Compose os desfaz; medido no install.sh, envq).
+valor_compose() { printf '"%s"' "$(printf '%s' "${1-}" | sed 's/[\\"$]/\\&/g')"; }
+
+# ── O GoTrue manda e-mail pelo SMTP do CRM ───────────────────────────────────
+#
+# O compose oficial aponta o GoTrue para `supabase-mail`, que não existe em
+# produção: "esqueci a senha" e a confirmação de cadastro não chegariam. O SMTP
+# do CRM (#1176) é a fonte, na MESMA precedência de lib/email/config.ts: a
+# linha da tela /admin/email, se existe; senão o .env. Sai 1 (e não toca em
+# nada) quando o CRM não tem SMTP — quem chama avisa o dono.
+sincronizar_smtp_do_gotrue() {
+  local env_sb sep=$'\x1f' linha="" host porta usuario senha remetente nome
+  env_sb="$(dir_do_supabase)/.env"
+  [ -f "$env_sb" ] || return 1
+  linha="$(psql_run -tA -F "$sep" -c "select coalesce(smtp_host,''), smtp_port,
+      coalesce(smtp_username,''),
+      coalesce(case when smtp_password_encrypted is null then '' else public.fn_decrypt_oauth(smtp_password_encrypted) end,''),
+      coalesce(from_email,''), coalesce(from_name,'')
+    from public.platform_smtp_settings where id = 1" 2>/dev/null)" || linha=""
+  if [ -n "$linha" ]; then
+    IFS="$sep" read -r host porta usuario senha remetente nome <<<"$linha"
+  else
+    host="${SMTP_HOST:-}"; porta="${SMTP_PORT:-587}"; usuario="${SMTP_USERNAME:-}"
+    senha="${SMTP_PASSWORD:-}"; remetente="${SMTP_FROM_EMAIL:-}"; nome="${SMTP_FROM_NAME:-}"
+  fi
+  [ -n "$host" ] && [ -n "$remetente" ] || return 1
+  set_env_var "$env_sb" SMTP_HOST "$(valor_compose "$host")"
+  set_env_var "$env_sb" SMTP_PORT "${porta:-587}"
+  set_env_var "$env_sb" SMTP_USER "$(valor_compose "$usuario")"
+  set_env_var "$env_sb" SMTP_PASS "$(valor_compose "$senha")"
+  set_env_var "$env_sb" SMTP_ADMIN_EMAIL "$(valor_compose "$remetente")"
+  set_env_var "$env_sb" SMTP_SENDER_NAME "$(valor_compose "${nome:-${APP_NAME:-DeskcommCRM}}")"
+}
+
+# ── `so_convite` fecha o caminho DIRETO do GoTrue (#1653) ────────────────────
+#
+# O CRM já recusava cadastro sem convite na tela, na server action e na volta do
+# Google, mas o GoTrue continuava aceitando `POST /auth/v1/signup` — com a anon
+# key que vai para o navegador. A instalação que escolheu "só convite" acumulava
+# conta que ninguém autorizou, e o dono não tinha porta para fechar.
+#
+# A única trava que fecha esse caminho é o `disable_signup` do próprio GoTrue, e
+# ele NÃO tem API de configuração no self-hosted: medido no fonte
+# supabase/auth v2.196.0, as rotas `/admin` são audit, users, generate_link, sso
+# e oauth — nenhuma de config. Então o valor mora no `.env` do Supabase, na
+# chave OFICIAL `DISABLE_SIGNUP`: o compose do Supabase no ref pinado já a
+# mapeia (`GOTRUE_DISABLE_SIGNUP: ${DISABLE_SIGNUP}`) e o `.env.example` dele a
+# traz como `false`. Uma variável nossa ao lado seria sombra: o override passaria
+# a ignorar a oficial, e quem fechou o cadastro pela receita do Supabase seria
+# reaberto em silêncio.
+#
+# Quem manda é o modo que o APP enxerga, na mesma precedência de
+# lib/auth/politica-de-cadastro.ts: a linha de `platform_settings` (a tela de
+# `/admin/cadastro`); sem linha, o piso `SIGNUP_MODE` do `.env` do CRM; valor
+# irreconhecível no piso vale `aberto`. `so_convite` → true, os outros → false.
+# Usar `aberto` quando falta a linha deixaria justamente a instalação que
+# declarou `SIGNUP_MODE=so_convite` com o CRM fechado e o GoTrue aberto.
+#
+# Idempotente, e quem chama só reinicia o `auth` quando o arquivo MUDOU. Devolve
+# 1 (sem tocar em nada) quando o valor já é o do modo, quando o banco não
+# respondeu ou quando a coluna ainda não existe (instalação anterior à 0253):
+# reabrir ou fechar o cadastro de uma instalação por causa de um soluço do
+# banco seria o mesmo defeito que o memo pegajoso de `modoDeCadastro()` existe
+# para evitar. "Banco falhou" e "sem linha" são respostas diferentes: a primeira
+# não mexe, a segunda cai no piso.
+sincronizar_signup_mode_do_gotrue() {
+  local env_sb modo alvo atual
+  env_sb="$(dir_do_supabase)/.env"
+  [ -f "$env_sb" ] || return 1
+  modo="$(psql_run -tA -c "select signup_mode from public.platform_settings where id = 1" 2>/dev/null)" || return 1
+  modo="$(printf '%s' "$modo" | tr -d '[:space:]')"
+  if [ -z "$modo" ]; then
+    modo="$(sed -n 's/^SIGNUP_MODE=//p' "${PROJECT_DIR:-$PWD}/.env" 2>/dev/null | tail -n 1 | tr -d "\"' \t\r")"
+    case "$modo" in aberto|com_aprovacao|so_convite) ;; *) modo=aberto ;; esac
+  fi
+  case "$modo" in
+    so_convite) alvo=true ;;
+    aberto|com_aprovacao) alvo=false ;;
+    *) return 1 ;;
+  esac
+  atual="$(sed -n 's/^DISABLE_SIGNUP=//p' "$env_sb" | tail -n 1 | tr -d "\"' \t\r")"
+  [ "$atual" = "$alvo" ] && return 1
+  set_env_var "$env_sb" DISABLE_SIGNUP "$alvo"
+  if [ "$alvo" = true ]; then
+    c_ylw "Cadastro direto no Supabase: FECHADO (a instalação está em 'só convite'; convites seguem funcionando)."
+  else
+    c_ylw "Cadastro direto no Supabase: ABERTO (acompanha o modo '$modo' da instalação)."
+  fi
+  return 0
+}
+
+# ── E-mails de acesso: o GoTrue busca o MOLDE no app (#2109) ────────────────
+#
+# O molde padrão do GoTrue linka para `/auth/v1/verify`, e o clique em "esqueci
+# a senha" termina em `/login?error=link_invalido` (diagnóstico na #2109). As
+# rotas `/email-templates/recovery` e `/email-templates/confirmation` do app
+# emitem o link com `token_hash`, que `app/auth/confirm` sabe fechar.
+#
+# O compose oficial do Supabase não mapeia estas chaves para o serviço `auth`
+# (só `GOTRUE_SMTP_*` e `GOTRUE_MAILER_URLPATHS_*`), então elas valem DUAS
+# vezes: no .env do Supabase, que o compose interpola, e no
+# `supabase-single-server.override.yml`, que as entrega ao contêiner.
+#
+# Chamada pelo install-single-server.sh (com o domínio que ele recebeu) e por
+# atualizar_supabase_single_server (sem domínio: sai do SITE_URL que o
+# instalador gravou como https://DOMINIO). Valor já presente — no .env do
+# Supabase ou no ambiente — manda: nada sobrescreve um molde que o operador já
+# apontou. Sem URL https para montar o caminho, não grava nada: um molde
+# apontado para `localhost` seria pior que o padrão.
+gravar_modelos_do_gotrue() {  # gravar_modelos_do_gotrue <.env do Supabase> [https://DOMINIO]
+  local env_sb="$1" base="${2:-}" chave caminho valor
+  [ -f "$env_sb" ] || return 0
+  [ -n "$base" ] || base="$(valor_do_env "$env_sb" SITE_URL)"
+  case "$base" in https://?*) base="${base%/}" ;; *) return 0 ;; esac
+  for chave in GOTRUE_MAILER_TEMPLATES_CONFIRMATION GOTRUE_MAILER_TEMPLATES_RECOVERY; do
+    [ -n "$(valor_do_env "$env_sb" "$chave")" ] && continue
+    case "$chave" in
+      *CONFIRMATION) caminho=/email-templates/confirmation ;;
+      *) caminho=/email-templates/recovery ;;
+    esac
+    valor="${!chave:-}"
+    [ -n "$valor" ] || valor="${base}${caminho}"
+    set_env_var "$env_sb" "$chave" "$valor"
+  done
+  return 0
+}
+
+# ── O update.sh leva o Supabase até a versão pinada ──────────────────────────
+#
+# O `update.sh` oficial do Supabase faz o merge de três vias dos arquivos dele
+# contra a versão de partida (.supabase-version), nunca toca em dado nem no
+# .env (só acrescenta chave nova). Falhar aqui NÃO derruba a atualização do
+# CRM: o Supabase segue na versão de antes e a próxima rodada tenta de novo.
+atualizar_supabase_single_server() {
+  local dir atual
+  dir="$(dir_do_supabase)"
+  [ -f "$dir/.env" ] || { c_red "⛔ $(t "Modo single-server sem {1}/.env — rode install-single-server.sh." "$dir")"; return 1; }
+  cp "$KIT_DIR/supabase-single-server.override.yml" "$dir/docker-compose.deskcomm.yml" || return 1
+  set_env_var "$dir/.env" COMPOSE_PROJECT_NAME "$(projeto_do_supabase)"
+  atual="$(sed -n 's/^ref=//p' "$dir/.supabase-version" 2>/dev/null | tail -1)"
+  if [ "$atual" != "$SUPABASE_REF" ]; then
+    step "$(t "Atualizando o Supabase desta VPS ({1} → {2})" "${atual:-$(t "desconhecida")}" "$SUPABASE_REF")"
+    if ! (cd "$dir" && env -i PATH="$PATH" HOME="${HOME:-/root}" sh update.sh --to "$SUPABASE_REF" --yes); then
+      c_ylw "$(t "⚠ O Supabase não foi atualizado; segue na versão {1}. A próxima atualização tenta de novo." "${atual:-$(t "anterior")}")"
+    fi
+  fi
+  # #2109 — no corpo desta função, e não numa linha do update.sh, pelo mesmo
+  # motivo do #1653 logo abaixo. Antes do `up -d --wait`: o compose recria o
+  # auth com o ambiente novo, sem reinício à parte.
+  gravar_modelos_do_gotrue "$dir/.env"
+  dc_supabase up -d --wait || return 1
+  # #1653 — a sincronização do modo de cadastro mora AQUI, no corpo desta
+  # função, e não numa linha do update.sh. Na atualização que traz este
+  # conserto, quem executa é o update.sh ANTIGO: o bash segue lendo o arquivo
+  # que abriu, e uma linha nova no texto do update.sh nunca roda (medido: o
+  # `git checkout` troca o inode e o script antigo vai até o fim). O que o
+  # update.sh antigo faz depois do checkout é reler este `_common.sh` e chamar
+  # esta função — em toda versão com single-server (desde a v1.42.0) —, então
+  # é o corpo NOVO dela que roda já na primeira atualização. Falha aqui é
+  # aviso, não saída 1: o CRM segue atualizável.
+  if sincronizar_signup_mode_do_gotrue; then
+    dc_supabase up -d --no-deps auth >/dev/null 2>&1 || c_ylw "⚠ Não consegui reiniciar o auth do Supabase com o modo de cadastro (#1653)."
+  fi
+  return 0
+}
+
+# Nome FÍSICO do volume que guarda as sessões do WAHA. `docker compose config
+# --volumes` devolve o nome LÓGICO (`waha-data`); passá-lo direto a `docker run
+# -v` cria/abre outro volume global com esse nome e produz um backup vazio que
+# parece válido. Perguntar ao contêiner pela montagem real mantém o prefixo do
+# projeto Compose (ex.: `deskcommcrm_waha-data`).
+#
+# A montagem também diz de QUE ESPÉCIE ela é, e `.Name` só responde por uma: num
+# bind de pasta do host (`- /srv/waha:/app/.sessions`) ele vem VAZIO, e ficar só
+# com ele devolve exatamente o volume fantasma que esta função existe para não
+# usar. Volume nomeado → `.Name`; bind → `.Source`.
+#
+# Sem contêiner não há montagem para ler, e o nome sai de
+# nome_do_projeto_atual, o mesmo que o compose usa: respeita COMPOSE_PROJECT_NAME
+# e mantém o `-` de uma pasta como `deskcomm-crm`.
+volume_waha_data() {
+  local container campos tipo nome origem
+  container="$(dc ps -a -q waha 2>/dev/null || true)"
+  campos=""
+  if [ -n "$container" ]; then
+    campos="$(docker inspect "$container" \
+      --format '{{range .Mounts}}{{if eq .Destination "/app/.sessions"}}{{.Type}}|{{.Name}}|{{.Source}}{{end}}{{end}}' \
+      2>/dev/null || true)"
+  fi
+  tipo="${campos%%|*}"
+  nome="${campos#*|}"; nome="${nome%%|*}"
+  origem="${campos##*|*|}"
+  case "$tipo" in
+    volume) if [ -n "$nome" ]; then printf '%s' "$nome"; return 0; fi ;;
+    bind)   if [ -n "$origem" ]; then printf '%s' "$origem"; return 0; fi ;;
+  esac
+  printf '%s' "$(nome_do_projeto_atual)_waha-data"
+}
+
+# O `.tgz` de um volume VAZIO tem ~87 bytes, uma entrada só (`.`) e o `tar` SAI
+# COM ZERO. Quem decide se o snapshot presta é o CONTEÚDO, não o código de saída
+# dele: contar as entradas além da raiz é o que separa um backup de verdade do
+# volume errado — a diferença que só aparecia no dia do restore.
+tar_tem_sessao() {  # tar_tem_sessao <arquivo.tgz>
+  local itens
+  itens="$(tar tzf "$1" 2>/dev/null | grep -cvxE '\./?$' || true)"
+  [ "${itens:-0}" -gt 0 ]
 }
 
 # ── QUEM FALA COM O BANCO E PODE SER PARADO ──────────────────────────────────
@@ -109,6 +661,15 @@ dc_files() {
 # Vazio quando o Supabase é HOSPEDADO — lá não há o que parar, e é por isso que
 # a conferência das regras, que não depende de parar nada, é a peça portável.
 supabase_local_containers() {
+  # No single-server os nomes são os do projeto (sem container_name fixo): as
+  # mesmas três peças, achadas pelo projeto e pelo serviço — nunca as de outro
+  # Supabase que more na VPS.
+  if [ "${SINGLE_SERVER:-0}" = "1" ]; then
+    docker ps --filter "label=com.docker.compose.project=$(projeto_do_supabase)" \
+      --format '{{.Names}} {{.Label "com.docker.compose.service"}}' 2>/dev/null \
+      | awk '$2 == "rest" || $2 == "studio" || $2 == "realtime" { print $1 }' || true
+    return 0
+  fi
   docker ps --format '{{.Names}}' 2>/dev/null | grep -E \
     '^(supabase-rest|supabase-studio|realtime-dev\.supabase-realtime)$' || true
 }
@@ -173,7 +734,7 @@ veredito_da_imagem_do_app() {  # veredito_da_imagem_do_app <versão alvo> <vers�
 
 pausar_o_que_fala_com_o_banco() {
   PARADOS="$(supabase_local_containers)"
-  c_ylw "Pausando o sistema para mexer no banco com segurança."
+  c_ylw "$(t "Pausando o sistema para mexer no banco com segurança.")"
   dc stop app worker scheduler >/dev/null 2>&1 || true
   if [ -n "$PARADOS" ]; then
     # shellcheck disable=SC2086
@@ -230,17 +791,30 @@ religar_o_supabase() {
       ainda_fora="$resta"
     fi
     if [ -n "$ainda_fora" ]; then
-      c_red "⛔ PEÇAS DO BANCO NÃO VOLTARAM depois da atualização:"
+      c_red "$(t "⛔ PEÇAS DO BANCO NÃO VOLTARAM depois da atualização:")"
       for c in $ainda_fora; do c_red "   • $c"; done
-      c_red "   Enquanto elas estiverem paradas, o CRM não consegue ler nem gravar."
-      c_ylw "   Para subir à mão:  docker start $ainda_fora"
+      c_red "$(t "   Enquanto elas estiverem paradas, o CRM não consegue ler nem gravar.")"
+      c_ylw "$(t "   Para subir à mão:  docker start {1}" "$ainda_fora")"
     fi
     PARADOS=""
   fi
 }
 
 restaurar_servicos() {
+  # O código de SAÍDA da execução que está terminando, capturado antes de
+  # qualquer coisa: é ele que o diagnóstico (#1955) relata como desfecho. Este
+  # é o gatilho `trap restaurar_servicos EXIT INT TERM HUP` do update.sh — e é
+  # também por ele que TODO run termina com diagnóstico persistido.
+  local rc_da_execucao=$?
   religar_o_supabase
+  # O rollback dos pins ANTES de qualquer subida (#1955, critério 4). É esta
+  # linha que faz o `dc up -d` lá embaixo trazer a versão de ANTES: sem ela, o
+  # ambiente e o `.env` seguem apontando para a imagem que falhou, e a "volta"
+  # deixa os serviços em `Created`/`Exited`. No-op quando a atualização não
+  # passou da troca de versão (ou quando terminou bem e o rollback foi
+  # desarmado) — e também é no-op em qualquer outro script do kit, que não
+  # arma nada.
+  restaurar_versao_anterior
   # ⛔ O CRM NÃO VOLTA AO AR COM REGRA DE ISOLAMENTO FALTANDO.
   #
   # Um CRM fora do ar é um problema visível que alguém resolve em minutos. Um
@@ -249,10 +823,11 @@ restaurar_servicos() {
   # que custou um dia inteiro nesta instalação, com o funil vazio e a
   # atualização dizendo "concluída com sucesso".
   if [ -n "${REGRAS_FALTANDO:-}" ]; then
-    c_red "   O CRM segue PARADO de propósito. Resolva as regras antes de subir."
+    c_red "$(t "   O CRM segue PARADO de propósito. Resolva as regras antes de subir.")"
     # ⚠️ O aviso de manutenção NÃO desce aqui, de propósito. Com regra faltando o
     # CRM não volta, e a página é a única coisa que explica isso a quem tentar
     # abrir o sistema — melhor que um erro de conexão sem autor.
+    diagnostico_de_atualizacao "$rc_da_execucao"
     return 0
   fi
   # O aviso desce ANTES de o CRM subir, e não depois. Com o Caddy do próprio kit
@@ -265,6 +840,9 @@ restaurar_servicos() {
   # agent.sh também sourceiam este arquivo e não têm o que derrubar.
   declare -F manutencao_desce >/dev/null 2>&1 && manutencao_desce
   dc up -d app worker scheduler >/dev/null 2>&1 || true
+  # Por ÚLTIMO: assim o diagnóstico mostra o estado DEPOIS da volta, que é o
+  # que interessa a quem for ler o arquivo depois (#1955, critério 5).
+  diagnostico_de_atualizacao "$rc_da_execucao"
 }
 
 # ── Imagem pronta que não serve para esta VPS: constrói a versão aqui ────────
@@ -292,21 +870,292 @@ construir_aqui_e_subir() {  # construir_aqui_e_subir [versão alvo] → 0 se sub
   [ -n "$versao" ] && export APP_VERSION="$versao"
   # O aviso vem ANTES da construção, e não depois: são 15 a 25 minutos de tela
   # parada, e sem ele o dono conclui que travou e mata o script no meio.
-  c_ylw "⚠ As imagens prontas desta versão não servem para esta VPS."
-  c_ylw "  O motivo mais comum é a arquitetura dela ser diferente da das imagens"
-  c_ylw "  publicadas: o registro responde que não tem manifest para a arquitetura"
-  c_ylw "  daqui. Não é problema da sua VPS nem do seu acesso."
-  c_ylw "  Vou construir as três imagens aqui, do código desta versão."
-  c_ylw "  Leva de 15 a 25 minutos e a tela fica sem novidade nesse tempo —"
-  c_ylw "  não é travamento, pode deixar rodando."
+  c_ylw "$(t "⚠ As imagens prontas desta versão não servem para esta VPS.")"
+  c_ylw "$(t "  O motivo mais comum é a arquitetura dela ser diferente da das imagens")"
+  c_ylw "$(t "  publicadas: o registro responde que não tem manifest para a arquitetura")"
+  c_ylw "$(t "  daqui. Não é problema da sua VPS nem do seu acesso.")"
+  c_ylw "$(t "  Vou construir as três imagens aqui, do código desta versão.")"
+  c_ylw "$(t "  Leva de 15 a 25 minutos e a tela fica sem novidade nesse tempo —")"
+  c_ylw "$(t "  não é travamento, pode deixar rodando.")"
   if ! dc -f "$COMPOSE_BUILD" build; then
-    c_red "✖ A construção das imagens aqui falhou (o erro está logo acima)."
+    c_red "$(t "✖ A construção das imagens aqui falhou (o erro está logo acima).")"
     return 1
   fi
   if ! dc -f "$COMPOSE_BUILD" up -d; then
-    c_red "✖ As imagens foram construídas, mas os serviços não subiram."
+    c_red "$(t "✖ As imagens foram construídas, mas os serviços não subiram.")"
     return 1
   fi
+  return 0
+}
+
+# ── O que fazer quando o REGISTRO DE IMAGENS não responde (#1955) ───────────
+#
+# MEDIDO numa instalação real da HostGator, reproduzido duas vezes: durante um
+# update pela tela o resolver do Docker saturou (`[resolver] more than 1024
+# concurrent queries`, `dial udp 8.8.4.4:53: i/o timeout`), o `pull` e o
+# `up -d` morreram, e o script caiu no fallback de CONSTRUÇÃO LOCAL — que
+# gastou a memória inteira da VPS no `next-build` (OOM) e deixou app, worker,
+# scheduler e proxy em `Created`/`Exited`. 502 para todo mundo até alguém
+# reiniciar o Docker à mão.
+#
+# Três peças fecham a classe inteira, e elas são as que faltavam:
+#
+#   1. `preflight_atualizacao` — pergunta ao registro ANTES de parar qualquer
+#      coisa. Falhou? `refuse` (RC 3): a versão atual segue no ar intocada.
+#   2. `build_local_permitido` — construção local deixa de ser o que acontece
+#      SOZINHO quando o registro não responde. Continua sendo o caminho de
+#      quem quer de propósito (DESKCOMM_BUILD_LOCAL=1) e de quem tem registro
+#      respondendo (a recuperação de arquitetura, #1060/#1143).
+#   3. `restaurar_versao_anterior` + `diagnostico_de_atualizacao` — o rollback
+#      dos pins de versão e o laço que garante diagnóstico no fim de TODO run.
+#
+# O prazo é a outra metade: sem ele o `docker ps` também trava (foi o que
+# prendeu o healthcheck no passo "▶ Containers") e nenhum destes sinais chega
+# a existir — o script simplesmente nunca termina.
+com_prazo() {  # com_prazo <segundos> <comando...>
+  local prazo="$1"; shift
+  # `timeout` é do coreutils e está em todo Linux onde o kit roda; sem ele o
+  # comportamento continua o antigo, não nasce um erro novo.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$prazo" "$@"
+  else
+    "$@"
+  fi
+}
+
+# As QUATRO imagens da release estão prontas no registro?
+#
+# O agente da tela anunciava "nova versão" olhando SÓ a etiqueta no Git e SÓ a
+# imagem do app: um run de publicação que morresse no meio deixava a release
+# anunciada com o worker (ou o scheduler, ou a voz) inexistente — e era o
+# `up -d` de quem clicava em "Atualizar" que descobria.
+#
+# Ecoa: prontas | incompleta | indisponivel
+#   prontas       → as quatro existem;
+#   incompleta    → ALGUMA falta e o registro respondeu = publicação incompleta;
+#   indisponivel  → NENHUMA respondeu = o registro/DNS está fora (ou a tag nem
+#                   existe, o que para o chamador dá no mesmo: não se sabe).
+veredito_das_imagens_da_release() {  # veredito_das_imagens_da_release <versão>
+  local versao="${1:-}" img total=0 achadas=0
+  versao="${versao#v}"
+  [ -n "$versao" ] || { printf 'indisponivel'; return 0; }
+  for img in "$IMG_APP" "$IMG_WORKER" "$IMG_SCHEDULER" "$IMG_VOICE_AGENT"; do
+    total=$((total + 1))
+    if com_prazo 20 docker buildx imagetools inspect "${img}:${versao}" >/dev/null 2>&1; then
+      achadas=$((achadas + 1))
+    fi
+  done
+  if [ "$achadas" -eq "$total" ]; then
+    printf 'prontas'
+  elif [ "$achadas" -eq 0 ]; then
+    printf 'indisponivel'
+  else
+    printf 'incompleta'
+  fi
+}
+
+# O preflight: dá para atualizar sem derrubar o que está no ar?
+# → 0 = pode seguir; 1 = NÃO pode, com o motivo na stdout.
+#
+# Este é o critério 3 da issue: preflight falho mantém a versão ATUAL no ar.
+# Por isso ele roda antes do backup, antes do `git checkout` e antes de
+# qualquer `docker stop` — o `refuse` devolve RC 3, que o agent.sh lê como
+# "esta atualização nunca começou" e não tenta desfazer nada.
+preflight_atualizacao() {  # preflight_atualizacao <versão alvo>
+  local versao="${1:-}" veredito
+  versao="${versao#v}"
+  if ! com_prazo 30 docker info >/dev/null 2>&1; then
+    printf '%s' "o Docker não respondeu em 30s (daemon parado ou travado — veja 'systemctl status docker' e 'journalctl -u docker -n 100')."
+    return 1
+  fi
+  # Quem pediu construção local de propósito não depende do registro: é a
+  # saída de escape que o próprio portão do build ensina, e recusá-la aqui a
+  # anularia justamente com o registro fora.
+  build_local_pedido && return 0
+  # Sem o plugin buildx a sonda abaixo falha nas quatro imagens, e o motivo
+  # sairia como "registro fora (DNS/rede)" — diagnóstico errado, e o dono iria
+  # mexer na rede de uma VPS cuja rede está boa.
+  if ! com_prazo 20 docker buildx version >/dev/null 2>&1; then
+    printf '%s' "o plugin buildx do Docker não está instalado nesta VPS, e é com ele que confiro se a versão $versao está publicada. Instale o pacote docker-buildx-plugin. Nada foi parado nem baixado."
+    return 1
+  fi
+  veredito="$(veredito_das_imagens_da_release "$versao")"
+  case "$veredito" in
+    prontas) return 0 ;;
+    incompleta)
+      printf '%s' "a versão $versao está INCOMPLETA no registro: uma ou mais das quatro imagens (app, worker, scheduler, voz) ainda não existe — o run de publicação não terminou. Nada foi parado nem baixado."
+      return 1 ;;
+    *)
+      printf '%s' "não consegui falar com o registro de imagens (DNS/rede) para a versão $versao. Nada foi parado nem baixado: a versão atual segue no ar."
+      return 1 ;;
+  esac
+}
+
+# A construção local continua sendo o caminho de quem TEM registro respondendo
+# (é a recuperação de arquitetura, #1060/#1143 — ela não pode sumir) e de quem
+# pede de propósito. O que ela deixou de ser é AUTOMÁTICA quando quem falhou é
+# o registro: foi exatamente isso que transformou um apagão de DNS em OOM no
+# `next-build` e a instalação em 502 (#1955, critério 2).
+#
+# → 0 = pode construir aqui.
+build_local_pedido() {  # → 0 quando quem opera pediu construção local de propósito
+  case "${DESKCOMM_BUILD_LOCAL:-}" in 1|sim|s|yes) return 0 ;; esac
+  return 1
+}
+
+build_local_permitido() {  # build_local_permitido <versão alvo>
+  build_local_pedido && return 0
+  case "${DESKCOMM_BUILD_LOCAL:-}" in
+    0|nao|não|no) return 1 ;;  # quem opera proibiu de propósito
+  esac
+  [ "$(veredito_das_imagens_da_release "${1:-}")" != "indisponivel" ]
+}
+
+# Os serviços que deveriam estar de pé depois do `up -d` (#1955, critério 6).
+# Ecoa, um por linha, os que NÃO estão rodando. Vazio = "não sei".
+#
+# "Não sei" NUNCA vira rollback: derrubar uma instalação que está de pé por
+# causa de um `ps` que falhou seria o defeito de antes, só que invertido. Só
+# se devolve a versão anterior quando há UM SERVIÇO POSITIVAMENTE fora do ar.
+servicos_fora_do_ar() {
+  local esperados="app worker scheduler" saida svc estado conhecidos=0 rodando=" " fora=""
+  case "${REVERSE_PROXY:-caddy}" in traefik|npm) ;; *) esperados="$esperados caddy" ;; esac
+  # shellcheck disable=SC2046
+  # Com prazo pelo mesmo motivo do healthcheck: um `ps` preso no resolver
+  # saturado prenderia aqui o fim da atualização. Estourou = "não sei".
+  saida="$(com_prazo 30 docker compose $(dc_files) ps -a --format '{{.Service}} {{.State}}' 2>/dev/null)" || return 0
+  [ -n "$saida" ] || return 0
+  while read -r svc estado; do
+    [ -n "${svc:-}" ] || continue
+    # CONHECER o estado e estar RODANDO são perguntas diferentes: `exited` e
+    # `created` provam que o `ps` respondeu (então a lista vale), mas são
+    # justamente o serviço fora do ar que esta conferência existe para pegar.
+    case "$estado" in
+      running|Up*)
+        conhecidos=$((conhecidos + 1))
+        rodando="${rodando}${svc} " ;;
+      exited|created|paused|restarting|dead|removing|Exit*)
+        conhecidos=$((conhecidos + 1)) ;;
+    esac
+  done <<EOF
+$saida
+EOF
+  [ "$conhecidos" -gt 0 ] || return 0
+  for svc in $esperados; do
+    case "$rodando" in *" $svc "*) ;; *) fora="${fora}${fora:+ }${svc}" ;; esac
+  done
+  printf '%s' "$fora"
+}
+
+# ── O rollback dos pins de versão (#1955, critério 4) ───────────────────────
+#
+# `gravar_imagens` troca os OITO pins de versão do `.env` ANTES de baixar
+# qualquer coisa, e o `update.sh` exporta as quatro imagens por cima. Daí em
+# diante, TODO `docker compose up -d` usa o endereço da versão NOVA — inclusive
+# o da volta, o do gatilho de saída e o do `up -d` manual que o dono roda
+# depois. Se a nova imagem não existe (registro fora, publicação incompleta),
+# a "volta" deixa os serviços em `Created`: era o desfecho da issue.
+#
+# O snapshot é a cópia fiel dos pins ANTES da troca; a restauração reescreve o
+# arquivo E reexporta as variáveis, porque o compose prefere o ambiente ao
+# `.env` — restaurar só o arquivo seria rollback no papel, com o ambiente ainda
+# apontando para a versão que falhou.
+CHAVES_DE_VERSAO="APP_IMAGE APP_PULL_POLICY WORKER_IMAGE WORKER_PULL_POLICY SCHEDULER_IMAGE SCHEDULER_PULL_POLICY VOICE_AGENT_IMAGE VOICE_AGENT_PULL_POLICY"
+SNAPSHOT_DE_VERSAO=".deskcomm-env-antes-do-update"
+
+armar_rollback_de_versao() {  # armar_rollback_de_versao <envfile>
+  local envfile="${1:-}" snap tmp
+  [ -f "$envfile" ] || return 0
+  # `${envfile%/*}` não corta nada num caminho sem barra (`.env` relativo, que
+  # é como o update.sh chama), e o snapshot caeria DENTRO de um arquivo.
+  case "$envfile" in
+    */*) snap="${envfile%/*}/${SNAPSHOT_DE_VERSAO}" ;;
+    *)   snap="./${SNAPSHOT_DE_VERSAO}" ;;
+  esac
+  tmp="${snap}.tmp.$$"
+  # Só as chaves que EXISTEM agora: uma chave ausente é omissão de uma
+  # instalação antiga, e a restauração tem de voltar a deixá-la ausente.
+  grep -E "^($(printf '%s' "$CHAVES_DE_VERSAO" | tr ' ' '|'))=" "$envfile" > "$tmp" 2>/dev/null || true
+  mv "$tmp" "$snap" 2>/dev/null || return 0
+  ROLLBACK_ENV_SNAPSHOT="$snap"
+  ROLLBACK_ENV_ARQUIVO="$envfile"
+  return 0
+}
+
+# Desarma sem apagar o arquivo: ele é a prova do estado anterior, e a próxima
+# execução o sobrescreve. Chamado no único ponto em que a atualização PROVOU
+# ter terminado (app saudável e serviços de pé).
+desarmar_rollback_de_versao() {
+  ROLLBACK_ENV_SNAPSHOT=""
+  return 0
+}
+
+restaurar_versao_anterior() {  # → 0 sempre (rollback que falha não mata a volta)
+  [ -n "${ROLLBACK_ENV_SNAPSHOT:-}" ] || return 0
+  [ -f "${ROLLBACK_ENV_SNAPSHOT:-}" ] || { ROLLBACK_ENV_SNAPSHOT=""; return 0; }
+  local envfile="${ROLLBACK_ENV_ARQUIVO:-}" tmp k v re
+  [ -n "$envfile" ] && [ -f "$envfile" ] || return 0
+  re="^($(printf '%s' "$CHAVES_DE_VERSAO" | tr ' ' '|'))="
+  tmp="${envfile}.rollback.$$"
+  grep -vE "$re" "$envfile" > "$tmp" 2>/dev/null || true
+  cat "$ROLLBACK_ENV_SNAPSHOT" >> "$tmp" 2>/dev/null || true
+  # O modo do `.env` (600) sobrevive ao `mv`: trocar de inode sem herdá-lo
+  # deixaria os segredos legíveis por outro usuário da VPS.
+  chmod --reference="$envfile" "$tmp" 2>/dev/null || chmod 600 "$tmp" 2>/dev/null || true
+  mv "$tmp" "$envfile" 2>/dev/null || return 0
+  # E as variáveis EXPORTADAS voltam junto — sem isto o rollback é só papel.
+  for k in $CHAVES_DE_VERSAO; do
+    v="$(sed -n "s/^${k}=//p" "$envfile" 2>/dev/null | tail -1)"
+    if [ -n "$v" ]; then
+      export "$k=$v" 2>/dev/null || true
+    else
+      unset "$k" 2>/dev/null || true
+    fi
+  done
+  ROLLBACK_ENV_SNAPSHOT=""
+  UPDATE_ROLLBACK="pins restaurados para a versão anterior"
+  return 0
+}
+
+# ── O diagnóstico que TODO run deixa para trás (#1955, critério 5) ──────────
+#
+# Escrito por um gatilho no TOPO do update.sh (cobre os caminhos que morrem
+# antes do banco) e por `restaurar_servicos` daí para baixo — os dois escrevem
+# no MESMO arquivo. Sem ele, a única evidência de um update que morreu era a
+# cauda do log que o agente guarda, e o apagão de resolver descrito na issue
+# não deixava rastro nenhum de POR QUÊ.
+#
+# Silencioso de propósito: sai no arquivo, nunca na stdout (um "✓" a mais na
+# tela de quem está operando é ruído, e ruído ensina a ignorar a saída).
+# Tudo com `|| true` — este código roda dentro de gatilho de saída, onde
+# falhar é pior do que não dizer.
+diagnostico_de_atualizacao() {
+  local rc="${1:-$?}" arq="${DIAGNOSTICO_ARQUIVO:-}" status
+  [ -n "$arq" ] || return 0
+  status="${UPDATE_STATUS:-em andamento}"
+  if [ "$rc" -ne 0 ] && [ "$status" = "em andamento" ]; then
+    status="FALHA (a execução saiu pelo caminho de erro)"
+  elif [ "$rc" -eq 0 ] && [ "$status" = "em andamento" ]; then
+    status="concluído"
+  fi
+  {
+    printf '══ diagnóstico da atualização do DeskcommCRM ══\n'
+    printf 'quando:     %s\n' "$(date -u '+%Y-%m-%d %H:%M:%S UTC' 2>/dev/null || date)"
+    printf 'diretório:  %s\n' "${PROJECT_DIR:-$PWD}"
+    printf 'status:     %s\n' "$status"
+    printf 'código:     %s\n' "$rc"
+    printf 'etapa:      %s\n' "${UPDATE_ETAPA:-desconhecida}"
+    printf 'alvo:       %s\n' "${TARGET_TAG:-—}"
+    printf 'instalada:  %s\n' "${CURRENT_TAG:-—}"
+    printf 'rollback:   %s\n' "${UPDATE_ROLLBACK:-não precisou (a atualização não passou da troca de versão)}"
+    printf 'containers:\n'
+    # shellcheck disable=SC2046
+    # Com prazo: este bloco roda no gatilho de SAÍDA, inclusive quando o
+    # preflight recusou porque o Docker não respondeu — sem prazo, o `ps`
+    # travaria ali e a atualização nunca terminaria.
+    com_prazo 30 docker compose $(dc_files) ps -a 2>/dev/null || printf '  (o Docker não respondeu em 30s)\n'
+    printf '\n'
+  } >> "$arq" 2>/dev/null || true
   return 0
 }
 
@@ -454,10 +1303,10 @@ garantir_rede_do_proxy() {
     local rede
     rede="${PROXY_NETWORK_NAME:-proxy_network}"
     docker network inspect "$rede" >/dev/null 2>&1 && return 0
-    die "A rede Docker '$rede' (a do Nginx Proxy Manager) não existe.
+    die "$(t "A rede Docker '{1}' (a do Nginx Proxy Manager) não existe.
 Rode 'docker network ls', identifique a rede do seu NPM (Settings > a que o
 contêiner dele já está conectado) e ponha PROXY_NETWORK_NAME=<nome> no .env
-antes de tentar de novo."
+antes de tentar de novo." "$rede")"
   fi
   [ "${REVERSE_PROXY:-caddy}" = "traefik" ] || return 0
   local nossa drv erro
@@ -474,28 +1323,28 @@ antes de tentar de novo."
     # stacks é um caso conhecido). Sem repassar a resposta dele, a mensagem
     # mandaria repetir à mão o comando que acabou de falhar.
     if ! erro="$(docker network create "$TRAEFIK_NETWORK" 2>&1 >/dev/null)"; then
-      die "Não consegui criar a rede Docker '$TRAEFIK_NETWORK'. O Docker respondeu:
-  ${erro}"
+      die "$(t "Não consegui criar a rede Docker '{1}'. O Docker respondeu:
+  {2}" "$TRAEFIK_NETWORK" "$erro")"
     fi
-    c_dim "  (rede '$TRAEFIK_NETWORK' criada — é por ela que o Traefik alcança o CRM)"
+    c_dim "$(t '  (rede '"'"'{1}'"'"' criada — é por ela que o Traefik alcança o CRM)' "$TRAEFIK_NETWORK")"
     ;;
   inexistente)
-    die "A rede Docker '$TRAEFIK_NETWORK' não existe.
+    die "$(t "A rede Docker '{1}' não existe.
 Rode 'docker network ls', identifique a rede do seu Traefik e ponha
-TRAEFIK_NETWORK=<nome> no .env antes de tentar de novo."
+TRAEFIK_NETWORK=<nome> no .env antes de tentar de novo." "$TRAEFIK_NETWORK")"
     ;;
   driver_errado)
     # Mandar quem está em modo host "procurar a rede do seu Traefik" é mandar
     # procurar o que não existe: em modo host ele não está em rede nenhuma do
     # Docker. Para esse caso a saída é apagar a linha e deixar o kit decidir —
     # ele cria a bridge do projeto sozinho.
-    die "A rede '$TRAEFIK_NETWORK' tem driver '$drv', e o app precisa
+    die "$(t "A rede '{1}' tem driver '{2}', e o app precisa
 de uma bridge para o Traefik alcançar o contêiner. Se o seu Traefik roda em modo
 host (é o caso quando 'docker ps' não mostra porta publicada nele), APAGUE a linha
-TRAEFIK_NETWORK do .env: o kit cria e usa a rede '$nossa'.
+TRAEFIK_NETWORK do .env: o kit cria e usa a rede '{3}'.
 Senão, rode 'docker network ls' e ponha a bridge certa em TRAEFIK_NETWORK no .env.
 Se for uma overlay do Swarm, ela precisa ter sido criada com --attachable —
-sem isso um contêiner de compose comum não consegue entrar nela."
+sem isso um contêiner de compose comum não consegue entrar nela." "$TRAEFIK_NETWORK" "$drv" "$nossa")"
     ;;
   esac
 }
@@ -517,14 +1366,14 @@ c_grn() { paint 32 "$*"; }
 c_ylw() { paint 33 "$*"; }
 c_dim() { paint 2  "$*"; }
 die()   { c_red "✖ $*"; exit 1; }
-step()  { printf '\n'; paint 1 "▶ $*"; }
+step()  { printf '\n'; paint 1 "▶ $*"; UPDATE_ETAPA="$*"; }
 
 # Gêmea da de install.sh (se mexer numa, mexa na outra) — ver o comentário lá
 # para o defeito que ela fecha. Coberta por test-validators.sh.
 resposta_sim() {
   local r
   r="$(printf '%s' "${1:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-  case "$r" in s|sim|y|yes) return 0;; *) return 1;; esac
+  case "$r" in s|sim|si|sí|sÍ|y|yes) return 0;; *) return 1;; esac
 }
 
 # Saúde do app pela rota que ele responde de verdade, não pela porta. A porta
@@ -667,9 +1516,13 @@ load_env() {
 enter_project() {
   if [ -f "$COMPOSE" ]; then :;
   elif [ -f "deskcommcrm/$COMPOSE" ]; then cd deskcommcrm;
-  else die "Não achei $COMPOSE. Rode a partir da pasta do projeto."; fi
-  [ -f .env ] || die "Falta o .env (rode install.sh primeiro)."
+  else die "$(t "Não achei {1}. Rode a partir da pasta do projeto." "$COMPOSE")"; fi
+  [ -f .env ] || die "$(t "Falta o .env (rode install.sh primeiro).")"
   load_env .env
+  if [ -z "${WAHA_IMAGE:-}" ]; then
+    WAHA_IMAGE="$(imagem_waha_padrao_para_host)"
+    export WAHA_IMAGE
+  fi
   PROJECT_DIR="$(pwd)"
 }
 
@@ -708,7 +1561,45 @@ url_do_schema() {
 # psql efêmero via container (não exige psql no host). Usa a conexão de schema:
 # os chamadores mexem em `auth.mfa_factors` e `private.app_secrets`, fora do
 # alcance de uma role de app com grants só em `public`.
-psql_run() { docker run --rm -i postgres:17-alpine psql "$(url_do_schema)" -v ON_ERROR_STOP=1 "$@"; }
+psql_run() { pg_container -i postgres:17-alpine psql "$(url_do_schema)" -v ON_ERROR_STOP=1 "$@"; }
+
+# ── O teste TLS do kit (#829) ────────────────────────────────────────────────
+#
+# A issue quer duas metades, e esta é a segunda: com a CA declarada o teste
+# PASSA com verificação LIGADA; sem ela, o diagnóstico diz qual variável falta.
+#
+# `sslmode` no query string vence o ambiente (libpq), então dá para exigir
+# `verify-full` reescrevendo a string SÓ no teste — a conexão normal do kit
+# segue a string original, inalterada. `sslrootcert` precisa do caminho DENTRO
+# do contêiner, que é o fixo do pg_container (CA_NO_CONTAINER).
+url_tls_verificada() {  # url_tls_verificada <connection string> → string com verificação total
+  local url="${1:?url_tls_verificada sem connection string}"
+  case "$url" in
+    *sslmode=*) url="$(printf '%s' "$url" | sed 's/sslmode=[A-Za-z0-9_-]*/sslmode=verify-full/g')" ;;
+    *) case "$url" in *\?*) url="${url}&sslmode=verify-full" ;; *) url="${url}?sslmode=verify-full" ;; esac ;;
+  esac
+  case "$url" in
+    *sslrootcert=*) url="$(printf '%s' "$url" | sed "s|sslrootcert=[^&]*|sslrootcert=${CA_NO_CONTAINER}|g")" ;;
+    *) url="${url}&sslrootcert=${CA_NO_CONTAINER}" ;;
+  esac
+  printf '%s' "$url"
+}
+
+# Roda um `select 1` com verificação TOTAL de cadeia e hostname. Vazio no
+# sucesso; ao falhar, explica — e quando a causa é a CA ausente, a frase vem
+# com o nome da variável (ca_do_supabase), nunca só o erro cru do libpq.
+tls_do_banco() {
+  local caminho=""
+  if [ -z "${SUPABASE_DB_ADMIN_URL:-}${SUPABASE_DB_URL:-}" ]; then
+    printf '%s' "Sem SUPABASE_DB_URL no .env não há connection string para testar — rode o install.sh."
+    return 1
+  fi
+  if ! caminho="$(ca_do_supabase 2>&1)"; then
+    printf '%s' "$caminho"
+    return 1
+  fi
+  pg_container postgres:17-alpine psql "$(url_tls_verificada "$(url_do_schema)")" -tAc 'select 1' >/dev/null
+}
 
 # ── Re-aplicar o baseline num banco que JÁ existe ────────────────────────────
 # Chamado pelo `update.sh` e pelo `install.sh` re-executado. Sem `ON_ERROR_STOP`,
@@ -777,7 +1668,7 @@ reaplicar_baseline() {
   [ -z "$log" ] || : > "$log"
   while :; do
     rc=0
-    raw="$(docker run --rm -i -v "$arquivo:/b.sql:ro" postgres:17-alpine \
+    raw="$(pg_container -i -v "$arquivo:/b.sql:ro" postgres:17-alpine \
           psql "$(url_do_schema)" -q -f /b.sql 2>&1)" || rc=$?
     [ -z "$log" ] || printf '── passada %s de %s (saída %s) ──\n%s\n' "$BASELINE_PASSADAS" "$tentativas" "$rc" "$raw" >> "$log"
     BASELINE_INESPERADO="$(printf '%s\n' "$raw" | grep -iE 'ERROR|FATAL' | grep -viE "$BASELINE_ERROS_BENIGNOS" || true)"
@@ -815,7 +1706,7 @@ reaplicar_baseline() {
       # passada, sem disputa" em cima de duas coisas que ninguém mediu. Silêncio.
       return 1
     fi
-    c_ylw "• parte do banco não aplicou (disputa com o app no ar ou conexão instável) — aplicando de novo, é seguro (passada $((BASELINE_PASSADAS + 1)) de $tentativas). O que não aplicou:"
+    c_ylw "$(t "• parte do banco não aplicou (disputa com o app no ar ou conexão instável) — aplicando de novo, é seguro (passada {1} de {2}). O que não aplicou:" "$((BASELINE_PASSADAS + 1))" "$tentativas")"
     listar_erros_do_banco "$BASELINE_INESPERADO" 10 "    "
     sleep "$((espera * BASELINE_PASSADAS))"
     BASELINE_PASSADAS=$((BASELINE_PASSADAS + 1))
@@ -1087,6 +1978,19 @@ gravar_imagens() {
   # não no `stable` móvel do default do compose.
   set_env_var "$envfile" VOICE_AGENT_IMAGE       "${IMG_VOICE_AGENT}:${versao}"
   set_env_var "$envfile" VOICE_AGENT_PULL_POLICY "$politica"
+  # O WAHA de quem já roda em ARM mora AQUI, e não numa linha do update.sh: é
+  # esta função que o update.sh ANTIGO chama depois de reler o kit, então é
+  # assim que a troca chega já na atualização que a traz. O export vale porque
+  # o compose prefere a variável do ambiente (que o enter_project exportou com o
+  # valor velho) à do .env.
+  local waha_atual
+  waha_atual="$(sed -n 's/^WAHA_IMAGE=//p' "$envfile" 2>/dev/null | tail -1 | tr -d "\"'")"
+  if waha_amd64_conhecido_em_arm "$(uname -m 2>/dev/null || true)" "$waha_atual"; then
+    WAHA_IMAGE="$(imagem_waha_padrao_para_host)"
+    export WAHA_IMAGE
+    set_env_var "$envfile" WAHA_IMAGE "$WAHA_IMAGE"
+    c_ylw "$(t "  (WAHA trocado para a variante oficial ARM64: {1})" "$WAHA_IMAGE")"
+  fi
 }
 
 # ── Os segredos da chamada de voz, no .env de quem já tinha instalado ────────
@@ -1182,7 +2086,7 @@ set_env_var() {
 # `_common.sh` roda sob `set -euo pipefail`, e o consumidor resolve o UUID numa
 # ATRIBUIÇÃO: `uid="$(owner_id_by_email "$EMAIL")"`. O status da atribuição é o
 # da substituição, então uma função que devolve não-zero mata o script ALI — na
-# linha de cima do `[ -n "$uid" ] || die "Usuário não encontrado."`, que nunca
+# linha de cima do `[ -n "$uid" ] || die "$(t "Usuário não encontrado.")"`, que nunca
 # chega a rodar. E o `grep` devolve 1 justamente quando não casa ninguém, que é
 # o caso em que a mensagem existe para falar.
 #
@@ -1265,12 +2169,12 @@ setup_event_log_drain_cron() {
   if [ "$(basename "$0")" = update.sh ] && [ -z "${DESKCOMM_AGENT_REPORT:-}" ]; then
     trocar_segredo_do_cron_vazado || true
   fi
-  command -v crontab >/dev/null 2>&1 || { c_ylw "⚠ 'crontab' não encontrado — instale o pacote 'cron' e rode de novo pra ativar as automações."; return 0; }
+  command -v crontab >/dev/null 2>&1 || { c_ylw "$(t "⚠ 'crontab' não encontrado — instale o pacote 'cron' e rode de novo pra ativar as automações.")"; return 0; }
 
   local secret="${INTERNAL_CRON_SECRET:-}"
   [ -n "$secret" ] || secret="${INTERNAL_SECRET:-}"
-  [ -n "$secret" ] || { c_ylw "⚠ falta INTERNAL_SECRET/INTERNAL_CRON_SECRET — não ativei o cron das automações."; return 0; }
-  [ -n "${NEXT_PUBLIC_APP_URL:-}" ] || { c_ylw "⚠ falta NEXT_PUBLIC_APP_URL — não ativei o cron das automações."; return 0; }
+  [ -n "$secret" ] || { c_ylw "$(t "⚠ falta INTERNAL_SECRET/INTERNAL_CRON_SECRET — não ativei o cron das automações.")"; return 0; }
+  [ -n "${NEXT_PUBLIC_APP_URL:-}" ] || { c_ylw "$(t "⚠ falta NEXT_PUBLIC_APP_URL — não ativei o cron das automações.")"; return 0; }
 
   local url_drain="${NEXT_PUBLIC_APP_URL}/api/v1/cron/event-log-drain"
   local marcador; marcador="$(cron_tag drain)"
@@ -1283,7 +2187,7 @@ setup_event_log_drain_cron() {
 
   local cabecalho="${PROJECT_DIR:-$PWD}/.env.cron-drain"
   gravar_cabecalho_do_cron "$cabecalho" "$secret" \
-    || { c_ylw "⚠ não consegui gravar ${cabecalho} — não ativei o cron das automações."; return 0; }
+    || { c_ylw "$(t "⚠ não consegui gravar {1} — não ativei o cron das automações." "$cabecalho")"; return 0; }
 
   # A linha legada (com o Bearer escrito nela) sai pela assinatura da URL.
   # ⚠️ Numa instalação existente isso só acontece a partir do update SEGUINTE ao
@@ -1324,7 +2228,7 @@ setup_event_log_drain_cron() {
   # Stdin vazio para o `cron_merge` é exatamente o que "sem crontab prévio" deve
   # produzir — o comportamento não muda, só o status.
   ( { crontab -l 2>/dev/null || true; } | cron_merge "$marcador" "$url_drain" "$cron_line" ) | crontab -
-  c_grn "✓ automações ativas (cron do event-log-drain, a cada minuto)"
+  c_grn "$(t "✓ automações ativas (cron do event-log-drain, a cada minuto)")"
 
   if [ "$first_time" = 1 ]; then
     # 1ª ativação do cron (inclusive numa instalação já existente que nunca
@@ -1333,11 +2237,11 @@ setup_event_log_drain_cron() {
     # (ex.: webhook de dias/semanas atrás) — surpresa indesejada pro dono do
     # CRM. Marcamos como 'done' só os realmente velhos (>7 dias); os recentes
     # continuam 'pending' e processam normalmente no próximo drain.
-    step "Higienizando eventos pendentes antigos (1ª ativação do cron)"
+    step "$(t "Higienizando eventos pendentes antigos (1ª ativação do cron)")"
     psql_run -c "update event_log set status='done', updated_at=now() where status='pending' and created_at < now() - interval '7 days';" \
       >/dev/null 2>&1 \
-      && c_grn "✓ eventos pendentes com mais de 7 dias marcados como concluídos" \
-      || c_ylw "⚠ não consegui higienizar eventos antigos — confira manualmente a tabela event_log se necessário."
+      && c_grn "$(t "✓ eventos pendentes com mais de 7 dias marcados como concluídos")" \
+      || c_ylw "$(t "⚠ não consegui higienizar eventos antigos — confira manualmente a tabela event_log se necessário.")"
   fi
 }
 
@@ -1420,11 +2324,11 @@ trocar_segredo_do_cron_vazado() {
   novo="$(openssl rand -hex 32 2>/dev/null)" || novo=""
   if [ -z "$novo" ]; then
     [ -n "$tem_cadeado" ] && exec 8>&-
-    c_ylw "⚠ não consegui gerar a senha nova das rotinas — tento de novo na próxima atualização."
+    c_ylw "$(t "⚠ não consegui gerar a senha nova das rotinas — tento de novo na próxima atualização.")"
     return 1
   fi
 
-  step "Trocando a senha interna das rotinas (a antiga ficou no log do sistema)"
+  step "$(t "Trocando a senha interna das rotinas (a antiga ficou no log do sistema)")"
   set_env_var "$envfile" "$chave" "$novo"
   export "${chave}=${novo}"
   if ! dc up -d >/dev/null 2>&1; then
@@ -1432,19 +2336,19 @@ trocar_segredo_do_cron_vazado() {
     export "${chave}=${velho}"
     dc up -d >/dev/null 2>&1 || true
     [ -n "$tem_cadeado" ] && exec 8>&-
-    c_ylw "⚠ não consegui reiniciar o app com a senha nova — mantive a antiga e tento de novo na próxima atualização."
+    c_ylw "$(t "⚠ não consegui reiniciar o app com a senha nova — mantive a antiga e tento de novo na próxima atualização.")"
     return 1
   fi
   wait_app_healthy 20 3 >/dev/null \
-    || c_ylw "⚠ o app ainda não respondeu depois da troca — a senha nova já está no .env e segue valendo."
+    || c_ylw "$(t "⚠ o app ainda não respondeu depois da troca — a senha nova já está no .env e segue valendo.")"
   gravar_cabecalho_do_cron "${dir}/.env.cron-drain" "$novo" || true
   : > "$marca" 2>/dev/null || true
   [ -n "$tem_cadeado" ] && exec 8>&-
   SEGREDO_DO_CRON_TROCADO=1
 
-  c_grn "✓ senha interna das rotinas trocada — a que ficou gravada no log do sistema não abre mais nada"
-  c_ylw "  Recomendado (não obrigatório): apagar os logs antigos, onde a senha velha aparece."
-  c_ylw "  Numa VPS Ubuntu/Debian, como root:"
+  c_grn "$(t "✓ senha interna das rotinas trocada — a que ficou gravada no log do sistema não abre mais nada")"
+  c_ylw "$(t "  Recomendado (não obrigatório): apagar os logs antigos, onde a senha velha aparece.")"
+  c_ylw "$(t "  Numa VPS Ubuntu/Debian, como root:")"
   c_ylw "    sudo truncate -s 0 /var/log/syslog && sudo rm -f /var/log/syslog.*"
   c_ylw "    sudo journalctl --rotate && sudo journalctl --vacuum-time=1s"
   return 0
@@ -1457,10 +2361,10 @@ trocar_segredo_do_cron_vazado() {
 # sempre. Chamada por install.sh e update.sh (bloco 7) — re-rodar não duplica
 # a linha do crontab.
 setup_update_agent_cron() {
-  command -v crontab >/dev/null 2>&1 || { c_ylw "⚠ 'crontab' não encontrado — o botão de atualizar pela tela não vai funcionar."; return 0; }
+  command -v crontab >/dev/null 2>&1 || { c_ylw "$(t "⚠ 'crontab' não encontrado — o botão de atualizar pela tela não vai funcionar.")"; return 0; }
   local secret="${INTERNAL_CRON_SECRET:-${INTERNAL_SECRET:-}}"
-  [ -n "$secret" ] || { c_ylw "⚠ falta INTERNAL_SECRET — não ativei o agente de atualização."; return 0; }
-  [ -n "${NEXT_PUBLIC_APP_URL:-}" ] || { c_ylw "⚠ falta NEXT_PUBLIC_APP_URL — não ativei o agente de atualização."; return 0; }
+  [ -n "$secret" ] || { c_ylw "$(t "⚠ falta INTERNAL_SECRET — não ativei o agente de atualização.")"; return 0; }
+  [ -n "${NEXT_PUBLIC_APP_URL:-}" ] || { c_ylw "$(t "⚠ falta NEXT_PUBLIC_APP_URL — não ativei o agente de atualização.")"; return 0; }
 
   # `cd` explícito: o agent.sh chama enter_project(), que acha o projeto pelo
   # DIRETÓRIO CORRENTE. No cron o CWD é o home do dono do crontab — sem o cd,
@@ -1474,7 +2378,7 @@ setup_update_agent_cron() {
   # Mesmo motivo do drain acima, e é por isso que o conserto é nos DOIS: a
   # primeira instalação passa pelos dois blocos na mesma rodada.
   ( { crontab -l 2>/dev/null || true; } | cron_merge "$marcador" "$legado" "$cron_line" ) | crontab -
-  c_grn "✓ atualização pela tela ativa (agente a cada 5 minutos)"
+  c_grn "$(t "✓ atualização pela tela ativa (agente a cada 5 minutos)")"
 }
 
 # Garante a chave de cifra dos segredos (webhooks/Nuvemshop) e a semeia no
@@ -1490,7 +2394,7 @@ ensure_encryption_key() {
   if [ -z "$key" ]; then
     key="$(openssl rand -hex 32)"
     printf '\nNUVEMSHOP_OAUTH_ENCRYPTION_KEY=%s\n' "$key" >> "$envfile"
-    c_grn "✓ chave de cifra dos segredos gerada e gravada no .env"
+    c_grn "$(t "✓ chave de cifra dos segredos gerada e gravada no .env")"
   fi
   export NUVEMSHOP_OAUTH_ENCRYPTION_KEY="$key"
 
@@ -1498,6 +2402,71 @@ ensure_encryption_key() {
   # permite configurar a chave via parâmetro de banco).
   psql_run -c "insert into private.app_secrets (name, value) values ('nuvemshop_oauth_key', '${key}') on conflict (name) do update set value = excluded.value, updated_at = now();" \
     >/dev/null 2>&1 \
-    && c_grn "✓ chave de cifra ativa no banco (segredos de webhook são guardados cifrados)" \
-    || c_ylw "⚠ não consegui semear a chave de cifra no banco — segredos de webhook não poderão ser salvos até rodar update.sh de novo."
+    && c_grn "$(t "✓ chave de cifra ativa no banco (segredos de webhook são guardados cifrados)")" \
+    || c_ylw "$(t "⚠ não consegui semear a chave de cifra no banco — segredos de webhook não poderão ser salvos até rodar update.sh de novo.")"
+}
+
+# ── A ÚLTIMA RELEASE ESTÁVEL PUBLICADA ──────────────────────────────────────
+#
+# ⚠️ TAG EXISTIR NÃO É RELEASE PUBLICADA, e confundir as duas instala código
+# que ninguém lançou.
+#
+# Caso real (2026-09-13): `v1.20.0` existe como tag annotated criada À MÃO no
+# repositório oficial — a mensagem da própria tag registra que o CI recusou
+# criá-la — enquanto `/releases/latest` continuava devolvendo `v1.19.0`.
+# `git tag -l 'v*' --sort=-v:refname | head -1`, que era o que este kit usava,
+# responde "v1.20.0" e manda todo clone do mundo instalar um código sem
+# release, sem changelog e sem os cinco checks obrigatórios da `main`.
+#
+# `/releases/latest` é a pergunta certa: a própria API do GitHub define esse
+# endpoint como a última release que NÃO é draft e NÃO é prerelease — os dois
+# filtros que queremos, aplicados na origem, sem precisar ordenar nada aqui.
+#
+# O repositório sai do `origin` (e não de uma constante) para que um fork com
+# releases próprias funcione sem editar o kit; `DESKCOMM_RELEASES_LATEST_URL`
+# troca o endereço inteiro quando é preciso.
+#
+# Devolve string VAZIA quando não dá para saber (sem rede, API fora, fork sem
+# release). Vazio é "não sei" — e quem chama TEM de tratar isso como "não sei",
+# nunca como "não há versão nova". Cair de volta para `git tag` aqui seria
+# reintroduzir exatamente o defeito que esta função existe para matar.
+ultima_release_estavel() {
+  local origem slug url tag
+  origem="$(git config --get remote.origin.url 2>/dev/null || true)"
+
+  # Endereço explícito primeiro: é o caminho dos testes (um JSON local via
+  # `file://`) e de quem opera um fork com releases num lugar próprio.
+  url="${DESKCOMM_RELEASES_LATEST_URL:-}"
+
+  if [ -z "$url" ]; then
+    case "$origem" in
+      https://github.com/*|http://github.com/*|git@github.com:*)
+        slug="$(printf '%s' "$origem" \
+          | sed -E 's#^git@github\.com:#https://github.com/#; s#\.git$##; s#^https?://[^/]+/##')"
+        url="https://api.github.com/repos/${slug}/releases/latest"
+        ;;
+      *)
+        # Origin FORA do GitHub (espelho, caminho local): ali não existe API de
+        # release, e a maior tag é a única resposta que existe — o mesmo que o
+        # kit fazia antes. Toda instalação real clona do GitHub (install.sh) e
+        # nunca cai aqui; quem cai é o repositório descartável dos testes.
+        git tag -l 'v*' --sort=-v:refname | head -1
+        return 0
+        ;;
+    esac
+  fi
+
+  # `-f` faz o curl falhar em 404 (repo sem release nenhuma) em vez de devolver
+  # o corpo de erro, que o sed abaixo interpretaria como ausência de tag_name.
+  tag="$(curl -fsSL --max-time 20 -H 'Accept: application/vnd.github+json' "$url" 2>/dev/null \
+    | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
+
+  # Sem jq de propósito: o kit não pode exigir jq numa VPS de cliente. O
+  # `tag_name` é o primeiro campo desse formato no JSON de uma release e não
+  # contém aspas, então o sed é suficiente — e a validação abaixo recusa
+  # qualquer coisa que não tenha cara de versão, em vez de confiar no parse.
+  case "$tag" in
+    v[0-9]*) printf '%s\n' "$tag" ;;
+    *) printf '' ;;
+  esac
 }

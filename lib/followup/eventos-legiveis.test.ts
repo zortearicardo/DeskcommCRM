@@ -1,4 +1,8 @@
+import { readFileSync } from "node:fs";
+
 import { describe, expect, it } from "vitest";
+
+import { DICIONARIO } from "@/lib/i18n/dicionario";
 
 import {
   descreveEvento,
@@ -10,7 +14,7 @@ import {
   type NoDoDossie,
 } from "./eventos-legiveis";
 import type { FlowNode } from "./graph-schema";
-import { EVENTO_ACAO_ADIADA } from "./node-handlers";
+import { EVENTO_ACAO_ADIADA, EVENTO_CLASSIFICACAO_ESPERANDO, EVENTO_TURNO_DESCARTADO } from "./node-handlers";
 
 const espera: FlowNode = {
   id: "wait-1",
@@ -152,6 +156,58 @@ describe("descreveEvento", () => {
     expect(r.titulo).toBe("Segurou o envio até o horário permitido");
     expect(r.detalhe).toContain("envia em");
     expect(r.autor).toBe("motor");
+  });
+
+  it("o turno descartado pela suspensão diz o motivo e que o envio volta (migration 0501)", () => {
+    const r = descreveEvento(
+      evento({ node_id: "action-1", event_type: EVENTO_TURNO_DESCARTADO, payload: { motivo: "org_nao_operante" } }),
+      nos,
+      "pt-BR",
+    );
+    expect(r.titulo).toBe("O envio deste passo foi descartado porque a conta foi suspensa");
+    expect(r.detalhe).toBe("sai num envio novo quando a conta for reativada");
+  });
+
+  it("o turno descartado pela PAUSA da inscrição aponta a pausa, não a conta (#2262)", () => {
+    const r = descreveEvento(
+      evento({ node_id: "action-1", event_type: EVENTO_TURNO_DESCARTADO, payload: { motivo: "inscricao_pausada" } }),
+      nos,
+      "pt-BR",
+    );
+    expect(r.titulo).toBe("O envio deste passo foi descartado porque a inscrição está pausada");
+    expect(r.detalhe).toBe("sai num envio novo quando a inscrição for retomada");
+  });
+
+  it("as duas frases do turno descartado têm espanhol e inglês — o dossiê as passa por t() dinâmico, que o guarda de i18n não vê", () => {
+    const en = JSON.parse(readFileSync("lib/i18n/traducoes/en.json", "utf8")) as Record<string, string>;
+    for (const motivo of ["org_nao_operante", "inscricao_pausada"]) {
+      const r = descreveEvento(evento({ node_id: "action-1", event_type: EVENTO_TURNO_DESCARTADO, payload: { motivo } }), nos, "pt-BR");
+      for (const frase of [r.titulo, r.detalhe ?? ""]) {
+        expect(DICIONARIO[frase]?.es, `sem espanhol: ${frase}`).toBeTruthy();
+        expect(en[frase], `sem inglês: ${frase}`).toBeTruthy();
+      }
+    }
+  });
+
+  it("o classificar que espera a resposta diz que ESPERA, e até quando — não parece travado", () => {
+    const r = descreveEvento(
+      evento({ node_id: "action-1", event_type: EVENTO_CLASSIFICACAO_ESPERANDO, payload: { until: "2026-08-11T12:00:00.000Z" } }),
+      nos,
+      "pt-BR",
+    );
+    expect(r.titulo).toBe("Esperando a resposta do cliente");
+    expect(r.detalhe).toMatch(/^se ele não responder até .+, o fluxo segue sem a resposta$/);
+    expect(r.autor).toBe("motor");
+  });
+
+  it("a carência vencida sem resposta diz POR QUE seguiu, não só que seguiu", () => {
+    const r = descreveEvento(
+      evento({ event_type: "node_advanced", payload: { next_node_id: "action-1", class: "no_reply" } }),
+      nos,
+      "pt-BR",
+    );
+    expect(r.titulo).toBe("O cliente não respondeu dentro do prazo");
+    expect(r.detalhe).toBe("foi para Primeira cutucada");
   });
 
   it("tipo desconhecido não vira jargão disfarçado de frase, mas também não some", () => {
@@ -352,5 +408,17 @@ describe("os eventos que o plano de tempo trouxe", () => {
     const r = descreveEvento(evento({ event_type: "timing_plan_desistido" }), nos, "pt-BR");
     expect(r.titulo).toBe("Seguiu sem o plano de tempo");
     expect(r.detalhe).toContain("máximo configurado");
+  });
+
+  it("nascimento do negócio é proveniência, não código cru", () => {
+    const r = descreveEvento(evento({ event_type: "enrolled_by_lead_created" }), nos, "pt-BR");
+    expect(r.titulo).toBe("Começou porque o negócio nasceu");
+    expect(r.autor).toBe("motor");
+  });
+
+  it("retorno do cliente é proveniência, não código cru", () => {
+    const r = descreveEvento(evento({ event_type: "enrolled_by_inbound_after_silence" }), nos, "pt-BR");
+    expect(r.titulo).toBe("Começou porque o cliente voltou a escrever");
+    expect(r.autor).toBe("motor");
   });
 });

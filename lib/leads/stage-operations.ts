@@ -31,6 +31,7 @@ import {
   slugDeNome,
   updatesDeMarcacao,
   validarArquivamento,
+  validarJanelaDeEsfriamento,
   validarMarcacao,
   validarNomeDeEtapa,
   type EtapaEditavel,
@@ -51,7 +52,7 @@ export interface DepsDeEtapa {
 
 /** As colunas que a tela e as regras usam. `position` entra: a reordenação calcula em cima dela. */
 const COLUNAS =
-  "id, name, slug, position, is_won, is_lost, is_archived, agent_stage_hint, last_change_actor_kind, last_change_at";
+  "id, name, slug, position, is_won, is_lost, is_archived, win_probability, agent_stage_hint, avisar_na_central, expected_duration_hours, last_change_actor_kind, last_change_at";
 
 /** A etapa como sai para quem lê — inclui a autoria da última mudança de configuração. */
 export interface EtapaVisivel {
@@ -61,12 +62,31 @@ export interface EtapaVisivel {
   position: number;
   is_won: boolean;
   is_lost: boolean;
+  /**
+   * Probabilidade de GANHO desta etapa, 0–100 (migration 0426). `null` = etapa
+   * sem calibração, e a previsão a reporta à parte em vez de somar zero.
+   *
+   * `is_won` e `is_lost` valem 100 e 0 NA REGRA (`lib/leads/previsao.ts`),
+   * não aqui: gravar seria um segundo lugar para a mesma verdade divergir.
+   */
+  win_probability: number | null;
+  /** Negócio que entra nesta etapa abre um aviso na Central (migration 0440). */
+  avisar_na_central: boolean;
+  /**
+   * Janela de "esfriando" DESTA etapa, em horas (`crm_stages.expected_duration_hours`).
+   * `null` = a etapa nunca configurou, e o radar cai no padrão de 24 h/72 h
+   * (`resolveStageWindow`). Vazio NÃO é zero: zero não esfria nunca, e a
+   * coluna é `numeric` sem CHECK (a rede é a validação de 1 a 8760 em
+   * `validarJanelaDeEsfriamento`, aqui e nas rotas).
+   */
+  expected_duration_hours: number | null;
   /** `user` | `ai` | `system` — `null` nas etapas anteriores a esta coluna. */
   last_change_actor_kind: string | null;
   last_change_at: string | null;
 }
 
 type EtapaLida = EtapaEditavel & {
+  avisar_na_central?: boolean | null;
   last_change_actor_kind: string | null;
   last_change_at: string | null;
 };
@@ -119,6 +139,9 @@ export function corpo(etapas: EtapaLida[]): { etapas: EtapaVisivel[] } {
         position: e.position,
         is_won: e.is_won,
         is_lost: e.is_lost,
+        win_probability: e.win_probability ?? null,
+        avisar_na_central: e.avisar_na_central === true,
+        expected_duration_hours: e.expected_duration_hours ?? null,
         last_change_actor_kind: e.last_change_actor_kind ?? null,
         last_change_at: e.last_change_at ?? null,
       })),
@@ -222,7 +245,7 @@ export interface EtapaCriada {
  */
 export async function criarEtapa(
   deps: DepsDeEtapa,
-  input: { pipelineId: string; nome: string },
+  input: { pipelineId: string; nome: string; expected_duration_hours?: number | null },
 ): Promise<EtapaCriada> {
   const name = input.nome.trim();
   const etapas = await funilOuNadaFeito(deps, input.pipelineId);
@@ -232,6 +255,15 @@ export async function criarEtapa(
   const veredito = validarNomeDeEtapa(name, etapas, null);
   if (!veredito.ok) {
     throw new ApiError(422, "unprocessable_entity", undefined, deps.requestId, veredito.erro);
+  }
+
+  // A janela nasce com a etapa quando quem a criou já sabe a duração — mesma
+  // régua do PATCH, porque a coluna é `numeric` sem CHECK.
+  if (input.expected_duration_hours !== undefined && input.expected_duration_hours !== null) {
+    const janela = validarJanelaDeEsfriamento(input.expected_duration_hours);
+    if (!janela.ok) {
+      throw new ApiError(422, "unprocessable_entity", undefined, deps.requestId, janela.erro);
+    }
   }
 
   const autoria = autoriaDaMudanca(deps.actor);
@@ -244,6 +276,11 @@ export async function criarEtapa(
     slug: slugDeNome(name, etapas.map((e) => e.slug)),
     position: posicaoEntre(etapas[etapas.length - 1]?.position ?? null, null),
     ...autoria,
+    // Só quando veio pedido — a chave ausente não é a mesma que `null` num
+    // insert que outros chamadores (MCP) compartilham.
+    ...(input.expected_duration_hours !== undefined
+      ? { expected_duration_hours: input.expected_duration_hours }
+      : {}),
   };
 
   const { data: criada, error } = await deps.supabase
@@ -277,12 +314,29 @@ export interface PedidoDeEdicao {
   is_won?: boolean;
   is_lost?: boolean;
   /**
+   * Probabilidade de ganho da etapa, 0–100 (migration 0426). `null` limpa a
+   * calibração — e a previsão volta a reportar a etapa no balde "sem
+   * probabilidade". Ganho e perda NÃO aceitam número: valem 100 e 0 na regra,
+   * nunca gravado.
+   */
+  win_probability?: number | null;
+  /**
    * O vizinho da ESQUERDA (`null` = primeira coluna), não um número de posição:
    * quem arrasta a coluna sabe onde ela caiu, não qual fração de `position` isso
    * vira. Mandar o número duplicaria a conta que `posicaoEntre` já faz — e as
    * duas divergiriam no primeiro ajuste.
    */
   depois_de?: string | null;
+  /** Liga ou desliga o aviso na Central para quem entra nesta etapa (0440). */
+  avisar_na_central?: boolean;
+  /**
+   * Janela de "esfriando" da etapa, em HORAS (`crm_stages.expected_duration_hours`).
+   * `null` limpa a configuração de propósito — a etapa volta ao padrão de
+   * 24 h/72 h do radar (`resolveStageWindow`). Aceita 1 a 8760 (uma hora a um
+   * ano): fora disso, `validarJanelaDeEsfriamento` recusa ANTES de tocar no
+   * banco, porque a coluna é `numeric` sem CHECK.
+   */
+  expected_duration_hours?: number | null;
 }
 
 export async function atualizarEtapa(
@@ -325,6 +379,30 @@ export async function atualizarEtapa(
     }
   }
 
+  if (pedido.win_probability !== undefined && pedido.win_probability !== null) {
+    const p = pedido.win_probability;
+    if (!Number.isInteger(p) || p < 0 || p > 100) {
+      throw new ApiError(
+        422,
+        "unprocessable_entity",
+        undefined,
+        deps.requestId,
+        "A probabilidade de ganho de uma etapa vai de 0 a 100.",
+      );
+    }
+  }
+
+  // `null` limpa a calibração da janela e cai no padrão do radar — o mesmo
+  // contrato do `win_probability` acima. Um número fora de 1 a 8760 nunca
+  // chega ao banco: a coluna é `numeric` SEM CHECK (a migration que colocaria
+  // um ficou de fora deste escopo), então quem valida aqui é a primeira rede.
+  if (pedido.expected_duration_hours !== undefined && pedido.expected_duration_hours !== null) {
+    const veredito = validarJanelaDeEsfriamento(pedido.expected_duration_hours);
+    if (!veredito.ok) {
+      throw new ApiError(422, "unprocessable_entity", undefined, deps.requestId, veredito.erro);
+    }
+  }
+
   const temMarcacao = pedido.is_won !== undefined || pedido.is_lost !== undefined;
   if (temMarcacao) {
     const veredito = validarMarcacao(etapas, stageId, pedido);
@@ -333,8 +411,21 @@ export async function atualizarEtapa(
     }
   }
 
-  const patchDoAlvo: PatchDeMarcacao & { name?: string; position?: number } = {};
+  const patchDoAlvo: PatchDeMarcacao & {
+    name?: string;
+    position?: number;
+    win_probability?: number | null;
+    avisar_na_central?: boolean;
+    expected_duration_hours?: number | null;
+  } = {};
   if (pedido.name !== undefined) patchDoAlvo.name = pedido.name.trim();
+  // `undefined` não viaja; `null` limpa a calibração de propósito.
+  if (pedido.win_probability !== undefined) patchDoAlvo.win_probability = pedido.win_probability;
+  if (pedido.avisar_na_central !== undefined) patchDoAlvo.avisar_na_central = pedido.avisar_na_central;
+  // Mesmo contrato: `undefined` = "não mexe", `null` = "volta ao padrão de 24 h".
+  if (pedido.expected_duration_hours !== undefined) {
+    patchDoAlvo.expected_duration_hours = pedido.expected_duration_hours;
+  }
 
   if (pedido.depois_de !== undefined) {
     // Só as ativas compõem a régua: arquivada não ocupa lugar no quadro.
@@ -479,6 +570,24 @@ export async function arquivarEtapa(
     );
   }
 
+  // ── POR QUE A RÉGUA DE CAMPOS OBRIGATÓRIOS (#1536) NÃO ENTRA AQUI ───────────
+  //
+  // Este UPDATE move N negócios de uma vez e é a ÚNICA porta de saída de uma
+  // etapa que está sendo arquivada (`validarArquivamento` recusa arquivar com
+  // negócio e sem destino). Aplicar `validaCamposExigidos` aqui seria decidir
+  // por N fichas diferentes, e a recusa não teria saída nenhuma: a tela de
+  // arquivamento não coleta campo de ficha, então o dono ficaria SEM COMO tirar
+  // a coluna do quadro — nem saberia qual dos cards travou a operação. Bloquear
+  // uma ação de CONFIGURAÇÃO por dado de ficha é decisão de produto nova, não
+  // conserto do buraco do #1536, e por isso fica registrado aqui em vez de
+  // imposto em silêncio (o CR do mantenedor aceita as duas saídas).
+  //
+  // O buraco em si fecha pelas portas de ENTRADA em etapa: arrasto, lote,
+  // botão ganhar/perder, MCP, agente, handoff e agendamento passam todos pela
+  // mesma régua, então o PRÓXIMO movimento destes cards — para uma etapa que
+  // exige — é coberto. A comparação "mesma etapa passa" também não vira buraco
+  // aqui: o destino deste UPDATE é SEMPRE outra etapa.
+  //
   // ⚠️ OS NEGÓCIOS ANDAM PRIMEIRO. Arquivar antes de mover deixaria os cards
   // apontando para uma coluna fora do quadro se a segunda escrita falhasse —
   // sumiço silencioso, o pior desfecho possível aqui.

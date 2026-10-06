@@ -161,15 +161,39 @@ export type ActivityType =
   /**
    * O negócio nasceu da TROCA DE FUNIL (`POST /api/v1/leads/[id]/clone`).
    *
-   * ⚠️ Não é `lead_created`: aquele rótulo diz "Entrou pelo WhatsApp", e este
-   * negócio não entrou por canal nenhum — ele veio de outro funil, e é isso que
+   * ⚠️ Não é `lead_created`: aquele diz "Entrou no funil" pela primeira
+   * mensagem de um canal, e este negócio não entrou por canal nenhum — ele veio de outro funil, e é isso que
    * quem abre o card no destino precisa ler. O outro lado da troca é a
    * `demand_closed` da origem, com a razão "Levado para o funil X".
    */
-  | "moved_from_pipeline";
+  | "moved_from_pipeline"
+  | "proposal_drafted"
+  | "proposal_sent"
+  | "proposal_accepted"
+  | "proposal_declined"
+  | "proposal_expired"
+  | "proposal_value_changed"
+  /**
+   * N2 — o envio tentou agendar o follow-up automático e NÃO conseguiu por um
+   * motivo que não é "já existe retorno" (esse tem atividade própria, a do
+   * retorno que já serve). Sem esta linha, "a proposta foi enviada e nenhum
+   * retorno veio" seria indistinguível de "o retorno está a caminho" — e é
+   * justamente no silêncio que a demanda morre. O PORQUÊ vai no `reason`.
+   */
+  | "proposal_followup_skipped"
+  /**
+   * O CONTATO VIROU PESSOAL / DEIXOU DE SER PESSOAL (spec 21).
+   *
+   * Tipos próprios, e não `note`, porque quem decide o que some da vista é um
+   * FILTRO que só enxerga `new.type`: sem tipo próprio, marcar não teria como
+   * pendurar a prova na timeline do negócio — e sem negócio aberto não há linha
+   * possível (`lead_id` é NOT NULL), só auditoria (D6).
+   */
+  | "contact_marked_personal"
+  | "contact_unmarked_personal";
 
 export const ACTIVITY_LABELS: Record<ActivityType, string> = {
-  lead_created: "Entrou pelo WhatsApp",
+  lead_created: "Entrou no funil",
   stage_changed: "Mudou de estágio",
   agent_move_corrected: "Correção do que o assistente tinha feito",
   note: "Anotação",
@@ -267,6 +291,17 @@ export const ACTIVITY_LABELS: Record<ActivityType, string> = {
   // ter mudado de contato sem ninguém tê-lo movido.
   contacts_merged: "Contatos duplicados juntados",
   moved_from_pipeline: "Veio de outro funil",
+  proposal_drafted: "Rascunho de proposta criado",
+  proposal_sent: "Proposta enviada",
+  proposal_accepted: "Proposta aceita",
+  proposal_declined: "Proposta recusada",
+  proposal_expired: "Proposta venceu sem decisão",
+  proposal_value_changed: "Valor do negócio atualizado pela proposta",
+  proposal_followup_skipped: "Follow-up automático não agendado",
+  // Rótulos com o veredito, nunca o mecanismo: quem lê a timeline quer saber
+  // que o contato saiu da operação (ou voltou), não o nome da coluna.
+  contact_marked_personal: "Marcado como pessoal",
+  contact_unmarked_personal: "Desmarcado como pessoal",
 };
 
 /** Quando o tipo é legado/desconhecido, a linha ainda é honesta — sem jargão. */

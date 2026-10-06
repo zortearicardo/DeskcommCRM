@@ -19,9 +19,9 @@
  *    da bolha de voz. E a Meta **não converte** — quem manda mp3 com `voice:true` erra;
  *    o outro canal converte por nós, este não.
  */
-import { graphVersion } from "@/lib/graph-version";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { metaContactsPayload } from "@/lib/channels/meta/contact-card";
+import { graphBaseUrl } from "@/lib/channels/meta/graph-base";
 import { resolveMetaCreds } from "../meta/credentials";
 import type {
   ChannelAdapter,
@@ -32,7 +32,7 @@ import type {
 } from "../types";
 
 /** Só dígitos. `+55 (31) 99896-6398` → `5531998966398`. */
-function toE164Digits(raw: string): string {
+export function toE164Digits(raw: string): string {
   return raw.replace(/\D/g, "");
 }
 
@@ -47,8 +47,13 @@ function toE164Digits(raw: string): string {
 import { metaCredsFromEnv } from "../meta/credentials";
 export { metaCredsFromEnv as getMetaCreds };
 
-/** `kind: "contact"` → objeto `contacts` da Cloud API. */
-function contactPayload(env: OutboundEnvelope): Record<string, unknown> | null {
+/**
+ * `kind: "contact"` → objeto `contacts` da Cloud API.
+ *
+ * Exportada (e a de mídia também) porque o canal Datafy fala o MESMO dialeto:
+ * duas cópias garantiriam que a primeira correção de mídia faltasse num lado.
+ */
+export function contactPayload(env: OutboundEnvelope): Record<string, unknown> | null {
   if (env.kind !== "contact" || !env.contact) return null;
   return {
     type: "contacts",
@@ -57,7 +62,7 @@ function contactPayload(env: OutboundEnvelope): Record<string, unknown> | null {
 }
 
 /** `kind` do envelope → objeto de mídia da Cloud API. */
-function mediaPayload(env: OutboundEnvelope): Record<string, unknown> | null {
+export function mediaPayload(env: OutboundEnvelope): Record<string, unknown> | null {
   if (!env.media) return null;
   const link = env.media.url;
   const caption = env.media.caption ?? undefined;
@@ -148,10 +153,9 @@ export const metaCloudAdapter: ChannelAdapter = {
     });
     if (!creds) return { reachable: false, status: null, detail: "sem_credencial_para_a_sessao" };
 
-    const version = graphVersion();
     try {
       const res = await fetch(
-        `https://graph.facebook.com/${version}/${input.sessionRef}?fields=display_phone_number,quality_rating`,
+        `${graphBaseUrl()}/${input.sessionRef}?fields=display_phone_number,quality_rating`,
         {
           headers: { Authorization: `Bearer ${creds.token}` },
           // Teto de espera: um endpoint que pendura a conexão penduraria o cron
@@ -205,7 +209,7 @@ export const metaCloudAdapter: ChannelAdapter = {
 
     const headers = { Authorization: `Bearer ${creds.token}` };
     const lookup = await fetch(
-      `https://graph.facebook.com/${creds.graphVersion}/${encodeURIComponent(mediaId)}`,
+      `${graphBaseUrl()}/${encodeURIComponent(mediaId)}`,
       { headers, signal: AbortSignal.timeout(15_000) },
     );
     const metadata = (await lookup.json().catch(() => ({}))) as {
@@ -263,6 +267,56 @@ export const metaCloudAdapter: ChannelAdapter = {
     return { buffer, mime };
   },
 
+  /**
+   * "digitando…" no aparelho do cliente, antes da 1ª bolha do turno da IA.
+   *
+   * Aqui o indicador não é da conversa, é da MENSAGEM que se está respondendo:
+   * a Graph pede o `message_id` recebido e, no mesmo pedido, marca essa
+   * mensagem como lida. Não existe "digitando" sem o "lido" — é um corpo só,
+   * `status: "read"` com `typing_indicator`. O indicador some quando a resposta
+   * sai ou em 25 s, o que vier antes.
+   *
+   * Sem mensagem do cliente para responder, ou sem credencial para a sessão, é
+   * NOOP, não erro — o mesmo critério do outro canal com o transporte ausente:
+   * o produto não para por causa de um indicador decorativo. Recusa da Graph
+   * LANÇA, como manda o contrato: quem decide engolir é quem chama.
+   */
+  async signalTyping(
+    input: ChannelTenantScope & { sessionRef: string; recipient: string; inboundExternalId: string | null },
+  ): Promise<void> {
+    if (!input.inboundExternalId) return;
+    const creds = await resolveMetaCreds(createAdminClient(), {
+      organizationId: input.organizationId,
+      phoneNumberId: input.sessionRef,
+    });
+    if (!creds) return;
+
+    const res = await fetch(`${graphBaseUrl()}/${creds.phoneNumberId}/messages`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${creds.token}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        status: "read",
+        message_id: input.inboundExternalId,
+        typing_indicator: { type: "text" },
+      }),
+      // Teto curto de propósito: no início do turno ninguém espera esta chamada
+      // (`acenderDigitando`), mas antes da 1ª bolha `esperarComoHumano` a aguarda
+      // — uma Graph pendurada seguraria a mensagem, que é o produto, por causa
+      // do indicador, que é decoração.
+      signal: AbortSignal.timeout(5_000),
+    });
+    const body = (await res.json().catch(() => ({}))) as {
+      error?: { code?: number; message?: string };
+    };
+    if (!res.ok || body.error) {
+      throw new Error(`meta_${body.error?.code ?? res.status}: ${body.error?.message ?? `http_${res.status}`}`);
+    }
+  },
+
   async send(envelope: OutboundEnvelope): Promise<{ externalId: string | null }> {
     // Sessão primeiro, env como fallback. O `sessionRef` do canal oficial É o
     // `phone_number_id` (ver `resolveSessionRef`), então ele é a chave da busca.
@@ -288,7 +342,7 @@ export const metaCloudAdapter: ChannelAdapter = {
 
     await envelope.beforeSend?.();
     const res = await fetch(
-      `https://graph.facebook.com/${creds.graphVersion}/${creds.phoneNumberId}/messages`,
+      `${graphBaseUrl()}/${creds.phoneNumberId}/messages`,
       {
         method: "POST",
         headers: {

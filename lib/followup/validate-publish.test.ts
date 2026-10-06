@@ -1,6 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { validateFlowForPublish } from './validate-publish';
+import { algumCanalExigeModeloForaDaJanela, validateFlowForPublish } from './validate-publish';
+import { idsDeEtapaCitados } from './etapas-citadas';
 import type { FlowGraph, FlowNode, FlowEdge } from './graph-schema';
+import { CHANNEL_CAPABILITIES, PROVIDERS_DE_MENSAGEM, PROVIDERS_SEM_MENSAGEM } from '../channels/capabilities';
 
 const pos = { x: 0, y: 0 };
 const TEMPLATE_ID = '00000000-0000-4000-8000-000000000000';
@@ -191,6 +193,32 @@ describe('validateFlowForPublish', () => {
       [edge('t1', 'w1', always()), edge('w1', 'a1', always()), edge('a1', 'e1', always())]
     );
     expect(validateFlowForPublish(g).ok).toBe(true);
+  });
+
+  // Revisão do #1729: o plano B só sai com a janela de 24 h fechada, e o seletor
+  // dele só oferece modelo aprovado. Numa organização cujos canais não têm janela,
+  // exigi-lo travava o publish de "espera 1 dia -> IA escreve".
+  it('does not flag long_wait_needs_template when no channel of the org has a 24h window', () => {
+    const g = graph(
+      [trigger('t1'), wait('w1', { mode: 'fixed', duration_ms: 90_000_000 }), actionAiMessage('a1'), end('e1')],
+      [edge('t1', 'w1', always()), edge('w1', 'a1', always()), edge('a1', 'e1', always())]
+    );
+    expect(validateFlowForPublish(g, { exigeModeloForaDaJanela: false }).ok).toBe(true);
+    const comJanela = validateFlowForPublish(g, { exigeModeloForaDaJanela: true });
+    expect(comJanela.ok).toBe(false);
+    if (!comJanela.ok) expect(comJanela.errors.map((e) => e.code)).toEqual(['long_wait_needs_template']);
+  });
+
+  it('algumCanalExigeModeloForaDaJanela: only a known message channel without freeform outside the window counts', () => {
+    // Pela matriz de capabilities, sem nomear provider (invariante 1 da restrição de canal).
+    const semJanela = PROVIDERS_DE_MENSAGEM.filter((p) => CHANNEL_CAPABILITIES[p].freeformOutsideWindow);
+    const comJanela = PROVIDERS_DE_MENSAGEM.filter((p) => !CHANNEL_CAPABILITIES[p].freeformOutsideWindow);
+    expect(semJanela.length).toBeGreaterThan(0);
+    expect(comJanela.length).toBeGreaterThan(0);
+    expect(algumCanalExigeModeloForaDaJanela([])).toBe(false);
+    expect(algumCanalExigeModeloForaDaJanela(semJanela)).toBe(false);
+    for (const p of comJanela) expect(algumCanalExigeModeloForaDaJanela([...semJanela, p])).toBe(true);
+    expect(algumCanalExigeModeloForaDaJanela([...PROVIDERS_SEM_MENSAGEM, 'provider_do_futuro', null])).toBe(false);
   });
 
   it('flags cycle_without_wait for a cycle containing no sufficient wait node', () => {
@@ -735,5 +763,156 @@ describe('validateFlowForPublish — a regra precisa poder decidir', () => {
 
   it('sem a lista de etapas a etapa não é conferida — só quem lê o banco pode dizer se ela existe', () => {
     expect(validateFlowForPublish(comRegras([{ field: 'lead_stage', op: 'eq', value: 'PAGO' }]))).toEqual({ ok: true });
+  });
+});
+
+describe('publish por superfície (roteiro de atendimento, #1130)', () => {
+  function pergunta(id: string, key = id): FlowNode {
+    return {
+      id,
+      type: 'collect',
+      label: id,
+      position: pos,
+      config: { key, label: id, type: 'text', required: true, permite_correcao: true },
+    };
+  }
+  const codigos = (g: FlowGraph, surface?: 'followup' | 'atendimento') => {
+    const r = validateFlowForPublish(g, surface ? { surface } : {});
+    return r.ok ? [] : r.errors.map((e) => e.code);
+  };
+
+  it('roteiro linear início → pergunta → fim publica', () => {
+    const g = graph(
+      [trigger('t'), pergunta('nome'), end('f', 'converted')],
+      [edge('t', 'nome', always()), edge('nome', 'f', always())],
+    );
+    expect(validateFlowForPublish(g, { surface: 'atendimento' })).toEqual({ ok: true });
+  });
+
+  it('roteiro com espera é recusado com a caixa nomeada', () => {
+    const g = graph(
+      [trigger('t'), wait('w', { mode: 'fixed', duration_ms: 3_600_000 }), end('f')],
+      [edge('t', 'w', always()), edge('w', 'f', always())],
+    );
+    expect(codigos(g, 'atendimento')).toContain('no_fora_da_superficie');
+  });
+
+  it('follow-up com pergunta é recusado (o relógio não pergunta)', () => {
+    const g = graph(
+      [trigger('t'), pergunta('nome'), end('f')],
+      [edge('t', 'nome', always()), edge('nome', 'f', always())],
+    );
+    expect(codigos(g)).toContain('no_fora_da_superficie');
+    expect(codigos(g, 'followup')).toContain('no_fora_da_superficie');
+  });
+
+  it('roteiro que ramifica é recusado', () => {
+    const g = graph(
+      [trigger('t'), pergunta('a'), pergunta('b'), end('f')],
+      [edge('t', 'a', always()), edge('t', 'b', always()), edge('a', 'f', always()), edge('b', 'f', always())],
+    );
+    expect(codigos(g, 'atendimento')).toContain('roteiro_ramificado');
+  });
+
+  it('duas perguntas no mesmo campo são recusadas', () => {
+    const g = graph(
+      [trigger('t'), pergunta('a', 'cidade'), pergunta('b', 'cidade'), end('f')],
+      [edge('t', 'a', always()), edge('a', 'b', always()), edge('b', 'f', always())],
+    );
+    expect(codigos(g, 'atendimento')).toContain('campo_repetido');
+  });
+
+  describe('encadeamento em ciclo (revisão do #1573)', () => {
+    const encadeiaPara = (fluxo: string): FlowNode => ({
+      id: 'f',
+      type: 'end',
+      label: 'f',
+      position: pos,
+      config: { outcome: 'converted', ao_finalizar: { tipo: 'proximo_fluxo', fluxo } },
+    });
+    const roteiroQueVaiPara = (fluxo: string) =>
+      graph([trigger('t'), pergunta('a'), encadeiaPara(fluxo)], [edge('t', 'a', always()), edge('a', 'f', always())]);
+    const ctx = (encadeamentos: Array<[string, string[]]>) => ({
+      surface: 'atendimento' as const,
+      roteiro: {
+        pointerId: 'A',
+        encadeamentos: new Map(encadeamentos.map(([id, proximos]) => [id, { nome: `Roteiro ${id}`, proximos }])),
+      },
+    });
+    const erros = (g: FlowGraph, c: ReturnType<typeof ctx>) => {
+      const r = validateFlowForPublish(g, c);
+      return r.ok ? [] : r.errors;
+    };
+
+    it('⭐ A → B → A é recusado no Fim, com a cadeia na mensagem', () => {
+      const e = erros(roteiroQueVaiPara('B'), ctx([['B', ['A']]]));
+      expect(e.map((x) => x.code)).toEqual(['roteiro_em_ciclo']);
+      expect(e[0]!.node_id).toBe('f');
+      expect(e[0]!.message).toContain('este roteiro → Roteiro B → este roteiro');
+    });
+
+    it('A → B → C → A também (ciclo longo)', () => {
+      expect(erros(roteiroQueVaiPara('B'), ctx([['B', ['C']], ['C', ['A']]])).map((x) => x.code)).toEqual([
+        'roteiro_em_ciclo',
+      ]);
+    });
+
+    it('A → A é recusado', () => {
+      expect(erros(roteiroQueVaiPara('A'), ctx([])).map((x) => x.code)).toEqual(['roteiro_em_ciclo']);
+    });
+
+    it('A → B → C (sem volta) passa, e ciclo entre OUTROS (B ↔ C) não trava a busca', () => {
+      expect(erros(roteiroQueVaiPara('B'), ctx([['B', ['C']], ['C', []]]))).toEqual([]);
+      expect(erros(roteiroQueVaiPara('B'), ctx([['B', ['C']], ['C', ['B']]]))).toEqual([]);
+    });
+  });
+});
+
+/**
+ * #2065 — os nós de ação no publish, com o contexto montado como a rota monta:
+ * o banco só devolve as etapas que `idsDeEtapaCitados` pediu. Antes do conserto
+ * essa função só olhava nós de condição, e todo `move_lead` lia como "etapa que
+ * não existe mais" — nenhum fluxo com a caixa conseguia ser publicado.
+ */
+describe('validateFlowForPublish — nós de ação (#2065)', () => {
+  const ATIVA = '6f1d2c3b-4a5e-4f60-8a7b-9c0d1e2f3a4b';
+  const ARQUIVADA = '7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d';
+  const banco = new Map([
+    [ATIVA, { nome: 'Proposta · Vendas', arquivada: false }],
+    [ARQUIVADA, { nome: 'Antiga · Vendas', arquivada: true }],
+  ]);
+  const codigos = (r: ReturnType<typeof validateFlowForPublish>) => (r.ok ? [] : r.errors.map((e) => e.code));
+
+  function comAcao(acao: FlowNode): FlowGraph {
+    return graph([trigger('t1'), acao, end('fim')], [edge('t1', acao.id, always()), edge(acao.id, 'fim', always())]);
+  }
+  const mover = (stage_id: string): FlowNode => ({ id: 'm1', type: 'move_lead', label: 'Mover', position: pos, config: { stage_id } });
+  const marcar = (tags: string[]): FlowNode => ({ id: 'g1', type: 'edit_lead_tag', label: 'Tag', position: pos, config: { tags } });
+
+  /** O que `carregaEtapasCitadas` faz, sem Postgres: consulta só os ids citados. */
+  function publicar(g: FlowGraph) {
+    const etapas = new Map(idsDeEtapaCitados(g.nodes).flatMap((id) => (banco.has(id) ? [[id, banco.get(id)!] as const] : [])));
+    return validateFlowForPublish(g, { etapas });
+  }
+
+  it('mover para etapa ativa publica', () => {
+    expect(publicar(comAcao(mover(ATIVA)))).toEqual({ ok: true });
+  });
+
+  it('mover sem etapa escolhida recusa, mesmo sem nada lido do banco', () => {
+    expect(codigos(validateFlowForPublish(comAcao(mover('  '))))).toEqual(['etapa_destino_ausente']);
+  });
+
+  it('mover para etapa arquivada recusa com o nome da etapa', () => {
+    const r = publicar(comAcao(mover(ARQUIVADA)));
+    expect(codigos(r)).toEqual(['etapa_destino_arquivada']);
+    if (r.ok) return;
+    expect(r.errors[0]!.message).toContain('Antiga · Vendas');
+  });
+
+  it('tag vazia ou em branco recusa; tag escrita publica', () => {
+    expect(codigos(publicar(comAcao(marcar([]))))).toEqual(['tag_ausente']);
+    expect(codigos(publicar(comAcao(marcar(['vip', '  ']))))).toEqual(['tag_ausente']);
+    expect(publicar(comAcao(marcar(['vip'])))).toEqual({ ok: true });
   });
 });

@@ -16,7 +16,7 @@ import { NextRequest } from "next/server";
 import { audit } from "@/lib/audit";
 import { fail } from "@/lib/api/wrappers";
 import { requireRole } from "@/lib/auth/require-role";
-import { loadAuthUser, resolveActiveOrg } from "@/lib/auth/server";
+import { loadAuthUser, orgAtivaSemPortao } from "@/lib/auth/server";
 import type { AuthUser } from "@/lib/auth/types";
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
@@ -24,10 +24,14 @@ import { getWahaClient } from "@/lib/waha/client";
 import { logger } from "@/lib/logger";
 import { decryptWebhookSecret } from "@/lib/webhooks/secrets";
 
-vi.mock("@/lib/auth/require-role", () => ({ requireRole: vi.fn() }));
+// `orgAtivaDaApi` REAL (sobre o `orgAtivaSemPortao` mockado): é ela que decide o 403 da org suspensa.
+vi.mock("@/lib/auth/require-role", async (original) => ({
+  ...(await original<Record<string, unknown>>()),
+  requireRole: vi.fn(),
+}));
 vi.mock("@/lib/auth/server", () => ({
   loadAuthUser: vi.fn(),
-  resolveActiveOrg: vi.fn(),
+  orgAtivaSemPortao: vi.fn(),
   mfaEmDivida: vi.fn(async () => false),
 }));
 vi.mock("@/lib/supabase/server", () => ({ createClient: vi.fn() }));
@@ -227,7 +231,7 @@ function authOk(): void {
     org: { orgId: ORG, name: "Org", role: "admin" },
   });
   vi.mocked(loadAuthUser).mockResolvedValue(user);
-  vi.mocked(resolveActiveOrg).mockResolvedValue({ orgId: ORG, name: "Org", role: "admin" });
+  vi.mocked(orgAtivaSemPortao).mockResolvedValue({ orgId: ORG, name: "Org", role: "admin", org_status: "active" });
 }
 
 /** Transporte do canal pareado por QR, registrando a ordem junto com o banco. */
@@ -637,6 +641,56 @@ describe("#1023 — a conexão removida fecha o próprio aviso", () => {
     expect(audit).toHaveBeenCalledWith(
       expect.objectContaining({
         action: "channel.archived",
+        metadata: expect.objectContaining({ avisos_fechados: "resolvido" }),
+      }),
+    );
+  });
+
+  /**
+   * O ramo que o relato descreve: a conexão foi EXCLUÍDA de vez, não arquivada —
+   * canal sem histórico nem configuração dá `outcome: "delete"` e cai no
+   * `.delete()` da rota. É o único ramo em que a linha de saúde já nem existe
+   * mais (o `on delete cascade` levou junto), então o resquício que pode sobrar
+   * é SÓ o item da Central — e é ele que o fecho tem de alcançar, vindo DEPOIS
+   * da exclusão. Sem esta chamada neste ramo, o teste falha: a exclusão de uma
+   * conexão virgem deixaria o crítico aberto para sempre, que é o sintoma da
+   * issue.
+   */
+  it("⭐ canal EXCLUÍDO de vez com aviso aberto → nenhum aviso daquela conexão sobra", async () => {
+    authOk();
+    const db = makeDb({
+      rows: {
+        agent_inbox_items: [
+          avisoAberto(CANAL, "i1"),
+          avisoAberto("99999999-9999-4999-8999-999999999999", "i2"),
+        ],
+      },
+    });
+    wahaOk(db);
+    const { DELETE } = await import("./route");
+    const res = await DELETE(reqDelete(), ctx());
+    const body = await res.json();
+
+    expect(res.status).toBe(200);
+    // Hard delete de verdade: a linha some, ninguém ganha `archived_at`.
+    expect(body.data.archived).toBe(false);
+    expect(db.linhas("channel_sessions")).toEqual([]);
+    // O fecho roda DEPOIS da exclusão — é o que separa este ramo do arquivamento.
+    expect(db.eventos).toEqual([
+      "waha:logout",
+      "waha:delete",
+      "delete:channel_sessions",
+      "update:agent_inbox_items",
+    ]);
+    expect(
+      db.linhas("agent_inbox_items").filter((l) => l.ref_id === CANAL && l.status === "open"),
+    ).toEqual([]);
+    // O aviso de OUTRA conexão segue aberto: o fecho é por `ref_id`, nunca por org.
+    expect(db.linhas("agent_inbox_items").find((l) => l.id === "i2")?.status).toBe("open");
+    // A auditoria diz o que aconteceu, e não só que a exclusão saiu.
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: "channel.deleted",
         metadata: expect.objectContaining({ avisos_fechados: "resolvido" }),
       }),
     );

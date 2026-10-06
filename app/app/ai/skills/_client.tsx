@@ -8,7 +8,8 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
 import { showApiError } from "@/components/feedback/ApiErrorToast";
-import { PuzzlePiece, UploadSimple, DownloadSimple, Trash, Info } from "@/lib/ui/icons";
+import { PuzzlePiece, UploadSimple, DownloadSimple, Trash, Info, PencilSimple, ArrowsClockwise } from "@/lib/ui/icons";
+import { EditorDeSkill } from "./_components/EditorDeSkill";
 import { usePermission } from "@/hooks/auth/AuthProvider";
 import {
   useSkills,
@@ -46,6 +47,7 @@ export function SkillsClient({ initialState }: Props) {
   const importSkill = useImportSkill();
   const fileInputRef = React.useRef<HTMLInputElement>(null);
   const [pendingName, setPendingName] = React.useState<string | null>(null);
+  const [editando, setEditando] = React.useState<string | null>(null);
 
   function handleInstall(name: string) {
     setPendingName(name);
@@ -66,6 +68,24 @@ export function SkillsClient({ initialState }: Props) {
     uninstall.mutate(name, {
       onSuccess: () => {
         toast.success(`Skill "${name}" ${t("desinstalada.")}`);
+        setPendingName(null);
+      },
+      onError: (err) => {
+        showApiError(err);
+        setPendingName(null);
+      },
+    });
+  }
+
+  // Catalogo publicou versão nova após a cópia da org: adotar re-faz o install
+  // (POST /install), que aponta o ponteiro da org para a versão ATUAL de
+  // plataforma numa cópia NOVA — a versão que a org tinha fica intacta no
+  // histórico, a releitura carrega o texto novo.
+  function handleAdotarVersao(name: string) {
+    setPendingName(name);
+    install.mutate(name, {
+      onSuccess: () => {
+        toast.success(t("Versão nova adotada — a sua cópia agora usa a versão mais recente do catálogo."));
         setPendingName(null);
       },
       onError: (err) => {
@@ -144,8 +164,72 @@ export function SkillsClient({ initialState }: Props) {
                     </span>
                   </div>
                   {skill.description && <p className="text-text-muted">{skill.description}</p>}
+                  {skill.versao_nova_catalogo && (
+                    <div className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-accent bg-accent-soft p-2.5 text-xs">
+                      <span className="flex flex-col gap-1.5 text-text">
+                        <span className="flex items-center gap-1.5">
+                          <Info className="shrink-0" aria-hidden />
+                          {t(
+                            "Há uma versão nova desta skill no catálogo. Se você editou esta cópia, suas alterações ficam só no Histórico de versões: ao adotar, a versão nova do catálogo passa a ser a ativa. Confira antes de adotar.",
+                          )}
+                        </span>
+                        {skill.comparativo && skill.comparativo.mudou_em.length > 0 && (
+                          <span className="flex flex-col gap-1 pl-6">
+                            <span className="font-medium text-text">
+                              {t("Se você adotar a versão do catálogo, muda:")}
+                            </span>
+                            <span className="flex flex-wrap gap-x-3 gap-y-0.5 text-text-muted">
+                              {skill.comparativo.mudou_em.includes("descricao") && (
+                                <span>• {t("Descrição")}</span>
+                              )}
+                              {skill.comparativo.mudou_em.includes("matcher") &&
+                                (skill.comparativo.any_adicionadas.length > 0 ||
+                                  skill.comparativo.any_removidas.length > 0) && (
+                                  <span>
+                                    • {t("Palavras-chave de ativação")}:{" "}
+                                    {skill.comparativo.any_adicionadas.length > 0 && (
+                                      <span className="text-accent">+{skill.comparativo.any_adicionadas.join(", ")}</span>
+                                    )}
+                                    {skill.comparativo.any_adicionadas.length > 0 &&
+                                      skill.comparativo.any_removidas.length > 0 && <span aria-hidden> </span>}
+                                    {skill.comparativo.any_removidas.length > 0 && (
+                                      <span className="text-destructive">−{skill.comparativo.any_removidas.join(", ")}</span>
+                                    )}
+                                  </span>
+                                )}
+                              {skill.comparativo.mudou_em.includes("corpo") && (
+                                <span>
+                                  • {t("Procedimento (corpo)")}: +{skill.comparativo.linhas_adicionadas} −
+                                  {skill.comparativo.linhas_removidas}
+                                </span>
+                              )}
+                            </span>
+                          </span>
+                        )}
+                      </span>
+                      {canManage && (
+                        <Button
+                          size="sm"
+                          disabled={install.isPending && pendingName === skill.name}
+                          onClick={() => handleAdotarVersao(skill.name)}
+                          className="w-full sm:w-auto"
+                        >
+                          <ArrowsClockwise />
+                          {install.isPending && pendingName === skill.name ? t("Adotando…") : t("Adotar versão nova")}
+                        </Button>
+                      )}
+                    </div>
+                  )}
                   {canManage && (
-                    <div className="flex sm:justify-end">
+                    <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setEditando(skill.name)}
+                        className="w-full sm:w-auto"
+                      >
+                        <PencilSimple /> {t("Editar")}
+                      </Button>
                       <Button
                         variant="ghost"
                         size="sm"
@@ -166,7 +250,7 @@ export function SkillsClient({ initialState }: Props) {
             <Info className="mt-0.5 shrink-0" aria-hidden />
             <p>
               {t(
-                "Para personalizar uma skill instalada, basta reenviar um .zip com o mesmo nome — a sua versão passa a valer no lugar da do catálogo. Não há editor dentro do sistema nesta fase.",
+                "Use Editar para ajustar o texto de uma skill instalada — cada salvamento cria uma versão nova e a anterior fica no histórico. Também dá para reenviar um .zip com o mesmo nome; a sua versão passa a valer no lugar da do catálogo.",
               )}
             </p>
           </div>
@@ -216,6 +300,16 @@ export function SkillsClient({ initialState }: Props) {
           )}
         </CardContent>
       </Card>
+
+      {editando !== null && (
+        <EditorDeSkill
+          nome={editando}
+          aberto
+          aoMudarAberto={(aberto) => {
+            if (!aberto) setEditando(null);
+          }}
+        />
+      )}
     </div>
   );
 }

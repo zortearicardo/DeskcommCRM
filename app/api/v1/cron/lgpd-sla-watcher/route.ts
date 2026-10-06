@@ -19,13 +19,13 @@ import { randomUUID } from "node:crypto";
 import type { NextRequest } from "next/server";
 
 import { ok, fail } from "@/lib/api/wrappers";
-import { env } from "@/lib/env";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { audit } from "@/lib/audit";
 import { triggerSlaAlarm } from "@/lib/lgpd/sla-alarm";
 import { marcaDaSaida, type MarcaDeSaida } from "@/lib/branding/saida";
 import type { LgpdRequest } from "@/lib/lgpd/types";
 import type { AlarmThreshold } from "@/lib/lgpd/sla-alarm";
+import { autorizaCron } from "@/lib/auth/cron-auth";
 
 export const dynamic = "force-dynamic";
 
@@ -35,6 +35,8 @@ const SCAN_LIMIT = 500;
 interface OrgRow {
   dpo_email: string | null;
   display_name: string | null;
+  /** O país decide o texto do alarme (doc 88) — lido nesta mesma consulta. */
+  country: string | null;
 }
 
 type RequestWithOrg = LgpdRequest & OrgRow;
@@ -46,16 +48,7 @@ export async function GET(req: NextRequest): Promise<Response> {
   // ────────────────────────────────────────────────────────────────────────
   // Auth — Bearer INTERNAL_CRON_SECRET or INTERNAL_SECRET (fail-closed)
   // ────────────────────────────────────────────────────────────────────────
-  const auth = req.headers.get("authorization") ?? "";
-  const provided = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : "";
-
-  const cronSecret = env.INTERNAL_CRON_SECRET;
-  const fallbackSecret = env.INTERNAL_SECRET;
-  const accepted: string[] = [];
-  if (cronSecret) accepted.push(cronSecret);
-  if (fallbackSecret) accepted.push(fallbackSecret);
-
-  if (accepted.length === 0 || !provided || !accepted.includes(provided)) {
+  if (!autorizaCron(req)) {
     return fail("forbidden", "Cron secret missing or invalid.", 403, { requestId });
   }
 
@@ -73,7 +66,8 @@ export async function GET(req: NextRequest): Promise<Response> {
       *,
       organizations!inner(
         dpo_email,
-        display_name
+        display_name,
+        country
       )
     `,
     )
@@ -157,6 +151,7 @@ export async function GET(req: NextRequest): Promise<Response> {
         organizationDpoEmail: dpoEmail,
         organizationName: orgName,
         marca: await marcaDe(row.organization_id),
+        country: orgData?.country ?? null,
       });
 
       if (result.reason === "dedup_24h") {

@@ -31,6 +31,14 @@ Edite o `.env` e preencha (mínimo):
 
 - **Supabase** (Settings → API do seu projeto): `NEXT_PUBLIC_SUPABASE_URL`,
   `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`
+  > Opcional: `SUPABASE_SERVER_URL`. Só quando o seu Supabase roda **na mesma
+  > rede** do app (Kong, self-host) — preencha com o endereço interno
+  > (ex.: `http://kong:8000`) e as requisições do **servidor** passam a usar
+  > esse caminho curto, que não precisa sair para a internet. O endereço interno
+  > não substitui a pública: o navegador continua falando com ela (Auth, Realtime
+  > e Storage), e é dela que saem os links que o app entrega — mídia, avatar,
+  > PDF da LGPD e o redirect do login com Google. Vazia, tudo funciona como
+  > antes.
 - **Banco direto** (Settings → Database → connection string): `SUPABASE_DB_URL`
   > É a conexão do **app**. Quem mexe no **schema** — `create extension`, o
   > `baseline.sql`, a promoção do dono, o `pg_dump` do backup — pode ser outra:
@@ -94,7 +102,26 @@ grant usage on schema public to agent_worker;
 grant select, insert, update, delete on all tables in schema public to agent_worker;
 grant usage, select on all sequences in schema public to agent_worker;
 grant execute on all functions in schema public to agent_worker;
+
+-- Funções e tabelas criadas por migration FUTURA nascem sem os grants acima;
+-- só os objetos que já existem no momento deste bloco os recebem. O
+-- `update.sh` re-aplica o `baseline.sql`, que re-emite default privileges só
+-- para postgres/anon/authenticated/service_role — agent_worker fica de fora.
+-- Espelhe a mesma convenção (`FOR ROLE "postgres"`) para que todo objeto que
+-- o dono criar a partir daqui já nasça alcançável pelo worker:
+alter default privileges for role "postgres" in schema public grant execute on functions to agent_worker;
+alter default privileges for role "postgres" in schema public grant usage, select on sequences to agent_worker;
+alter default privileges for role "postgres" in schema public grant select, insert, update, delete on tables to agent_worker;
+
+-- A auditoria é só-inclusão para todo papel: o worker grava e lê
+-- `api_audit_log`, nunca altera nem apaga. O `baseline.sql` reafirma isto a
+-- cada `update.sh` (migration 0525), com o nome que o papel tiver.
+revoke update, delete, truncate on table public.api_audit_log from agent_worker;
 ```
+Se o papel do **dono** na sua instalação não for `postgres` (ex.: você usa um
+superusuário com outro nome), troque `for role "postgres"` pelo nome dele nas
+linhas `alter default privileges` — é quem o `baseline.sql` roda como, e é esse
+papel que o default ACL segue.
 
 Aponte `SUPABASE_DB_URL` do `.env` para ela — e deixe a conexão do **dono** em
 `SUPABASE_DB_ADMIN_URL`. Antes isto era uma recomendação sem encaixe: o
@@ -114,9 +141,9 @@ grep -nE '(psql|pg_dump) "' hostgator-setup-kit/*.sh
 
 Duas consequências que valem saber antes de escolher onde declarar:
 
-- O `docker-compose.prod.yml` entrega o `.env` inteiro ao `app` e ao `worker`
-  (`env_file: .env`). Declarar `SUPABASE_DB_ADMIN_URL` ali a expõe aos
-  contêineres. Para não expor, passe-a só no comando:
+- O `docker-compose.prod.yml` entrega o `.env` inteiro ao `app`, ao `worker`
+  e, com telefonia, ao `voice-agent` (`env_file: .env`), e todo serviço que
+  recebe o `.env` a neutraliza no `environment:` — declará-la ali não a expõe. Para não deixá-la no arquivo, passe-a só no comando:
   `SUPABASE_DB_ADMIN_URL='...' bash hostgator-setup-kit/install.sh`.
 - Em compensação, o `update.sh` roda **sozinho** (cron do `agent.sh`) e é ele
   que entrega migration nova ao clone. Sem a chave no `.env`, cada atualização
@@ -163,7 +190,13 @@ sem quebrar nada.
 **O caminho manual:** no Dashboard →
 
 1. **Authentication → Sign In / Up**: habilite *Allow new users to sign up* e
-   mantenha *Confirm email* ligado.
+   mantenha *Confirm email* ligado. **Exceção:** com a instalação em
+   "Cadastro apenas por convite" (`/admin/cadastro`), **desligue** *Allow new
+   users to sign up*. Ligado, qualquer um cria conta direto no Supabase com a
+   chave pública que vai ao navegador, passando por fora do CRM (#1653). O
+   convite continua funcionando: com o cadastro público fechado, o app cria a
+   conta do convidado pela admin API, no servidor. Voltou para "aberto" ou
+   "com aprovação"? Ligue de novo, senão o cadastro pela tela falha.
 2. **Authentication → URL Configuration**: `Site URL = https://SEU_DOMINIO` e
    adicione `https://SEU_DOMINIO/auth/confirm` em *Redirect URLs*.
 3. **Authentication → Email Templates**: troque o link dos templates
@@ -185,6 +218,12 @@ sem quebrar nada.
    projeto Supabase de produção estava com ela gravada: quem seguiu a receita
    reproduziu o defeito.
 
+   O link abre a tela **Confirmar acesso**, com o botão **Continuar**, e é de
+   propósito: o token é de uso único, e verificadores de link (Safe Links do
+   Hotmail/Outlook, gateways de e-mail corporativos) abrem cada link na entrega.
+   Quando abrir o link já gastava o token, essas pessoas recebiam "link inválido
+   ou expirado" no próprio clique. Quem gasta o token agora é o botão.
+
 4. **SMTP próprio** (Authentication → SMTP): o sender embutido do Supabase tem
    limite baixo (~2 e-mails/h) — configure Resend/SES/etc. para produção.
    Isto é sobre VOLUME de envio: editar o corpo do e-mail **não** exige SMTP
@@ -193,7 +232,12 @@ sem quebrar nada.
    `smtp_host: null`).
 
 **GoTrue self-hosted:** equivalente por env:
-`GOTRUE_DISABLE_SIGNUP=false`, `GOTRUE_MAILER_AUTOCONFIRM=false`,
+`GOTRUE_DISABLE_SIGNUP=false` (`true` em "só convite", pela mesma razão do
+passo 1; no Supabase self-hosted oficial a chave do `.env` é `DISABLE_SIGNUP`.
+No kit de servidor único, o `update.sh` grava essa chave sozinho a partir do
+modo da instalação. A troca feita em `/admin/cadastro` só chega ao Supabase na
+próxima atualização, nos dois sentidos),
+`GOTRUE_MAILER_AUTOCONFIRM=false`,
 `GOTRUE_SITE_URL=https://SEU_DOMINIO`,
 `GOTRUE_URI_ALLOW_LIST=https://SEU_DOMINIO/auth/confirm`,
 `GOTRUE_SMTP_{HOST,PORT,USER,PASS}` e

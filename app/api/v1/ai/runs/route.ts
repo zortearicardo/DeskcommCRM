@@ -13,6 +13,15 @@ import type { NextRequest } from "next/server";
 
 import { fail, ok } from "@/lib/api/wrappers";
 import { requireRole } from "@/lib/auth/require-role";
+import { PROVEDOR_DO_JEV } from "@/lib/ai/decisao/credencial";
+import { CONFERENCIA_DE_CAMPO, PEDIDOS_DO_CLIENTE, rotuloDaChamadaDoJev } from "@/lib/ai/decisao/tarefas";
+import {
+  JEV_FALHOU_AO_LADO,
+  JEV_FALHOU_E_A_IA_COBRIU,
+  JEV_FALHOU_SEM_RESERVA,
+  O_QUE_FAZER_DO_JEV,
+} from "@/lib/ai/decisao/textos";
+import { rotuloDoProvedor } from "@/lib/ai/pontos/provedores";
 import { PONTO_POR_ID } from "@/lib/ai/pontos/registro";
 import { EXPLICACAO_DA_ORIGEM, type OrigemDaEscolha } from "@/lib/ai/pontos/resolver";
 import { createClient } from "@/lib/supabase/server";
@@ -51,6 +60,8 @@ const O_QUE_FAZER: Record<string, string> = {
     "A chamada foi recusada porque este ponto usa um endereço próprio e a empresa não tem chave cadastrada para ele — a chave da instalação não vai para endereço escolhido pela empresa. Cadastre a chave da empresa em Agente de IA › Provedores, ou tire o endereço próprio do ponto.",
   erro_desconhecido:
     "Não conseguimos classificar esta falha. A mensagem original do provedor está abaixo.",
+  // As falhas do Jev (`jev_*`), escritas junto do cliente dele.
+  ...O_QUE_FAZER_DO_JEV,
 };
 
 interface LinhaDeExecucao {
@@ -73,6 +84,9 @@ interface LinhaDeExecucao {
 const filtrosDaQuery = z.object({
   purpose: z.string().min(1).max(64).optional(),
   status: z.enum(["ok", "erro"]).optional(),
+  // O cabeçalho desta rota prometia o filtro por provedor desde o primeiro dia,
+  // e ele não existia: `?provider=` era descartado e a lista vinha inteira.
+  provider: z.string().min(1).max(64).optional(),
   limit: z.coerce.number().int().min(1).max(200).default(100),
 });
 
@@ -90,7 +104,7 @@ export async function GET(req: NextRequest): Promise<Response> {
   if (!filtros.success) {
     return fail("invalid_query", t("filtros inválidos"), 422, { details: filtros.error.issues });
   }
-  const { purpose, status, limit: limite } = filtros.data;
+  const { purpose, status, provider, limit: limite } = filtros.data;
 
   const db = await createClient();
   let q = db
@@ -104,24 +118,66 @@ export async function GET(req: NextRequest): Promise<Response> {
 
   if (purpose) q = q.eq("purpose", purpose);
   if (status) q = q.eq("status", status);
+  // "Só o Jev" inclui as linhas da reserva que o cobriu: são as que o cartão
+  // conta em "Vezes que a IA de sempre cobriu o Jev", e o link do cartão traz
+  // para cá. Filtrar só pelo provedor escondia justamente elas.
+  if (provider === PROVEDOR_DO_JEV) {
+    q = q.or(`provider.eq.${PROVEDOR_DO_JEV},origem_da_escolha.eq.reserva_do_jev`);
+  } else if (provider) {
+    q = q.eq("provider", provider);
+  }
 
   const { data, error } = await q;
   if (error) return fail("query_failed", error.message, 500);
 
   const execucoes = ((data ?? []) as LinhaDeExecucao[]).map((l) => {
     const ponto = PONTO_POR_ID.get(l.purpose);
+    // As chamadas do Jev sem ponto (os pedidos, a conferência de campo) têm o porquê delas.
+    const chamadaSemPonto = [PEDIDOS_DO_CLIENTE, CONFERENCIA_DE_CAMPO].find((c) => c.purpose === l.purpose);
     return {
       ...l,
       // O nome de gente do ponto. Sem isto a tela mostraria `flywheel_judge`, e
-      // o operador não tem por que saber o que é isso.
-      pontoRotulo: ponto?.rotulo ?? l.purpose,
+      // o operador não tem por que saber o que é isso. A chamada do Jev que não
+      // é de ponto nenhum (os pedidos do cliente) tem o nome dela.
+      pontoRotulo: ponto?.rotulo ?? rotuloDaChamadaDoJev(l.purpose) ?? l.purpose,
+      // "typesafe" na coluna, "Jev (TypeSafe AI)" na tela.
+      provedorRotulo: rotuloDoProvedor(l.provider) ?? l.provider,
       // A consequência daquele ponto falhar, que é o que liga uma linha de log
-      // a algo que a pessoa já viu acontecer no negócio dela.
-      consequencia: l.status === "erro" ? (ponto?.sintomaDeFalha ?? null) : null,
+      // a algo que a pessoa já viu acontecer no negócio dela. Só em `erro`, e
+      // só quando alguém ficou sem decisão. Não ficou em dois casos:
+      //  - `jev_cobriu`: a IA de sempre caiu em observação, mas a nota do Jev
+      //    já estava na mão e decidiu;
+      //  - `jev_observacao`: o Jev falhou numa tarefa do turno (a manipulação,
+      //    o roteador, a resposta ao follow-up) — o turno seguiu como sem ele;
+      //  - `reserva_do_jev` numa linha de erro: o roteador decidindo, e a IA de
+      //    sempre escolheu o agente no lugar do Jev.
+      // A falha do Jev com origem `jev` é a do clima sem reserva: aí é real.
+      consequencia:
+        l.status === "erro" &&
+        l.origem_da_escolha !== "jev_cobriu" &&
+        l.origem_da_escolha !== "jev_observacao" &&
+        l.origem_da_escolha !== "reserva_do_jev"
+          ? (ponto?.sintomaDeFalha ?? null)
+          : null,
       oQueFazer: l.status === "erro" ? (O_QUE_FAZER[l.error_code ?? ""] ?? null) : null,
-      porQueEsteModelo: l.origem_da_escolha
-        ? (EXPLICACAO_DA_ORIGEM[l.origem_da_escolha as OrigemDaEscolha] ?? null)
-        : null,
+      // Nas linhas de falha do Jev, a frase da origem ("O Jev decidiu.", "O Jev
+      // observou…") seria falsa — ele não respondeu. As chamadas sem ponto têm as
+      // delas: nos pedidos ele não decide nem compara, e sem ele vale a regra; na
+      // conferência de campo, sem ele o campo é gravado como antes.
+      porQueEsteModelo:
+        chamadaSemPonto !== undefined
+          ? l.status === "erro"
+            ? chamadaSemPonto.porQueNaFalha
+            : chamadaSemPonto.porQue
+          : l.status === "erro" && l.origem_da_escolha === "jev"
+          ? JEV_FALHOU_SEM_RESERVA
+          : l.status === "erro" && l.origem_da_escolha === "jev_observacao"
+            ? JEV_FALHOU_AO_LADO
+            : l.status === "erro" && l.origem_da_escolha === "reserva_do_jev"
+              ? JEV_FALHOU_E_A_IA_COBRIU
+            : l.origem_da_escolha
+              ? (EXPLICACAO_DA_ORIGEM[l.origem_da_escolha as OrigemDaEscolha] ?? null)
+              : null,
     };
   });
 

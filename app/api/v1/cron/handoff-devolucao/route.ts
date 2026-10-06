@@ -37,7 +37,6 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 
 import { ok, fail } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
-import { env } from "@/lib/env";
 import {
   lerPrazoDeDevolucaoMinutos,
   selecionarVencidas,
@@ -46,6 +45,7 @@ import {
 import { devolverAtendimentoAoAgente } from "@/lib/escalacao/retomada";
 import { logger } from "@/lib/logger";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { autorizaCron } from "@/lib/auth/cron-auth";
 
 export const dynamic = "force-dynamic";
 
@@ -145,6 +145,9 @@ export async function devolverHandoffsVencidos(
     )
     .in("organization_id", orgIds)
     .in("status", ["open", "pending", "claimed", "ai_handling"])
+    // Grupo de WhatsApp é sempre de humano: o automático nunca o atende, então
+    // "devolver ao agente" tiraria o grupo da fila humana sem ninguém responder.
+    .eq("is_group", false)
     .or("bot_silenced_until.eq.infinity,assignee_kind.eq.user,assigned_to_user_id.not.is.null")
     .limit(SCAN_LIMIT);
   if (error) throw new Error(`conversations: ${error.message}`);
@@ -197,10 +200,7 @@ export async function devolverHandoffsVencidos(
 async function handle(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
 
-  const auth = req.headers.get("authorization") ?? "";
-  const provided = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : "";
-  const accepted = [env.INTERNAL_CRON_SECRET, env.INTERNAL_SECRET].filter(Boolean);
-  if (accepted.length === 0 || !provided || !accepted.includes(provided)) {
+  if (!autorizaCron(req)) {
     return fail("forbidden", "Cron secret missing or invalid.", 403, { requestId });
   }
 

@@ -7,6 +7,8 @@ import { loadActiveRouter } from "@/lib/agent-engine/agent/router-config";
 import { classifyIntent } from "@/lib/agent-engine/agent/intent-classifier";
 import { fail } from "@/lib/api/wrappers";
 import type { AuthUser } from "@/lib/auth/types";
+import type { EstadoDaTarefa } from "@/lib/ai/decisao/config";
+import { consultarJevNoRoteador, registrarRoteadorDoJev, type EscolhaDoJev } from "@/lib/ai/decisao/roteador";
 
 /**
  * Task 6 (Fase 3 — Intent Router) — POST /api/v1/ai/routers/:id/test:
@@ -16,12 +18,24 @@ import type { AuthUser } from "@/lib/auth/types";
  *    ai_router_decisions (telemetria de decisão real, não de teste).
  */
 
+import type * as Credenciais from "@/lib/agent-engine/edge/llm/credentials";
+
 vi.mock("@/lib/auth/require-role", () => ({ requireRole: vi.fn() }));
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn() }));
 vi.mock("@/lib/ai/skills/db", () => ({ getSkillsPool: vi.fn(() => ({})) }));
 vi.mock("@/lib/agent-engine/agent/router-config", () => ({ loadActiveRouter: vi.fn() }));
 vi.mock("@/lib/agent-engine/agent/intent-classifier", () => ({ classifyIntent: vi.fn() }));
 vi.mock("@/lib/env", () => ({ env: { ANTHROPIC_API_KEY: "test-key" } }));
+// A pergunta "a empresa tem a IA de sempre?" (decisão B, doc 89). Padrão: tem.
+const { temIaDeSempre } = vi.hoisted(() => ({ temIaDeSempre: vi.fn(async () => true) }));
+vi.mock("@/lib/agent-engine/edge/llm/credentials", async (original) => ({
+  ...(await original<typeof Credenciais>()),
+  temIaDeSempre,
+}));
+vi.mock("@/lib/ai/decisao/roteador", () => ({
+  consultarJevNoRoteador: vi.fn(),
+  registrarRoteadorDoJev: vi.fn(async () => undefined),
+}));
 
 const ORG_ID = "22222222-2222-4222-8222-222222222222";
 const USER_ID = "11111111-1111-4111-8111-111111111111";
@@ -46,7 +60,7 @@ function mockAuthzOk() {
   });
 }
 
-function makeAdminStub(opts: { routerFound: boolean; agentName?: string | null }) {
+function makeAdminStub(opts: { routerFound: boolean; agentName?: string | null; nomes?: Record<string, string> }) {
   return {
     from(table: string) {
       if (table === "ai_routers") {
@@ -66,16 +80,23 @@ function makeAdminStub(opts: { routerFound: boolean; agentName?: string | null }
         };
       }
       if (table === "ai_agents") {
+        let id: unknown = null;
         return {
           select() {
             return this;
           },
-          eq() {
+          eq(col: string, v: unknown) {
+            if (col === "id") id = v;
             return this;
           },
           maybeSingle() {
+            const nome = opts.nomes?.[String(id)];
             return Promise.resolve({
-              data: opts.agentName !== undefined ? { name: opts.agentName } : { name: "Agente Vendas" },
+              data: nome
+                ? { name: nome }
+                : opts.agentName !== undefined
+                  ? { name: opts.agentName }
+                  : { name: "Agente Vendas" },
               error: null,
             });
           },
@@ -97,8 +118,31 @@ function ctx() {
   return { params: Promise.resolve({ id: ROUTER_ID }) };
 }
 
+/** O Jev no clique de teste: o estado da tarefa e a escolha dele. */
+function jevCom(estado: EstadoDaTarefa, escolha: EscolhaDoJev | null, modo: "comparacao" | "sob_demanda" = "comparacao") {
+  vi.mocked(consultarJevNoRoteador).mockReturnValue({
+    modo: Promise.resolve(modo),
+    estado: Promise.resolve(estado),
+    escolha: Promise.resolve(escolha),
+    observar: vi.fn(),
+  });
+}
+
+function escolhaDoJev(intentName: string | null, confidence: number, estado: "observando" | "decidindo"): EscolhaDoJev {
+  return {
+    estado,
+    veredito: { intentName, confidence },
+    confianca: 0.9,
+    modelo: "jev-1.13.0",
+    tokensDeEntrada: 400,
+    tokensDeSaida: 3,
+    latenciaMs: 300,
+  };
+}
+
 beforeEach(() => {
   vi.clearAllMocks();
+  jevCom("desligada", null);
 });
 
 describe("POST /api/v1/ai/routers/:id/test", () => {
@@ -137,11 +181,15 @@ describe("POST /api/v1/ai/routers/:id/test", () => {
       data: { intent_name: string | null; confidence: number; agent_id: string | null; agent_name: string | null };
     };
     expect(body.data).toEqual({
+      ia_consultada: true,
+      modo_roteador: "comparacao",
       intent_name: "vendas",
       confidence: 0.92,
       min_confidence: 0.6,
       agent_id: AGENT_ID,
       agent_name: "Agente Vendas",
+      // Jev desligado: a tela não mostra o lado dele.
+      jev: null,
     });
 
     // classifyIntent chamado com leadId/jobId null (nunca um uuid inventado —
@@ -214,11 +262,14 @@ describe("POST /api/v1/ai/routers/:id/test", () => {
     // membro "vendas" — confidence 0.4 < min_confidence 0.6 cai no fallback,
     // igual à produção (resolve-turn-agent.ts:193).
     expect(body.data).toEqual({
+      ia_consultada: true,
+      modo_roteador: "comparacao",
       intent_name: "vendas",
       confidence: 0.4,
       min_confidence: 0.6,
       agent_id: AGENT_ID,
       agent_name: "Agente Fallback",
+      jev: null,
     });
   });
 
@@ -241,6 +292,172 @@ describe("POST /api/v1/ai/routers/:id/test", () => {
     const res = await POST(req({ message: "oi" }), ctx());
     expect(res.status).toBe(404);
     expect(loadActiveRouter).not.toHaveBeenCalled();
+  });
+
+  describe("o Jev lado a lado (onda 2 do Jev, bloco 2.2)", () => {
+    const SUPORTE = "88888888-8888-4888-8888-888888888888";
+    const FALLBACK = "99999999-9999-4999-8999-999999999999";
+
+    function roteadorComDoisMembros() {
+      mockAuthzOk();
+      vi.mocked(createAdminClient).mockReturnValue(
+        makeAdminStub({
+          routerFound: true,
+          nomes: { [AGENT_ID]: "Agente Vendas", [SUPORTE]: "Agente Suporte", [FALLBACK]: "Agente Reserva" },
+        }) as never,
+      );
+      vi.mocked(loadActiveRouter).mockResolvedValue({
+        id: ROUTER_ID,
+        name: "Roteador",
+        classifierModel: null,
+        classifierProvider: null,
+        sticky: true,
+        minConfidence: 0.6,
+        fallbackAgentId: FALLBACK,
+        members: [
+          { agentId: AGENT_ID, intentName: "vendas", intentDescription: "Quer comprar", examples: [] },
+          { agentId: SUPORTE, intentName: "suporte", intentDescription: "Tem um problema", examples: [] },
+        ],
+      });
+    }
+
+    async function testar(mensagem = "meu pedido não chegou") {
+      const { POST } = await import("./route");
+      const res = await POST(req({ message: mensagem }), ctx());
+      expect(res.status).toBe(200);
+      return ((await res.json()) as { data: Record<string, unknown> & { jev: Record<string, unknown> | null } })
+        .data;
+    }
+
+    it("observando: as duas escolhas, com o AGENTE de cada uma — e a da sua IA é a que valeria", async () => {
+      roteadorComDoisMembros();
+      vi.mocked(classifyIntent).mockResolvedValue({ intentName: "vendas", confidence: 0.8 });
+      jevCom("observando", escolhaDoJev("suporte", 0.91, "observando"));
+
+      const d = await testar();
+      expect(d.agent_name).toBe("Agente Vendas");
+      expect(d.jev).toEqual({
+        estado: "observando",
+        respondeu: true,
+        intent_name: "suporte",
+        confidence: 0.91,
+        agent_id: SUPORTE,
+        agent_name: "Agente Suporte",
+        decide: false,
+      });
+      // A frase do teste, sozinha, sem cliente nem job por trás.
+      expect(vi.mocked(consultarJevNoRoteador).mock.calls[0]![1]).toMatchObject({
+        mensagem: "meu pedido não chegou",
+        contactId: null,
+        jobId: null,
+      });
+    });
+
+    it("não vira observação (R5), mas o custo do Jev entra em Execuções (R8)", async () => {
+      roteadorComDoisMembros();
+      vi.mocked(classifyIntent).mockResolvedValue({ intentName: "vendas", confidence: 0.8 });
+      const escolha = escolhaDoJev("suporte", 0.91, "observando");
+      jevCom("observando", escolha);
+
+      await testar();
+      expect(registrarRoteadorDoJev).toHaveBeenCalledOnce();
+      expect(vi.mocked(registrarRoteadorDoJev).mock.calls[0]![1]).toMatchObject({
+        jev: escolha,
+        observacao: null,
+        decidiu: false,
+        contactId: null,
+        jobId: null,
+      });
+    });
+
+    it("decidindo, com a sua IA respondendo: em produção vale a escolha do Jev", async () => {
+      roteadorComDoisMembros();
+      vi.mocked(classifyIntent).mockResolvedValue({ intentName: "vendas", confidence: 0.8 });
+      jevCom("decidindo", escolhaDoJev("suporte", 0.91, "decidindo"));
+
+      const d = await testar();
+      expect(d.jev).toMatchObject({ estado: "decidindo", agent_id: SUPORTE, decide: true });
+    });
+
+    it("sob demanda: Jev confiável decide sem chamar nem cobrar a IA de sempre", async () => {
+      roteadorComDoisMembros();
+      jevCom("decidindo", escolhaDoJev("suporte", 0.91, "decidindo"), "sob_demanda");
+      const d = await testar();
+      expect(classifyIntent).not.toHaveBeenCalled();
+      expect(d).toMatchObject({ ia_consultada: false, modo_roteador: "sob_demanda", confidence: null });
+      expect(d.jev).toMatchObject({ agent_id: SUPORTE, decide: true });
+    });
+
+    it.each([null, escolhaDoJev("suporte", 0.4, "decidindo"), escolhaDoJev("inventada", 0.99, "decidindo"), escolhaDoJev(null, 0.99, "decidindo")])(
+      "sob demanda: ausência ou intenção não confiável chama a reserva uma vez (%j)", async (escolha) => {
+        roteadorComDoisMembros();
+        jevCom("decidindo", escolha, "sob_demanda");
+        vi.mocked(classifyIntent).mockResolvedValue({ intentName: "vendas", confidence: 0.8 });
+        const d = await testar();
+        expect(classifyIntent).toHaveBeenCalledOnce();
+        expect(d).toMatchObject({ ia_consultada: true, agent_id: AGENT_ID });
+        expect(d.jev).toMatchObject({ decide: false });
+      },
+    );
+
+    it("sob demanda numa empresa sem a IA de sempre (decisão B): a prévia compara, e sem ela o Jev não decide", async () => {
+      roteadorComDoisMembros();
+      temIaDeSempre.mockResolvedValueOnce(false);
+      vi.mocked(classifyIntent).mockResolvedValue(null as never);
+      jevCom("decidindo", escolhaDoJev("suporte", 0.99, "decidindo"), "sob_demanda");
+      const d = await testar();
+      expect(classifyIntent).toHaveBeenCalledOnce();
+      expect(d).toMatchObject({ ia_consultada: true });
+      expect(d.jev).toMatchObject({ decide: false });
+    });
+
+    it("decidindo, sem a sua IA (R2): vale a regra de sempre, nunca só o Jev", async () => {
+      roteadorComDoisMembros();
+      vi.mocked(classifyIntent).mockResolvedValue(null as never);
+      jevCom("decidindo", escolhaDoJev("suporte", 0.99, "decidindo"));
+
+      const d = await testar();
+      expect(d.agent_id, "sem a IA de sempre, o de reserva").toBe(FALLBACK);
+      expect(d.jev).toMatchObject({ agent_id: SUPORTE, decide: false });
+    });
+
+    it("decidindo, e a sua IA devolve algo que não é resposta: ela 'não respondeu', e o Jev não decide sozinho (R2)", async () => {
+      roteadorComDoisMembros();
+      vi.mocked(classifyIntent).mockResolvedValue({ intentName: null, confidence: 0, falhou: true });
+      jevCom("decidindo", escolhaDoJev("suporte", 0.99, "decidindo"));
+
+      const d = await testar();
+      expect(d.confidence, "a tela lê null como 'não respondeu'").toBeNull();
+      expect(d.agent_id, "o lixo segue 'nenhuma': o de reserva").toBe(FALLBACK);
+      expect(d.jev).toMatchObject({ agent_id: SUPORTE, decide: false });
+    });
+
+    it("a probabilidade do Jev abaixo do mínimo leva ao de reserva — a mesma régua da sua IA", async () => {
+      roteadorComDoisMembros();
+      vi.mocked(classifyIntent).mockResolvedValue({ intentName: "vendas", confidence: 0.8 });
+      jevCom("observando", escolhaDoJev("suporte", 0.4, "observando"));
+
+      const d = await testar();
+      expect(d.jev).toMatchObject({ intent_name: "suporte", confidence: 0.4, agent_id: FALLBACK, agent_name: "Agente Reserva" });
+    });
+
+    it("ligado e sem resposta: a tela diz que ele não respondeu, e nada é gravado", async () => {
+      roteadorComDoisMembros();
+      vi.mocked(classifyIntent).mockResolvedValue({ intentName: "vendas", confidence: 0.8 });
+      jevCom("observando", null);
+
+      const d = await testar();
+      expect(d.jev).toEqual({
+        estado: "observando",
+        respondeu: false,
+        intent_name: null,
+        confidence: null,
+        agent_id: null,
+        agent_name: null,
+        decide: false,
+      });
+      expect(registrarRoteadorDoJev).not.toHaveBeenCalled();
+    });
   });
 
   it("body inválido (message vazio) → 422 validation_failed", async () => {

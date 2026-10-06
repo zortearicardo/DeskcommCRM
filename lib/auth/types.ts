@@ -1,5 +1,7 @@
 import type { InterfaceSettings } from "@/lib/navigation/interface";
 import type { Idioma } from "@/lib/i18n/idiomas";
+import type { ModuloOpcional } from "@/lib/instalacao/modulos";
+import type { CapacidadeDaOrganizacao } from "@/lib/organizacao/capacidades";
 
 /**
  * Papéis dentro do tenant.
@@ -44,6 +46,25 @@ export function roleAtLeast(role: string | null | undefined, min: Role): boolean
   return rank >= ROLE_RANK[min];
 }
 
+/**
+ * O platform admin pode ESCREVER pulando o papel do tenant?
+ *
+ * `is_platform_admin` sozinho responde "tem a linha em platform_admins" — e o
+ * `support_readonly` também tem. Todo atalho do tipo
+ * `!user.is_platform_admin && ROLE_RANK[...] < ROLE_RANK.admin` deixava o
+ * `support_readonly` que é membro comum de uma empresa escrever nela como se
+ * administrasse. Só `scope === "full"` escreve; ausente = sem escrita.
+ *
+ * Mora aqui, e não em `requirePlatformAdmin.ts`, porque é puro: as server actions
+ * que o usam já importam `ROLE_RANK` daqui e não ganham dependência de servidor.
+ * MFA não entra: quem chama já confere `mfaEmDivida` como fazia antes.
+ */
+export function escreveComoPlatformAdmin(
+  user: Pick<AuthUser, "is_platform_admin" | "platform_admin_scope">,
+): boolean {
+  return user.is_platform_admin && user.platform_admin_scope === "full";
+}
+
 /** Papéis que uma PESSOA pode ter. Espelha `user_organizations_role_check`. */
 export const PAPEIS_HUMANOS: ReadonlyArray<Role> = ["viewer", "agent", "manager", "admin"];
 
@@ -86,6 +107,23 @@ export interface UserOrgMembership {
    * então quem usa passa por `fusoValido` e cai em `FUSO_PADRAO`.
    */
   timezone?: string | null;
+  /**
+   * Moeda e país da organização (`organizations.currency` / `.country`).
+   *
+   * Mesma carona de `locale` e `timezone`, e pelo mesmo motivo: são as telas do
+   * negócio e do contato que precisam deles — o rótulo do valor e o documento
+   * do titular —, e sem esta carona cada diálogo cravaria `R$` e `CPF`, que foi
+   * exatamente o defeito. `country` nulo significa Brasil (`PAIS_PADRAO`).
+   */
+  currency?: string | null;
+  country?: string | null;
+  /**
+   * `organizations.status` da empresa. Quem decide se ela opera é `ehOperante`
+   * (`lib/organizacao/operante.ts`); ausente ou nulo = NÃO operante.
+   */
+  org_status?: string | null;
+  /** `organizations.suspended_kind` — só significa algo com status 'suspended'. */
+  suspended_kind?: string | null;
 }
 
 export interface AuthUser {
@@ -95,6 +133,11 @@ export interface AuthUser {
   full_name: string | null;
   avatar_url: string | null;
   is_platform_admin: boolean;
+  /**
+   * `platform_admins.scope` (`full` | `support_readonly`), nulo para quem não é
+   * platform admin. Escrita de platform admin exige `=== "full"`; ausente = sem escrita.
+   */
+  platform_admin_scope?: string | null;
   /**
    * Idioma da interface, de `user_metadata.locale`.
    *
@@ -148,6 +191,14 @@ export interface AuthUser {
 
 export interface ActiveOrg {
   interface_settings?: InterfaceSettings;
+  /** Moeda da organização — o rótulo do valor do negócio sai dela. */
+  currency?: string | null;
+  /** País da organização (ISO-3166 alpha-2); nulo = Brasil. */
+  country?: string | null;
+  /** Status da org ativa (`orgAtivaSemPortao` sempre preenche). Ausente/nulo = não operante. */
+  org_status?: string | null;
+  /** Tipo da suspensão — só significa algo com status 'suspended'. */
+  suspended_kind?: string | null;
   orgId: string;
   /** Fuso IANA da organização — ver `UserOrgMembership.timezone`. */
   timezone?: string | null;
@@ -170,6 +221,18 @@ export interface ActiveOrg {
    * `first_service_at` está congelada.
    */
   cliente_pela_agenda?: boolean;
+  /**
+   * Os módulos opcionais LIGADOS na instalação (`lib/instalacao/modulos.ts`).
+   * É da instalação, não da organização — mora aqui porque este é o contexto
+   * que o layout de `/app` entrega à casca. Ausente vale como nenhum: a porta
+   * de módulo desligado não aparece no menu.
+   */
+  modulos_ligados?: readonly ModuloOpcional[];
+  /**
+   * Capacidades que ESTA organização ligou (`lib/organizacao/capacidades.ts`).
+   * Só o layout de `/app` preenche; ausente vale como nenhuma no menu.
+   */
+  capacidades_ligadas?: readonly CapacidadeDaOrganizacao[];
   /**
    * O que ESTA organização definiu para si — CAMPO A CAMPO, e só o que ela
    * mesma definiu.
@@ -195,5 +258,9 @@ export interface ActiveOrg {
    * banco: `app/layout.tsx` resolve a pilha e o `<PublicEnvScript/>` a injeta em
    * `window.__PUBLIC_ENV__`, de onde `branding()` a lê.
    */
-  marca?: { readonly nome?: string; readonly logoUrl?: string | null };
+  marca?: {
+    readonly nome?: string;
+    readonly logoUrl?: string | null;
+    readonly logoDarkUrl?: string | null;
+  };
 }

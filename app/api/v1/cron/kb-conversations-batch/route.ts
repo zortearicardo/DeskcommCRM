@@ -17,9 +17,10 @@ import type { NextRequest } from "next/server";
 
 import { ok, fail } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
-import { env } from "@/lib/env";
 import { ingestConversationsBatch } from "@/lib/ai/rag/ingest/conversations";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { autorizaCron } from "@/lib/auth/cron-auth";
+import { STATUS_OPERANTE, ehOperante, statusDaOrgEmbutida } from "@/lib/organizacao/operante";
 
 export const dynamic = "force-dynamic";
 
@@ -28,21 +29,14 @@ const LOOKBACK_HOURS = 24;
 interface AgentRow {
   id: string;
   organization_id: string;
+  /** Status da org embutido — quem decide é `ehOperante`, não uma lista de ids. */
+  organizations?: { status?: string | null } | Array<{ status?: string | null }> | null;
 }
 
 export async function GET(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
 
-  const auth = req.headers.get("authorization") ?? "";
-  const provided = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : "";
-
-  const cronSecret = env.INTERNAL_CRON_SECRET;
-  const fallbackSecret = env.INTERNAL_SECRET;
-  const accepted: string[] = [];
-  if (cronSecret) accepted.push(cronSecret);
-  if (fallbackSecret) accepted.push(fallbackSecret);
-
-  if (accepted.length === 0 || !provided || !accepted.includes(provided)) {
+  if (!autorizaCron(req)) {
     return fail("forbidden", "Cron secret missing or invalid.", 403, { requestId });
   }
 
@@ -51,20 +45,26 @@ export async function GET(req: NextRequest): Promise<Response> {
 
   const { data: agentRows, error: agentErr } = await admin
     .from("ai_agents")
-    .select("id, organization_id")
-    .eq("is_active", true);
+    .select("id, organization_id, organizations:organization_id!inner(status)")
+    .eq("is_active", true)
+    .eq("organizations.status", STATUS_OPERANTE);
 
   if (agentErr) {
     console.error("[kb-conversations-cron] agent list failed", agentErr.message);
     return fail("internal_error", agentErr.message, 500, { requestId });
   }
 
+  // Organização parada (suspensa, redigida, arquivada) não gasta embedding: o
+  // provedor cobra por token, e quem paga é o dono da instalação. O corte sai no
+  // banco (o embed `!inner` + o filtro de status); o `ehOperante` abaixo é
+  // cinto. Nunca uma lista de ids de paradas negada na URL.
+
   const agents = (agentRows ?? []) as AgentRow[];
   // Pick one agent per org (first active wins) to avoid double-ingesting.
   const seenOrgs = new Set<string>();
   const unique: AgentRow[] = [];
   for (const a of agents) {
-    if (seenOrgs.has(a.organization_id)) continue;
+    if (seenOrgs.has(a.organization_id) || !ehOperante(statusDaOrgEmbutida(a.organizations))) continue;
     seenOrgs.add(a.organization_id);
     unique.push(a);
   }

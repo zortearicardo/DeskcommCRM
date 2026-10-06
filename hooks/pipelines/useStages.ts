@@ -37,6 +37,19 @@ export interface PatchDeEtapa {
   is_won?: boolean;
   is_lost?: boolean;
   depois_de?: string | null;
+  /**
+   * Probabilidade de ganho da etapa, 0–100. `null` limpa a calibração — e a
+   * previsão volta a reportar a etapa no balde "sem probabilidade".
+   */
+  win_probability?: number | null;
+  /** Negócio que entra nesta etapa abre um aviso na Central (migration 0440). */
+  avisar_na_central?: boolean;
+  /**
+   * Janela de "esfriando" da etapa, em HORAS (issue #1532). `null` limpa a
+   * configuração e a etapa volta ao padrão de 24 h/72 h. Fora de 1 a 8760
+   * inteiro a rota responde 422 — a coluna é `numeric` sem CHECK.
+   */
+  expected_duration_hours?: number | null;
 }
 
 function useReler(pipelineId: string) {

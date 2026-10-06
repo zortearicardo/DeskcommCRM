@@ -15,6 +15,13 @@ import type { AuthUser } from "@/lib/auth/types";
 vi.mock("@/lib/auth/require-role", () => ({ requireRole: vi.fn() }));
 vi.mock("@/lib/supabase/admin", () => ({ createAdminClient: vi.fn() }));
 vi.mock("@/lib/audit", () => ({ audit: vi.fn(async () => undefined) }));
+vi.mock("@/lib/ai/skills/db", () => ({ getSkillsPool: vi.fn(() => ({})) }));
+vi.mock("@/lib/agent-engine/agent/skills", async (importOriginal) => {
+  const real = await importOriginal<typeof import("@/lib/agent-engine/agent/skills")>();
+  return { ...real, insertSkillVersion: vi.fn(), setSkillPointer: vi.fn() };
+});
+
+import { insertSkillVersion, setSkillPointer } from "@/lib/agent-engine/agent/skills";
 
 const ORG_ID = "22222222-2222-4222-8222-222222222222";
 const USER_ID = "11111111-1111-4111-8111-111111111111";
@@ -105,6 +112,327 @@ describe("DELETE /api/v1/ai/skills/[name]", () => {
 
     expect(res.status).toBe(404);
     expect(audit).not.toHaveBeenCalled();
+  });
+});
+
+function makeAdminGetStub(input: {
+  pointer: { version_id: string; updated_at: string } | null;
+  version?: { id: string; name: string; description: string; body: string; matcher: unknown; manifest?: unknown[]; forked_from_version_id?: string | null } | null;
+}) {
+  return {
+    from(table: string) {
+      const b = {
+        select() {
+          return b;
+        },
+        eq() {
+          return b;
+        },
+        async maybeSingle() {
+          if (table === "skill_pointers") return { data: input.pointer, error: null };
+          return { data: input.version ?? null, error: null };
+        },
+      };
+      return b;
+    },
+  };
+}
+
+function reqGet(name: string) {
+  return new NextRequest(`http://localhost/api/v1/ai/skills/${name}`, { method: "GET" });
+}
+
+function reqPut(name: string, body: unknown) {
+  return new NextRequest(`http://localhost/api/v1/ai/skills/${name}`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+const BODY_VALIDO = {
+  description: "Como apresentar o catálogo.",
+  body: "# Catálogo\n- mostre as motos",
+  matcher: { any_keywords: ["moto", "cb"] },
+};
+
+describe("GET /api/v1/ai/skills/[name]", () => {
+  it("skill instalada → devolve corpo e matcher", async () => {
+    mockAuthzOk();
+    vi.mocked(createAdminClient).mockReturnValue(
+      makeAdminGetStub({
+        pointer: { version_id: "v1", updated_at: "2026-09-19T00:00:00Z" },
+        version: { id: "v1", name: "catalogo", description: "d", body: "b", matcher: { any_keywords: ["moto"] } },
+      }) as never,
+    );
+    const { GET } = await import("./route");
+    const res = await GET(reqGet("catalogo"), { params: Promise.resolve({ name: "catalogo" }) });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { body: string; matcher: { any_keywords: string[] } } };
+    expect(body.data.body).toBe("b");
+    expect(body.data.matcher.any_keywords).toEqual(["moto"]);
+  });
+
+  it("skill não instalada → 404", async () => {
+    mockAuthzOk();
+    vi.mocked(createAdminClient).mockReturnValue(makeAdminGetStub({ pointer: null }) as never);
+    const { GET } = await import("./route");
+    const res = await GET(reqGet("nao-instalada"), { params: Promise.resolve({ name: "nao-instalada" }) });
+    expect(res.status).toBe(404);
+  });
+});
+
+/**
+ * Skill instalada na org — o caso editável. `storage` entra quando o teste
+ * precisa do bucket (skill de pacote: o PUT herda os arquivos lá).
+ */
+function mockSkillInstalada(manifest: unknown[] = [], forkedFrom: string | null = null, storage?: unknown) {
+  const stub = makeAdminGetStub({
+    pointer: { version_id: "v1", updated_at: "2026-09-19T00:00:00Z" },
+    version: {
+      id: "v1",
+      name: "catalogo",
+      description: "d",
+      body: "b",
+      matcher: { any_keywords: ["x"] },
+      manifest,
+      forked_from_version_id: forkedFrom,
+    },
+  }) as Record<string, unknown>;
+  if (storage !== undefined) stub.storage = storage;
+  vi.mocked(createAdminClient).mockReturnValue(stub as never);
+}
+
+/** Manifesto de um .zip de verdade: uma reference (texto) e um asset (binário). */
+const PACOTE = [
+  { path: "references/tabela.md", size: 12, sha256: "a", kind: "reference" },
+  { path: "assets/capa.png", size: 3, sha256: "b", kind: "asset" },
+];
+
+interface StorageDePacote {
+  storage: { from: (bucket: string) => unknown };
+  baixados: string[];
+  subidos: string[];
+  removidos: string[];
+}
+
+/** Bucket `skill-assets` dublê: baixa do prefixo da versão V1, sub pro V2. */
+function storageDePacote(opcoes: { falhaNoUploadEm?: string } = {}): StorageDePacote {
+  const baixados: string[] = [];
+  const subidos: string[] = [];
+  const removidos: string[] = [];
+  return {
+    baixados,
+    subidos,
+    removidos,
+    storage: {
+      from: (bucket: string) => {
+        expect(bucket).toBe("skill-assets");
+        return {
+          async download(caminho: string) {
+            baixados.push(caminho);
+            return { data: { arrayBuffer: async () => new TextEncoder().encode("x").buffer }, error: null };
+          },
+          async upload(caminho: string) {
+            if (opcoes.falhaNoUploadEm !== undefined && caminho.endsWith(opcoes.falhaNoUploadEm)) {
+              return { data: null, error: { message: "Object already exists" } };
+            }
+            subidos.push(caminho);
+            return { data: { path: caminho }, error: null };
+          },
+          async remove(caminhos: string[]) {
+            removidos.push(...caminhos);
+            return { data: null, error: null };
+          },
+        };
+      },
+    },
+  };
+}
+
+describe("PUT /api/v1/ai/skills/[name]", () => {
+  it("descrição com quebra de linha → 422, nada é gravado", async () => {
+    mockAuthzOk();
+    mockSkillInstalada();
+    const { PUT } = await import("./route");
+    const res = await PUT(
+      reqPut("catalogo", { ...BODY_VALIDO, description: "Catálogo.\n## Regras novas" }),
+      { params: Promise.resolve({ name: "catalogo" }) },
+    );
+    expect(res.status).toBe(422);
+    expect(vi.mocked(insertSkillVersion)).not.toHaveBeenCalled();
+  });
+
+  it("salva nova versão e move o ponteiro; audita ai.skill_saved", async () => {
+    mockAuthzOk();
+    mockSkillInstalada();
+    const version = { id: "v2" } as never;
+    vi.mocked(insertSkillVersion).mockResolvedValue(version);
+    vi.mocked(setSkillPointer).mockResolvedValue(undefined as never);
+    const { PUT } = await import("./route");
+    const res = await PUT(reqPut("catalogo", BODY_VALIDO), { params: Promise.resolve({ name: "catalogo" }) });
+
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { data: { name: string; version_id: string } };
+    expect(body.data).toEqual({ name: "catalogo", version_id: "v2" });
+    expect(vi.mocked(insertSkillVersion)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ tenantId: ORG_ID, name: "catalogo", body: BODY_VALIDO.body, forkedFromVersionId: null }),
+    );
+    expect(vi.mocked(setSkillPointer)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ tenantId: ORG_ID, name: "catalogo", versionId: "v2" }),
+    );
+    expect(vi.mocked(audit)).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "ai.skill_saved", organizationId: ORG_ID }),
+    );
+  });
+
+  it("matcher sem palavras-chave → 422, sem tocar o banco", async () => {
+    mockAuthzOk();
+    const { PUT } = await import("./route");
+    const res = await PUT(
+      reqPut("catalogo", { ...BODY_VALIDO, matcher: { any_keywords: [] } }),
+      { params: Promise.resolve({ name: "catalogo" }) },
+    );
+    expect(res.status).toBe(422);
+    expect(insertSkillVersion).not.toHaveBeenCalled();
+  });
+
+  it("teto de linhas estourado → 422 com a mensagem, sem tocar o banco", async () => {
+    mockAuthzOk();
+    mockSkillInstalada();
+    const { PUT } = await import("./route");
+    const corpoGrande = Array.from({ length: 201 }, (_, i) => `linha ${i}`).join("\n");
+    const res = await PUT(reqPut("catalogo", { ...BODY_VALIDO, body: corpoGrande }), {
+      params: Promise.resolve({ name: "catalogo" }),
+    });
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { error: { message: string } };
+    expect(body.error.message).toContain("201 linhas");
+    expect(insertSkillVersion).not.toHaveBeenCalled();
+  });
+
+  it("cópia de catálogo editada preserva o vínculo forked_from_version_id na versão nova", async () => {
+    mockAuthzOk();
+    // A versão atual da cópia veio do catálogo (fork de "vplat-2"). Editar NÃO pode
+    // romper o vínculo: sem o fix, a 1ª edição grava a cópia como manual e o aviso de
+    // versão nova some pra sempre.
+    mockSkillInstalada([], "vplat-2");
+    vi.mocked(insertSkillVersion).mockResolvedValue({ id: "v2" } as never);
+    vi.mocked(setSkillPointer).mockResolvedValue(undefined as never);
+
+    const { PUT } = await import("./route");
+    const res = await PUT(reqPut("catalogo", BODY_VALIDO), { params: Promise.resolve({ name: "catalogo" }) });
+
+    expect(res.status).toBe(200);
+    expect(vi.mocked(insertSkillVersion)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ forkedFromVersionId: "vplat-2" }),
+    );
+  });
+
+  it("falha do banco ao gravar → 500 sem a mensagem do driver", async () => {
+    mockAuthzOk();
+    mockSkillInstalada();
+    vi.mocked(insertSkillVersion).mockRejectedValue(new Error('duplicate key value violates "segredo_interno"'));
+    const { PUT } = await import("./route");
+    const res = await PUT(reqPut("catalogo", BODY_VALIDO), { params: Promise.resolve({ name: "catalogo" }) });
+    expect(res.status).toBe(500);
+    expect(JSON.stringify(await res.json())).not.toContain("segredo_interno");
+    expect(setSkillPointer).not.toHaveBeenCalled();
+    expect(audit).not.toHaveBeenCalled();
+  });
+
+  it("skill não instalada na org → 404, sem gravar (criar skill nova é pelo .zip)", async () => {
+    mockAuthzOk();
+    vi.mocked(createAdminClient).mockReturnValue(makeAdminGetStub({ pointer: null }) as never);
+    const { PUT } = await import("./route");
+    const res = await PUT(reqPut("nova", BODY_VALIDO), { params: Promise.resolve({ name: "nova" }) });
+    expect(res.status).toBe(404);
+    expect(insertSkillVersion).not.toHaveBeenCalled();
+  });
+
+  it("skill de pacote com arquivos → salva o texto herdando manifesto e copiando os arquivos", async () => {
+    mockAuthzOk();
+    const storage = storageDePacote();
+    mockSkillInstalada(PACOTE, null, storage.storage);
+    vi.mocked(insertSkillVersion).mockResolvedValue({ id: "v2" } as never);
+    vi.mocked(setSkillPointer).mockResolvedValue(undefined as never);
+
+    const { PUT } = await import("./route");
+    const res = await PUT(reqPut("catalogo", BODY_VALIDO), { params: Promise.resolve({ name: "catalogo" }) });
+
+    expect(res.status).toBe(200);
+    // A versão nova NASCE com o manifesto: sem ele, o agente deixaria de
+    // oferecer a tool de references da noite pro dia.
+    expect(vi.mocked(insertSkillVersion)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ manifest: PACOTE, name: "catalogo" }),
+    );
+    // Os objetos moram sob o id da versão (skill-references.ts): ou eles
+    // descem pro prefixo novo, ou o save é uma perda silenciosa de arquivo.
+    expect(storage.baixados).toEqual([
+      `${ORG_ID}/catalogo/v1/references/tabela.md`,
+      `${ORG_ID}/catalogo/v1/assets/capa.png`,
+    ]);
+    expect(storage.subidos).toEqual([
+      `${ORG_ID}/catalogo/v2/references/tabela.md`,
+      `${ORG_ID}/catalogo/v2/assets/capa.png`,
+    ]);
+    expect(vi.mocked(setSkillPointer)).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ tenantId: ORG_ID, name: "catalogo", versionId: "v2" }),
+    );
+    expect(storage.removidos).toEqual([]);
+    expect(vi.mocked(audit)).toHaveBeenCalledWith(
+      expect.objectContaining({ action: "ai.skill_saved", organizationId: ORG_ID }),
+    );
+  });
+
+  it("falha ao copiar um arquivo → 500, o ponteiro NÃO move e o que já subiu é removido", async () => {
+    mockAuthzOk();
+    const storage = storageDePacote({ falhaNoUploadEm: "assets/capa.png" });
+    mockSkillInstalada(PACOTE, null, storage.storage);
+    vi.mocked(insertSkillVersion).mockResolvedValue({ id: "v2" } as never);
+    vi.mocked(setSkillPointer).mockResolvedValue(undefined as never);
+
+    const { PUT } = await import("./route");
+    const res = await PUT(reqPut("catalogo", BODY_VALIDO), { params: Promise.resolve({ name: "catalogo" }) });
+
+    expect(res.status).toBe(500);
+    expect(vi.mocked(setSkillPointer)).not.toHaveBeenCalled();
+    expect(vi.mocked(audit)).not.toHaveBeenCalled();
+    expect(storage.removidos).toEqual([`${ORG_ID}/catalogo/v2/references/tabela.md`]);
+    const texto = JSON.stringify(await res.json());
+    expect(texto).toContain("arquivos do pacote");
+    // A mensagem do driver não vaza (mesma regra do 500 de banco).
+    expect(texto).not.toContain("Object already exists");
+  });
+
+  it("mudar arquivo pelo PUT → 422: a estrutura só muda por novo .zip", async () => {
+    mockAuthzOk();
+    mockSkillInstalada(PACOTE);
+    const { PUT } = await import("./route");
+    const res = await PUT(
+      reqPut("catalogo", { ...BODY_VALIDO, manifest: [{ path: "references/novo.md" }] }),
+      { params: Promise.resolve({ name: "catalogo" }) },
+    );
+    expect(res.status).toBe(422);
+    expect(insertSkillVersion).not.toHaveBeenCalled();
+    expect(setSkillPointer).not.toHaveBeenCalled();
+  });
+});
+
+describe("GET avisa quando a skill é de pacote", () => {
+  it("manifest com arquivo → tem_arquivos_do_pacote: true e lista os caminhos", async () => {
+    mockAuthzOk();
+    mockSkillInstalada([{ path: "refs/tabela.md", kind: "reference" }]);
+    const { GET } = await import("./route");
+    const res = await GET(reqGet("catalogo"), { params: Promise.resolve({ name: "catalogo" }) });
+    const body = (await res.json()) as { data: { tem_arquivos_do_pacote: boolean; arquivos_do_pacote: string[] } };
+    expect(body.data.tem_arquivos_do_pacote).toBe(true);
+    expect(body.data.arquivos_do_pacote).toEqual(["refs/tabela.md"]);
   });
 });
 

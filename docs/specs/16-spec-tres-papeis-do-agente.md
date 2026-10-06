@@ -110,6 +110,9 @@ capacidade de mexer na operação."*
 - **Vê:** estado do lead, a declaração, o histórico, as 51 capacidades do catálogo.
 - **Tools:** as de escrita do catálogo MCP + as nativas de operação (`update_lead_state`,
   `schedule_followup`, `save_lead_note`, `open_human_case`, `provide_case_update`).
+- `followup.callback_enabled=false` oculta somente a criação de retorno (`schedule_followup` /
+  `crm_schedule_followup`) nos dois papéis. Consulta, cancelamento e inscrição em fluxo
+  configurado mantêm as regras próprias; agendamento de compromisso não é callback.
 - **Não tem canal.** `send_message` não existe no toolset dele. Não é regra de prompt — é ausência.
 - **Saída:** chamadas de ferramenta + registro. Um turno sem ação é **"nada a fazer" registrado**,
   nunca um `return` mudo.
@@ -126,7 +129,7 @@ existe, mais os classificadores onde regra não alcança.
 | camada | natureza | custo | estado |
 |---|---|---|---|
 | 10 gates de `BEFORE_SEND_GATES` (v6) | determinística | zero | **pronto** |
-| promessa semântica | LLM auxiliar | 1 chamada/envio | **pronto**, opt-in |
+| promessa semântica | LLM auxiliar | 1 chamada/envio | **pronto**, opt-in; considera [evidências consultadas no turno](promessas-com-evidencias-consultadas.md) |
 | jailbreak (inbound) | LLM auxiliar | 1 chamada/turno | **pronto**, opt-in |
 | vazamento de vocabulário | determinística | zero | **pronto** (`internal_vocabulary`) |
 

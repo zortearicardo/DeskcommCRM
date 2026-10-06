@@ -32,7 +32,12 @@ import { palavraDeSaida } from "@/lib/prospecting/rodape-de-saida";
 const audit = vi.fn(async () => {});
 const garantirLeadDaConversa = vi.fn(async () => ({ criado: true, leadId: "lead-1" }) as never);
 
+const encerraDemanda = vi.fn(async () => ({ lead: {}, jaEstava: false }) as never);
+
 vi.mock("@/lib/audit", () => ({ audit: (...a: unknown[]) => audit(...(a as [])) }));
+vi.mock("@/lib/leads/encerramento", () => ({
+  encerraDemanda: (...a: unknown[]) => encerraDemanda(...(a as [])),
+}));
 vi.mock("@/lib/leads/nascimento-do-lead", () => ({
   garantirLeadDaConversa: (...a: unknown[]) => garantirLeadDaConversa(...(a as [])),
 }));
@@ -65,6 +70,18 @@ let rpcChamadas: Array<{ nome: string; args: Record<string, unknown> }> = [];
  * tipo não distingue) passava verde: o fake respondia igual a qualquer filtro.
  */
 let filtrosDeMessages: Array<[string, unknown]> = [];
+/**
+ * O que a tabela do ref devolve quando o UPDATE de consumo roda. `null` é o
+ * ref que NÃO casa: já consumido, de outra organização, ou nunca gravado.
+ */
+let refCasado: { utm: Record<string, string> } | null = null;
+/** Os `.eq()`/`.is()` do consumo do ref — provam a organização e a trava de uso único. */
+let filtrosDoRef: Record<string, unknown> = {};
+/** Os negócios ABERTOS do contato, como a leitura de `crm_leads` os devolve. */
+let leadsAbertos: Array<{ id: string }> = [];
+let leadsErro: { message: string } | null = null;
+/** Os `.eq()` da leitura de `crm_leads` — provam organização, contato e "só os abertos". */
+let filtrosDeLeads: Array<[string, unknown]> = [];
 
 /** Imita o builder do PostgREST: encadeável, o efeito acontece no `await`. */
 function cadeia(rotulo: string): Record<string, unknown> {
@@ -88,6 +105,26 @@ const admin = {
   from(tabela: string) {
     return {
       update(payload: Record<string, unknown>) {
+        if (tabela === "meta_ads_click_refs") {
+          const consumo = {
+            eq(coluna: string, valor: unknown) {
+              filtrosDoRef[coluna] = valor;
+              return consumo;
+            },
+            is(coluna: string, valor: unknown) {
+              filtrosDoRef[coluna] = valor;
+              return consumo;
+            },
+            select(_colunas: string) {
+              return consumo;
+            },
+            async maybeSingle() {
+              sequencia.push("update:meta_ads_click_refs");
+              return { data: refCasado, error: null };
+            },
+          };
+          return consumo;
+        }
         ultimoUpdate = payload;
         return cadeia(`update:${tabela}`);
       },
@@ -100,6 +137,7 @@ const admin = {
         const consulta = {
           eq(coluna: string, valor: unknown) {
             if (tabela === "messages") filtrosDeMessages.push([coluna, valor]);
+            if (tabela === "crm_leads") filtrosDeLeads.push([coluna, valor]);
             return consulta;
           },
           order(_coluna: string, _opcoes?: unknown) {
@@ -118,6 +156,16 @@ const admin = {
             };
           },
         };
+        // Só a leitura de `crm_leads` é aguardada direto (sem `maybeSingle`). As
+        // outras tabelas seguem não-"thenable", como antes deste passo existir.
+        if (tabela === "crm_leads") {
+          return Object.assign(consulta, {
+            then(resolve: (v: unknown) => void) {
+              sequencia.push("select:crm_leads");
+              return Promise.resolve({ data: leadsAbertos, error: leadsErro }).then(resolve);
+            },
+          });
+        }
         return consulta;
       },
     };
@@ -157,6 +205,13 @@ beforeEach(() => {
   ultimaRpc = null;
   rpcChamadas = [];
   filtrosDeMessages = [];
+  refCasado = { utm: { utm_campaign: "black-friday", utm_ad: "video-depoimento-v3" } };
+  filtrosDoRef = {};
+  leadsAbertos = [];
+  leadsErro = null;
+  filtrosDeLeads = [];
+  encerraDemanda.mockReset();
+  encerraDemanda.mockResolvedValue({ lead: {}, jaEstava: false } as never);
   audit.mockClear();
   garantirLeadDaConversa.mockClear();
   garantirLeadDaConversa.mockResolvedValue({ criado: true, leadId: "lead-1" } as never);
@@ -288,6 +343,109 @@ describe("opt-out", () => {
   });
 });
 
+describe("opt-out fecha o negócio aberto como perdido", () => {
+  it("quem pede para sair tem cada negócio aberto encerrado como perda pedida pelo cliente", async () => {
+    leadsAbertos = [{ id: "lead-a" }, { id: "lead-b" }];
+
+    await rodar({ texto: "PARAR" });
+
+    expect(encerraDemanda).toHaveBeenCalledTimes(2);
+    for (const [i, leadId] of ["lead-a", "lead-b"].entries()) {
+      const [cliente, ctx, entrada] = encerraDemanda.mock.calls[i] as unknown as [
+        unknown,
+        Record<string, unknown>,
+        Record<string, unknown>,
+      ];
+      expect(cliente).toBe(admin);
+      expect(ctx).toMatchObject({
+        organization_id: "org-1",
+        // Não foi uma pessoa: a mensagem chegou pelo canal e o produto agiu.
+        actor: { type: "webhook_source", id: "canal-inbound" },
+      });
+      expect(entrada).toMatchObject({
+        leadId,
+        desfecho: "lost",
+        // Decisão do dono (doc 85, opção B): motivo próprio. "Cliente solicitou
+        // cancelamento" diria algo que o cliente não pediu — pedir silêncio não é
+        // cancelar.
+        motivo: "opted_out_of_messages",
+      });
+      expect(entrada.motivo).not.toBe("requested_by_customer");
+    }
+  });
+
+  it("lê só os negócios ABERTOS do contato, na organização certa", async () => {
+    await rodar({ texto: "PARAR" });
+
+    expect(filtrosDeLeads).toEqual(
+      expect.arrayContaining([
+        ["organization_id", "org-1"],
+        ["contact_id", "contato-1"],
+        ["status", "open"],
+      ]),
+    );
+  });
+
+  it("fecha DEPOIS de gravar o bloqueio e ANTES de o lead nascer", async () => {
+    leadsAbertos = [{ id: "lead-a" }];
+    encerraDemanda.mockImplementation(async () => {
+      sequencia.push("encerra:lead-a");
+      return { lead: {}, jaEstava: false } as never;
+    });
+    garantirLeadDaConversa.mockImplementation(async () => {
+      sequencia.push("lead-nasce");
+      return { criado: false, motivo: "contato_bloqueado" } as never;
+    });
+
+    await rodar({ texto: "PARAR" });
+
+    const bloqueio = sequencia.indexOf("update:contacts");
+    const encerra = sequencia.indexOf("encerra:lead-a");
+    const nasce = sequencia.indexOf("lead-nasce");
+    expect(bloqueio, "o bloqueio não foi gravado").toBeGreaterThanOrEqual(0);
+    expect(encerra, "o negócio não foi encerrado").toBeGreaterThan(bloqueio);
+    expect(nasce, "o lead nasceu antes do fechamento").toBeGreaterThan(encerra);
+  });
+
+  it("mensagem que não pede para sair não fecha nada", async () => {
+    leadsAbertos = [{ id: "lead-a" }];
+
+    await rodar({ texto: "oi, tudo bem?" });
+
+    expect(encerraDemanda).not.toHaveBeenCalled();
+    expect(sequencia).not.toContain("select:crm_leads");
+  });
+
+  it("falha ao gravar o bloqueio NÃO fecha o negócio de quem o sistema não protegeu", async () => {
+    updateErro = { message: "boom" };
+    leadsAbertos = [{ id: "lead-a" }];
+
+    await rodar({ texto: "PARAR" });
+
+    expect(encerraDemanda).not.toHaveBeenCalled();
+  });
+
+  it("um negócio que não fecha não impede o seguinte nem o resto da ingestão", async () => {
+    leadsAbertos = [{ id: "lead-a" }, { id: "lead-b" }];
+    encerraDemanda.mockRejectedValueOnce(new Error("pipeline_no_lost_stage"));
+
+    await rodar({ texto: "PARAR" });
+
+    expect(encerraDemanda).toHaveBeenCalledTimes(2);
+    expect(garantirLeadDaConversa).toHaveBeenCalledTimes(1);
+    expect(sequencia).toContain("rpc:ai_agent.dispatch_requested");
+  });
+
+  it("falha na leitura dos negócios não impede o resto da ingestão", async () => {
+    leadsErro = { message: "leitura falhou" };
+
+    await rodar({ texto: "PARAR" });
+
+    expect(encerraDemanda).not.toHaveBeenCalled();
+    expect(sequencia).toContain("rpc:ai_agent.dispatch_requested");
+  });
+});
+
 describe("despacho do agente", () => {
   it("emite com o payload que o consumidor lê, campo a campo", async () => {
     // O consumidor é UM só. Um payload por canal faria o worker adivinhar de
@@ -327,6 +485,29 @@ describe("nascimento do lead", () => {
     expect(garantirLeadDaConversa).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ nomeDoContato: "Marcela", conversationId: "conversa-1" }),
+    );
+  });
+
+  it("o negócio da conversa do Instagram nasce com origem Instagram, não WhatsApp", async () => {
+    // Sem isto, `garantirLeadDaConversa` cai no padrão: `source = 'whatsapp'`
+    // e "primeira mensagem recebida no WhatsApp" para quem escreveu no direct.
+    await rodar({ canal: "instagram" });
+    expect(garantirLeadDaConversa).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        origem: expect.objectContaining({
+          source: "instagram",
+          motivo: "primeira mensagem recebida no Instagram",
+        }),
+      }),
+    );
+  });
+
+  it("sem canal informado, a origem continua WhatsApp — o QR e o oficial não mudam", async () => {
+    await rodar();
+    expect(garantirLeadDaConversa).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ origem: expect.objectContaining({ source: "whatsapp" }) }),
     );
   });
 
@@ -546,5 +727,68 @@ describe("a origem da página que veio no texto", () => {
     expect(nomesDeRpc()).not.toContain("fn_estampar_atribuicao_de_anuncio");
     expect(garantirLeadDaConversa).toHaveBeenCalled();
     expect(vi.mocked(acelerarPipelineDeEventos)).toHaveBeenCalled();
+  });
+});
+
+/**
+ * O MESMO bloco de origem, pelo outro transporte: `[ref:XXXXXX]`, com as UTMs
+ * guardadas no servidor quando a rota de captura recebeu o clique
+ * (`app/api/v1/anuncios/meta/[org]/route.ts`).
+ *
+ * O que estes casos vigiam não é o casamento em si — é que o ref passa pelas
+ * MESMAS guardas do `[dk1:]`, e que o clique só é CONSUMIDO quando vai virar
+ * atribuição de verdade. Consumir fora da primeira mensagem queimaria o ref
+ * sem estampar ninguém, e o dono do clique nunca saberia por quê.
+ */
+describe("o ref curto da página que veio no texto", () => {
+  const REF = "[ref:K7M2P9]";
+  /** O mesmo `[dk1:]` do bloco acima, escrito aqui de forma independente. */
+  const DK1 = `[dk1:${Buffer.from(JSON.stringify({ utm_campaign: "dia-das-maes" }), "utf8").toString("base64url")}]`;
+  const nomesDeRpc = () => rpcChamadas.map((c) => c.nome);
+
+  it("casa o ref e estampa as UTMs guardadas no servidor", async () => {
+    await rodar({ texto: `Olá! Vim pelo site. ${REF}` });
+
+    const estampa = rpcChamadas.find((c) => c.nome === "fn_estampar_atribuicao_de_anuncio");
+    expect(estampa, "a origem do ref não foi estampada").toBeDefined();
+    expect(estampa?.args.p_platform).toBe("site");
+    const metadata = estampa?.args.p_metadata as Record<string, unknown>;
+    expect(metadata.utm_campaign).toBe("black-friday");
+    expect(metadata.utm_ad).toBe("video-depoimento-v3");
+  });
+
+  it("o consumo filtra por organização e por ref ainda não usado", async () => {
+    await rodar({ texto: `oi ${REF}` });
+
+    expect(filtrosDoRef.organization_id).toBe("org-1");
+    expect(filtrosDoRef.token).toBe("K7M2P9");
+    expect(filtrosDoRef.matched_at).toBeNull();
+  });
+
+  it("fora da primeira mensagem o ref NÃO é consumido", async () => {
+    historicoDoContato = { id: "outra-msg", count: 4 };
+
+    await rodar({ texto: `oi ${REF}` });
+
+    expect(sequencia).not.toContain("update:meta_ads_click_refs");
+    expect(nomesDeRpc()).not.toContain("fn_estampar_atribuicao_de_anuncio");
+  });
+
+  it("ref que não casa não estampa nada e a ingestão segue", async () => {
+    refCasado = null;
+
+    await expect(rodar({ texto: `oi ${REF}` })).resolves.toBeUndefined();
+
+    expect(nomesDeRpc()).not.toContain("fn_estampar_atribuicao_de_anuncio");
+    expect(garantirLeadDaConversa).toHaveBeenCalled();
+  });
+
+  it("com `[dk1:]` no texto, o ref nem vai ao banco", async () => {
+    // O `[dk1:]` se resolve sem consulta nenhuma. Ir ao banco assim mesmo
+    // consumiria um clique que ninguém pediu.
+    await rodar({ texto: `oi ${DK1} ${REF}` });
+
+    expect(sequencia).not.toContain("update:meta_ads_click_refs");
+    expect(nomesDeRpc()).toContain("fn_estampar_atribuicao_de_anuncio");
   });
 });

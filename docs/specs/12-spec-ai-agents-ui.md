@@ -99,7 +99,7 @@ Adiciona item "Agentes IA" na sidebar principal, entre "Pipelines" e "Configura�
 | Duplicar | `POST /agents/:id:duplicate` | — | `ai_agent.duplicated` |
 | Renomear | `PATCH /agents/:id` (modal inline) | — | `ai_agent.renamed` |
 | Pausar | `POST /agents/:id:pause` | "Tem certeza? Agente para de responder" | `ai_agent.paused` |
-| Despausar | `POST /agents/:id:publish` (republica versão atual) | — | `ai_agent.republished` |
+| Despausar | `unpauseAgentAction` (limpa `paused_at`; a versão nunca deixou de estar publicada) | — | `ai_agent.updated` (`metadata.unpaused`) |
 | Arquivar | `DELETE /agents/:id` | "Esta ação é reversível por 30 dias" | `ai_agent.archived` |
 
 ---
@@ -123,9 +123,9 @@ Adiciona item "Agentes IA" na sidebar principal, entre "Pipelines" e "Configura�
 - "Salvar rascunho" cria nova versão `status='draft'` (sem afetar produção).
 - "Publicar v4" só fica habilitado se há draft com diferenças vs versão publicada e validações passam.
 - Indicador de status no header é um Badge:
-  - 🟢 `published_version_id != null && draft inexistente` — só publicado
-  - 🟡 `published_version_id != null && draft existente` — publicado + draft pendente ("v3 publicada, v4 em rascunho")
-  - ⚪ `published_version_id == null` — pausado/nunca publicado
+  - 🟢 `published_version_id != null && paused_at == null && draft inexistente` — só publicado
+  - 🟡 `published_version_id != null && paused_at == null && draft existente` — publicado + draft pendente ("v3 publicada, v4 em rascunho")
+  - ⚪ `paused_at != null` (pausado: grava só `paused_at`, a versão segue publicada e `published_version_id` fica) ou `published_version_id == null` (nunca publicado). A régua viva é `estadoDoAgente` em `lib/ai/agents/no-ar.ts`
   - 🔴 versão tem invalidez (credential deletada, session offline) — bloqueia publish
 
 ### 3.2 Tab: Configuração (form principal)
@@ -193,6 +193,21 @@ Layout 2 colunas em desktop, stack em mobile.
 │                                       │ [+ Adicionar]                        │
 └───────────────────────────────────────┴──────────────────────────────────────┘
 ```
+
+### 3.2.1 Follow-up e retornos do agente
+
+Na edição da versão, a seção **Follow-up** expõe controles independentes:
+
+- `callback_enabled`: permite que o agente marque novos retornos prometidos. O
+  campo ausente em versões antigas é mostrado como habilitado. Desligá-lo oculta
+  a criação pontual pelo Conversador e Operador, sem retirar consulta ou
+  cancelamento de retornos existentes.
+- `enabled` e `flow_pointer_ids`: continuam controlando somente os fluxos
+  automáticos publicados. O controle de callbacks não desmarca esses campos nem
+  apaga a seleção de fluxos.
+
+O PATCH envia somente a propriedade alterada dentro de `followup`; o servidor
+preserva as demais propriedades da versão.
 
 ### 3.3 Validações de form (Zod, sincronizadas com Spec 10)
 

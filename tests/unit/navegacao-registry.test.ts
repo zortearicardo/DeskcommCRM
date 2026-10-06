@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import type { ModuloOpcional } from "@/lib/instalacao/modulos";
 import {
   NAV_DESTINATIONS,
   NAV_GROUPS,
@@ -150,37 +151,52 @@ describe("sidebarGroups", () => {
     expect(ids).toContain("atendimento");
   });
 
-  it("a ordem dentro do grupo de IA é a do uso real: agentes, follow-ups, roteadores", () => {
+  it("a ordem dentro do grupo de IA é a do uso real: agentes, follow-ups, casos", () => {
     // Provedores e Execuções NÃO entram aqui, e a razão é medida: pô-las na
     // sidebar estourou a dobra em 900px (e2e `navegacao.spec.ts`). Elas seguem
     // o padrão das outras nove telas do grupo — alcançáveis pelo hub "Ver tudo
     // em IA", que é o desenho existente para tela de configuração.
     const ia = sidebarGroups(true, null).find((g) => g.group.id === "ia");
+    // Casos entrou no lugar de Roteadores, um por um: roteador se configura
+    // poucas vezes; caso pede resposta no mesmo dia.
     expect(ia?.items.map((i) => i.href)).toEqual([
       "/app/ai/agents",
       "/app/ai/followups",
-      "/app/ai/routers",
+      "/app/ai/cases",
     ]);
   });
 });
 
 describe("hubSections", () => {
-  it("o hub do CRM é inventário: as seis telas do grupo, nas duas seções", () => {
+  it("o hub do CRM é inventário: as telas do grupo, nas duas seções", () => {
     // As seções são a régua do sidebar escrita por extenso — o que se abre todo
     // dia contra o que se define uma vez. Lista EXATA: `toContain` deixaria uma
     // tela nova entrar sem que ninguém decidisse de que lado dela ela cai.
     const secoes = hubSections("crm", true, null);
-    expect(secoes.map((s) => s.section)).toEqual(["O dia a dia da venda", "Preparar a venda"]);
+    expect(secoes.map((s) => s.section)).toEqual(["O dia a dia da venda", "Preparar a venda", "Fechar a venda"]);
     expect(secoes.flatMap((s) => s.items.map((i) => i.href))).toEqual([
       "/app/prospecting",
       "/app/kanban",
+      "/app/campaigns",
       "/app/contacts",
+      "/app/companies",
+      "/app/people",
       "/app/tasks",
       "/app/calls",
       "/app/comandas",
       "/app/products",
+      "/app/imports",
       "/app/settings/tenant/pipelines",
+      "/app/proposals",
     ]);
+  });
+
+  it("empresas, pessoas e importação só existem com o módulo crm_b2b ligado (doc 68)", () => {
+    const B2B = ["/app/companies", "/app/people", "/app/imports"];
+    const hrefs = (modulos: readonly ModuloOpcional[]) =>
+      hubSections("crm", true, null, undefined, modulos).flatMap((s) => s.items.map((i) => i.href));
+    expect(hrefs([]).filter((h) => B2B.includes(h))).toEqual([]);
+    expect(hrefs(["crm_b2b"]).filter((h) => B2B.includes(h))).toEqual(B2B);
   });
 
   it("agrupa a IA nas três etapas da jornada, na ordem", () => {

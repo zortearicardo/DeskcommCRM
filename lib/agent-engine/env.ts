@@ -11,6 +11,7 @@ import {
   RETORNO_MIN_AHEAD_MS_PADRAO,
   RETORNO_STAGGER_WINDOW_MS_PADRAO,
 } from '@/lib/followup/janela';
+import { esforcoDeRaciocinioOpenAI } from '@/lib/agent-engine/edge/llm/providers';
 
 const envSchema = z.object({
   // Postgres do Supabase (connection string — Settings → Database). O motor usa
@@ -19,6 +20,20 @@ const envSchema = z.object({
   // Supabase API — os handlers do app (sendMessageHandler) exigem o client
   // service-role. Mesmos valores do .env.local do app.
   NEXT_PUBLIC_SUPABASE_URL: z.string().url(),
+  // Endereço do Supabase PARA O WORKER, e só para ele (issue #1082). Vazio =
+  // vale a pública acima, que é o estado de toda instalação existente. Quem
+  // resolve a precedência é `urlDoSupabaseNoServidor`
+  // (lib/supabase/url-do-servidor.ts) — o mesmo módulo do app, para que os dois
+  // runtimes não possam divergir sobre qual vale. Este schema NÃO importa o
+  // módulo de propósito: ele é puro justamente para não arrastar nada do app
+  // para o boot do worker.
+  //
+  // `z.string()` e NÃO `.url()`: `lib/agent-engine/env.ts` LANÇA no boot quando o
+  // schema recusa, e um espaço sobrando no `.env` derrubaria o worker inteiro com
+  // um erro que não diz o que fazer. O mesmo motivo de `AI_BUDGET_ENFORCEMENT`
+  // (ver o comentário longo daquela chave): valor irreconhecível degrada com
+  // aviso, no resolvedor.
+  SUPABASE_SERVER_URL: z.string().optional(),
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
   // Chave LLM de plataforma (fallback quando a org não tem BYOK em
   // ai_provider_credentials). Opcional no boot: sem ela e sem BYOK, o turno
@@ -40,8 +55,13 @@ const envSchema = z.object({
   // Consertar a irmã da OpenAI e deixar esta é o modo de falha desta família:
   // ao mexer aqui, confira as três de uma vez.
   OPENROUTER_API_KEY: z.string().min(1).optional(),
-  // Modelo default do agente quando a org não define o dela (knob, nunca constante).
-  AGENT_DEFAULT_MODEL: z.string().min(1).default('claude-sonnet-4-5'),
+  // `AGENT_DEFAULT_MODEL` morava aqui, com `.default('claude-sonnet-4-5')` —
+  // um default da Anthropic escrito no schema de ambiente de um produto que
+  // também opera com OpenAI. NÃO EXISTIA CONSUMIDOR: nem `loadEnv` nem
+  // `llmEdgeConfigFromEnv` liam a chave, o Zod a parseava e ninguém a usava.
+  // Era puro default silencioso de documentar e de confundir quem fosse
+  // procurar o modelo efetivo (issue #2377). Saiu; o modelo de um agente vem de
+  // `ai_agents.model` e o do ponto vem do painel de provedores.
   // Teto de conexões por pool do pg. Sem valor = pg decide (default 10).
   DB_POOL_MAX: z.coerce.number().int().positive().optional(),
   // Knobs da fila. (Esta linha já afirmou "documentados no .env.example" quando
@@ -126,6 +146,11 @@ const envSchema = z.object({
   // Coalescência de rajada inbound: mensagens do MESMO contato dentro desta
   // janela viram UM job (responder em rajada é gatilho de ban). 0 = sem debounce.
   INBOUND_DEBOUNCE_MS: z.coerce.number().int().min(0).default(8_000),
+  // Resposta obsoleta: o cliente escreveu de novo enquanto o turno pensava → a
+  // resposta desatualizada não sai e o turno seguinte responde a tudo junto,
+  // enquanto a mensagem mais antiga sem resposta tiver menos que isto. 0 = desliga.
+  // Ver `respostaFicouObsoleta` (agent/turno-ja-respondido.ts).
+  RESPOSTA_OBSOLETA_TETO_MS: z.coerce.number().int().min(0).default(120_000),
   // Circuito de saúde do número — ritmo do ticker (block/response rate por número).
   NUMBER_HEALTH_INTERVAL_MS: z.coerce.number().int().positive().default(300_000),
   // Cron persistente por contato — knobs, nunca constantes.
@@ -148,6 +173,27 @@ const envSchema = z.object({
   // 'disabled' injeta o desligamento no corpo das chamadas — e SÓ nas da
   // DeepSeek (a fábrica é dela; ver providers.ts).
   DEEPSEEK_THINKING: z.enum(['provider', 'disabled']).default('provider'),
+  // Esforço de raciocínio das chamadas diretas à OpenAI (só modelos o*, gpt-5*,
+  // gpt-6*). Opcional; validado AQUI, pela mesma função que o lê em runtime, para
+  // um erro de grafia derrubar o boot com o nome da variável — e não cada turno
+  // do agente, que é onde `createDefaultRegistry` o lê.
+  OPENAI_REASONING_EFFORT: z
+    .string()
+    .optional()
+    .refine(
+      (v) => {
+        // `undefined` explícito tem de ser tratado aqui: passado à função, ele
+        // acionaria o default dela, que lê `process.env` e não o `source` do loadEnv.
+        if (v === undefined) return true;
+        try {
+          esforcoDeRaciocinioOpenAI(v);
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      'use none | minimal | low | medium | high | xhigh (ou deixe vazio)',
+    ),
   // Payload curado da tool get_lead_context.
   LEAD_CONTEXT_HISTORY_LIMIT: z.coerce.number().int().positive().default(20),
   LEAD_CONTEXT_MAX_TOKENS: z.coerce.number().int().positive().default(1_000),
@@ -167,8 +213,15 @@ const envSchema = z.object({
   PRUNE_TOOL_RESULTS_WINDOW_TURNS: z.coerce.number().int().positive().default(4),
   PRUNE_TOOL_RESULTS_MIN_RESULT_TOKENS: z.coerce.number().int().positive().default(200),
   // Skills situacionais — near-misses viram candidatos ao golden set (curadoria
-  // humana; escrita por fs em runtime, gitignored).
-  GOLDEN_CANDIDATES_DIR: z.string().min(1).default('lib/agent-engine/golden-candidates'),
+  // humana). Desde a #1695 o candidato é uma LINHA em `golden_candidates` (só
+  // rótulo, sem texto de cliente, com retenção) e não mais um JSON escrito em
+  // disco: `false` desliga a gravação. A chave antiga, `GOLDEN_CANDIDATES_DIR`,
+  // saiu junto com o disco — o diretório que ela nomeava não é escrito por
+  // ninguém, e uma chave morta no `.env` mentiria para quem chegasse depois.
+  GOLDEN_CANDIDATES_ENABLED: z
+    .enum(['true', 'false'])
+    .default('true')
+    .transform((v) => v === 'true'),
   // Classificadores auxiliares (modelo BARATO; sem valor = default da org).
   STAGE_CLASSIFIER_MODEL: z.string().min(1).optional(),
   JAILBREAK_CLASSIFIER_MODEL: z.string().min(1).optional(),

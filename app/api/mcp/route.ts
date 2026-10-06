@@ -15,6 +15,11 @@ import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/
 
 import { createMcpServer } from "@/lib/mcp/server";
 import { McpAuthError, validateBearerToken } from "@/lib/mcp/auth";
+import { modulosLigados } from "@/lib/instalacao/modulos";
+import { createAdminClient } from "@/lib/supabase/admin";
+import { capacidadesDaOrganizacao } from "@/lib/organizacao/capacidades";
+import { chaveDaRequisicao } from "@/lib/api/idempotency";
+import { z } from "zod";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -38,7 +43,9 @@ async function handle(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
   let auth;
   try {
-    auth = await validateBearerToken(req.headers.get("authorization"));
+    // Empresa suspensa entra marcada: o servidor só deixa a privacidade
+    // responder (LGPD nunca é bloqueada — decisão do dono, 30/09).
+    auth = await validateBearerToken(req.headers.get("authorization"), { permiteOrgSuspensa: true });
   } catch (err) {
     if (err instanceof McpAuthError) {
       return jsonRpcError(err.mcpCode, err.message, err.httpStatus);
@@ -47,8 +54,20 @@ async function handle(req: NextRequest): Promise<Response> {
     return jsonRpcError(-32603, msg, 500);
   }
 
+  const idempotencyKey = chaveDaRequisicao(req);
+  if (idempotencyKey !== null && !z.string().uuid().safeParse(idempotencyKey).success) {
+    return jsonRpcError(-32602, "Idempotency-Key deve ser UUID", 400);
+  }
+
   const transport = new WebStandardStreamableHTTPServerTransport({});
-  const server = createMcpServer(auth, requestId);
+  const admin = createAdminClient();
+  const server = createMcpServer(
+    auth,
+    requestId,
+    await modulosLigados(admin),
+    await capacidadesDaOrganizacao(admin, auth.organizationId),
+    idempotencyKey ?? undefined,
+  );
 
   try {
     await server.connect(transport);

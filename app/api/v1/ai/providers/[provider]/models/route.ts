@@ -8,7 +8,8 @@ import { randomUUID } from "node:crypto";
 import { type NextRequest } from "next/server";
 
 import { ok, fail } from "@/lib/api/wrappers";
-import { loadAuthUser, resolveActiveOrg } from "@/lib/auth/server";
+import { loadAuthUser } from "@/lib/auth/server";
+import { orgAtivaDaApi } from "@/lib/auth/require-role";
 import { createClient } from "@/lib/supabase/server";
 import { ehProvedorSuportado } from "@/lib/ai/pontos/provedores";
 
@@ -35,7 +36,9 @@ export async function GET(
 
   const authUser = await loadAuthUser();
   if (!authUser) return fail("unauthenticated", "Auth required.", 401, { requestId });
-  const activeOrg = await resolveActiveOrg(authUser);
+  const ativa = await orgAtivaDaApi(authUser, requestId);
+  if (!ativa.ok) return ativa.response;
+  const activeOrg = ativa.org;
   if (!activeOrg) {
     return fail("forbidden_tenant", "Sem organização ativa.", 403, { requestId });
   }
@@ -53,5 +56,23 @@ export async function GET(
     return fail("internal_error", "Erro ao listar modelos.", 500, { requestId });
   }
 
-  return ok({ models: data ?? [] }, { requestId });
+  // UM MODELO DE BUSCA NÃO É UM ATENDENTE.
+  //
+  // O catálogo é o mesmo que alimenta os pontos de índice/busca do RAG, então
+  // ele traz `text-embedding-3-small` — modelo que só converte texto em
+  // vetor. Era oferecido no seletor "Modelo" do agente (IA › Agentes › Modelo),
+  // e quem o escolhia ficava com um atendente mudo: embedding não conversa.
+  //
+  // `supports_tools` é a MESMA régua que `escolherModeloDoProvedor`
+  // (`lib/ai/agents/escolher-modelo.ts`) já usa para escolher o modelo do
+  // atendente e que `validarBinding` aplica no painel: sem ferramenta o modelo
+  // devolve texto plausível e nada chega ao funil. Filtrar aqui é filtrar em
+  // todos os seletôres — esta rota é a única fonte do `ModelPicker`.
+  //
+  // O filtro é em memória de propósito: são no máximo centenas de linhas, e
+  // assim o teste da rota enxerga a regra (um `eq` no banco o esconderia do
+  // dublê, que devolve a lista inteira).
+  const models = (data ?? []).filter((m) => m.supports_tools === true);
+
+  return ok({ models }, { requestId });
 }

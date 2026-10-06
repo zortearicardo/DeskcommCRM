@@ -1,8 +1,9 @@
 "use client";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
-import { useCallback } from "react";
+import { useCallback, useMemo } from "react";
 import { useRealtimeChannel } from "@/hooks/realtime/useRealtimeChannel";
 import { useRefetchDeSeguranca } from "@/hooks/realtime/useRefetchDeSeguranca";
+import { agendarRecargaDasConversas } from "@/hooks/inbox/recargaDasConversas";
 import { apiClient } from "@/lib/api/client";
 import { showApiError } from "@/components/feedback/ApiErrorToast";
 import type { Message } from "@/lib/types/messaging";
@@ -14,7 +15,7 @@ interface MessagesResponse {
 
 export function useMessagesRealtime(conversationId: string | null) {
   const qc = useQueryClient();
-  const queryKey = ["messages", conversationId] as const;
+  const queryKey = useMemo(() => ["messages", conversationId] as const, [conversationId]);
 
   const query = useInfiniteQuery({
     queryKey,
@@ -56,7 +57,7 @@ export function useMessagesRealtime(conversationId: string | null) {
 
   const onChange = useCallback(() => {
     if (conversationId) qc.invalidateQueries({ queryKey: ["messages", conversationId] });
-    qc.invalidateQueries({ queryKey: ["conversations"] });
+    agendarRecargaDasConversas(qc);
   }, [qc, conversationId]);
 
   const { status: realtimeStatus, ultimaEntrega } = useRealtimeChannel({

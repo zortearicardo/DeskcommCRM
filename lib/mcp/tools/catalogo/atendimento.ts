@@ -14,6 +14,29 @@
 import { declararTools } from "./tipos";
 
 export const TOOLS_ATENDIMENTO = declararTools([
+  // ── `risco` DESTAS DUAS REAVALIADO (#2158) ────────────────────────────────
+  //
+  // Medido contra a convenção que JÁ EXISTE, em `RISCOS`
+  // (`lib/mcp/tools/pacotes.ts`) — nenhum rótulo novo inventado:
+  //
+  //   "seguro"   = "Só consulta. O agente apenas lê a informação. Nada muda
+  //                no sistema."
+  //   "atencao"  = "Altera dados. O agente muda alguma coisa no sistema…"
+  //   "critico"  = "Efeito que não dá para desfazer…" — e ainda por cima sai
+  //                do pacote (`entraPorPacote`), exigindo marcação humana.
+  //
+  // As duas são leituras puras: mudá-las para "atencao" seria mentira no outro
+  // sentido ("altera dados" — não altera), e "critico" as tiraria do pacote
+  // Atender, que existe justamente para o agente saber com quem está falando.
+  // O que a issue apontava — o rótulo prometia mais do que o runtime entregava
+  // — passou a ser verdade DO LADO DO RUNTIME: em conversa, o escopo do contato
+  // do turno alcança a leitura também (#2158, `lib/mcp/tools/contacts.ts`).
+  //
+  // Fica registrado o limite da convenção: `risco` é POR FERRAMENTA, não por
+  // pacote, então não existe "seguro no vender / atencao no atender" para
+  // declarar — e a taxa de exposição de dado pessoal (leitura que devolve
+  // telefone/e-mail) não tem slot em `RISCOS`. Se um dia tiver, esta dupla é a
+  // primeira candidata.
   {
     name: "crm_search_contacts",
     category: "read",
@@ -31,6 +54,7 @@ export const TOOLS_ATENDIMENTO = declararTools([
     explicacao:
       "Abre a ficha completa de um cliente: dados de contato, histórico e por onde ele chegou até a empresa.",
     oQueToca: "Cadastro de clientes",
+    // Ver o bloco acima: mesma leitura, mesma conclusão (#2158).
     risco: "seguro",
     pacotes: ["atender", "vender"],
   },
@@ -129,5 +153,26 @@ export const TOOLS_ATENDIMENTO = declararTools([
     // publicado alcança (ver tests/unit/capacidade-alcancavel-pelo-agente.test.ts).
     pacotes: ["vender"],
     apenasHumano: true,
+  },
+  {
+    name: "crm_create_conversation_draft",
+    category: "write",
+    rotulo: "Deixar texto sugerido para a pessoa revisar",
+    explicacao:
+      "Guarda um texto vindo de outro sistema (ERP, formulário) na conversa, para a pessoa que atende revisar e enviar. " +
+      "Nada sai para o cliente por conta desta ação: o texto aparece no campo de resposta com o aviso de origem, " +
+      "e só o clique de quem atende manda a mensagem.",
+    oQueToca: "Atendimento",
+    // `atencao`, não `critico`: a ação em si não alcança o cliente — ela prepara
+    // uma sugestão que uma pessoa precisa confirmar. O peso do envio continua
+    // sendo do `crm_send_whatsapp_message`, que segue `critico`.
+    risco: "atencao",
+    // "escalar", não "atender": o texto é deixado para uma PESSOA revisar e
+    // enviar, que é a jornada "Passar para um humano". E "atender" é o pacote
+    // que encosta no teto por agente: cada capacidade a mais ali é uma vaga que
+    // o dono precisa liberar para ligar a jornada — o mesmo motivo que tirou
+    // `crm_propose_contact_field` daqui. A conta que isso quebra está no e2e
+    // `capacidades-do-agente.spec.ts` (comentário de `TOOLS_DO_SEED`).
+    pacotes: ["escalar"],
   },
 ]);

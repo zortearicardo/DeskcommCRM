@@ -35,6 +35,12 @@ import { Document, Page, StyleSheet, Text, View, renderToBuffer } from "@react-p
 import React from "react";
 
 import { env } from "@/lib/env";
+import { mascaraCpf } from "@/lib/lgpd/mask";
+import {
+  COPIA_DO_NUMERO_3,
+  DIREITOS_DA_ALINEA_E,
+  NAO_INFORMADO_PELO_CONTROLADOR,
+} from "@/lib/legal/art15";
 
 import type { ExportPayload } from "./export-collector";
 
@@ -95,10 +101,16 @@ interface Props {
   unsignedWarning?: boolean;
 }
 
-function fmtDate(s: string | null | undefined): string {
+/**
+ * Sem `fuso` (Brasil) a data sai como sempre saiu. Com `fuso` (organização
+ * fora do Brasil) sai no fuso DELA e com o nome do fuso escrito: um horário de
+ * São Paulo apresentado como local erra 3 a 4 h em Lisboa (doc 88).
+ */
+function formatarData(s: string | null | undefined, fuso?: string): string {
   if (!s) return "—";
   try {
-    return new Date(s).toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
+    if (!fuso) return new Date(s).toLocaleString("pt-BR", { timeZone: "America/Sao_Paulo" });
+    return new Date(s).toLocaleString("pt-PT", { timeZone: fuso, timeZoneName: "short" });
   } catch {
     return s;
   }
@@ -142,8 +154,44 @@ const noticeStatus: Record<string, string> = {
   dismissed: "Dispensado",
 };
 
+/**
+ * O CPF que o titular informou na conversa, MASCARADO, para a linha do
+ * documento no relatório (issue #2341).
+ *
+ * Antes esta linha dizia "valor no arquivo de dados", mas o `data.json` fica no
+ * Storage e o e-mail ao titular não o entrega — o documento apontava para um
+ * arquivo que quem o lê não tem. A saída escolhida (uma das duas da issue) foi
+ * imprimir o valor mascarado aqui mesmo; a outra — entregar o `data.json` junto
+ * — ficaria de fora porque esse arquivo também carrega campo interno
+ * (`reply_drafts`, `conversation_notes`, `audit_log_extract`).
+ *
+ * QUAL chave: o coletor reconhece o CPF pelo TIPO da pergunta (`cpf`), mas a
+ * chave onde ela grava é o operador que escolhe, e este relatório só enxerga o
+ * nome da chave. Então: das chaves que contêm "cpf", valem as que trazem um
+ * CPF de verdade (`tem_cpf: "sim"` não conta). Com UMA, sai a máscara. Com
+ * duas ou mais valores diferentes (mesmo que uma se chame `cpf`, como
+ * `cpf_responsavel` numa clínica), não há como saber qual é do titular, e sai
+ * a frase sem dígito de ninguém. O conserto de verdade é o coletor expor a
+ * chave que reconheceu. Sem valor achado, a frase sai SEM ponteiro: nunca o
+ * texto antigo.
+ */
+function cpfMascarado(contact: ExportPayload["contact"]): string {
+  const campos = contact?.custom_fields ?? {};
+  const candidatos = new Set(
+    Object.entries(campos)
+      .filter(([chave]) => chave.toLowerCase().includes("cpf"))
+      .map(([, valor]) => (typeof valor === "number" ? String(valor) : valor))
+      .filter((valor): valor is string => typeof valor === "string" && mascaraCpf(valor) !== null)
+      .map((valor) => valor.replace(/\D/g, "")),
+  );
+  const [unico] = candidatos;
+  return (candidatos.size === 1 ? mascaraCpf(unico) : null) ?? "valor não disponível neste relatório";
+}
+
 export function LgpdExportPdf({ data, unsignedWarning }: Props): React.ReactElement {
   const shortId = data.request_id.slice(0, 8);
+  // ponytail: o nome antigo, já preso ao fuso deste documento — as ~25 chamadas abaixo não mudam.
+  const fmtDate = (s: string | null | undefined) => formatarData(s, data.fuso);
 
   return (
     <Document>
@@ -155,7 +203,7 @@ export function LgpdExportPdf({ data, unsignedWarning }: Props): React.ReactElem
             {/* A lei vem do PERFIL do país da organização (issue #1033): país
                 sem citação revisada não cita lei nenhuma — citar a errada é
                 pior do que não citar artigo nenhum. */}
-            Base legal: {data.lei_citada ?? "não declarada (país sem citação revisada)"} ·
+            {`${data.lei_rotulo ?? "Base legal"}: `}{data.lei_citada ?? "não declarada (país sem citação revisada)"} ·
             Solicitação #{shortId}
           </Text>
         </View>
@@ -193,6 +241,52 @@ export function LgpdExportPdf({ data, unsignedWarning }: Props): React.ReactElem
           ) : null}
         </View>
 
+        {/* Art. 15.º, n.º 1 — alínea a alínea (issue #2340, doc 88).
+            Sai SÓ quando o coletor emitiu `art15`: Brasil (documento da LGPD,
+            art. 18 II) e país sem autoridade revisada no perfil ficam byte a
+            byte — os fixtures em tests/fixtures/lgpd-brasil-antes-do-doc88/ é
+            que travam isto, não este comentário. */}
+        {data.art15 ? (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>
+              Informações exigidas pelo art. 15.º, n.º 1
+            </Text>
+            <View style={styles.row}>
+              <Text style={styles.label}>a) Finalidades:</Text>
+              <Text style={styles.value}>
+                {data.art15.finalidades ?? NAO_INFORMADO_PELO_CONTROLADOR}
+              </Text>
+            </View>
+            <View style={styles.row}>
+              <Text style={styles.label}>c) Destinatários:</Text>
+              <Text style={styles.value}>
+                {data.art15.destinatarios ?? NAO_INFORMADO_PELO_CONTROLADOR}
+              </Text>
+            </View>
+            <View style={styles.row}>
+              <Text style={styles.label}>d) Conservação:</Text>
+              <Text style={styles.value}>
+                {data.art15.prazo_conservacao ?? NAO_INFORMADO_PELO_CONTROLADOR}
+              </Text>
+            </View>
+            <View style={styles.itemBlock}>
+              <Text style={styles.small}>e) Direitos</Text>
+              <Text>{DIREITOS_DA_ALINEA_E}</Text>
+            </View>
+            <View style={styles.itemBlock}>
+              <Text style={styles.small}>f) Reclamação a uma autoridade de controlo</Text>
+              <Text>
+                {data.art15.autoridade.nome} · {data.art15.autoridade.site}
+              </Text>
+            </View>
+            <View style={styles.itemBlock}>
+              <Text style={styles.small}>h) Decisões automatizadas</Text>
+              <Text>{data.art15.decisoes_automatizadas}</Text>
+            </View>
+            <Text style={styles.small}>{COPIA_DO_NUMERO_3}</Text>
+          </View>
+        ) : null}
+
         {/* Contact */}
         {data.contact ? (
           <View style={styles.section}>
@@ -210,9 +304,20 @@ export function LgpdExportPdf({ data, unsignedWarning }: Props): React.ReactElem
               <Text style={styles.value}>{data.contact.phone_number ?? "—"}</Text>
             </View>
             <View style={styles.row}>
-              <Text style={styles.label}>{data.documento_rotulo}:</Text>
+              {/* O valor "informado na conversa" vem só da pergunta de roteiro
+                  do tipo `cpf`, validada como CPF (`lib/lgpd/campos-personalizados.ts`):
+                  é sempre CPF, mesmo numa organização de fora do Brasil. */}
+              <Text style={styles.label}>
+                {data.contact.cpf_present || !data.contact.cpf_informado_na_conversa
+                  ? data.documento_rotulo
+                  : "CPF"}:
+              </Text>
               <Text style={styles.value}>
-                {data.contact.cpf_present ? "Armazenado (criptografado)" : "—"}
+                {data.contact.cpf_present
+                  ? "Armazenado (criptografado)"
+                  : data.contact.cpf_informado_na_conversa
+                    ? `Informado na conversa (${cpfMascarado(data.contact)})`
+                    : "—"}
               </Text>
             </View>
             <View style={styles.row}>
@@ -227,6 +332,21 @@ export function LgpdExportPdf({ data, unsignedWarning }: Props): React.ReactElem
               <Text style={styles.label}>Anonimizado:</Text>
               <Text style={styles.value}>{data.contact.is_anonymized ? "Sim" : "Não"}</Text>
             </View>
+          </View>
+        ) : null}
+
+        {/* Respostas e campos personalizados (roteiros de atendimento, etc.) */}
+        {data.contact && (data.contact.campos_legiveis ?? []).length > 0 ? (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Respostas e campos personalizados</Text>
+            {/* A pergunta em linha própria: rótulo de roteiro é frase, e na coluna
+                de 110pt dos dados fixos ele quebrava no meio da palavra. */}
+            {data.contact.campos_legiveis.map((campo, i) => (
+              <View key={i} style={styles.itemBlock}>
+                <Text style={styles.small}>{campo.rotulo}</Text>
+                <Text>{campo.valor}</Text>
+              </View>
+            ))}
           </View>
         ) : null}
 
@@ -279,6 +399,31 @@ export function LgpdExportPdf({ data, unsignedWarning }: Props): React.ReactElem
                   {fmtDate(m.created_at)} · {m.direction} · {m.type} · {m.status}
                 </Text>
                 <Text>{m.body ? m.body.slice(0, 280) : m.has_media ? "[mídia]" : "—"}</Text>
+                {m.media_derived_text ? (
+                  <Text style={styles.small}>
+                    transcrição/texto extraído da mídia: {m.media_derived_text.slice(0, 280)}
+                  </Text>
+                ) : null}
+              </View>
+            ))}
+          </View>
+        ) : null}
+
+        {/* Mensagens em grupos de WhatsApp escritas pelo titular (migration 0482) */}
+        {data.group_messages_authored.length > 0 ? (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Mensagens em Grupos de WhatsApp</Text>
+            {data.group_messages_authored.slice(0, 25).map((m) => (
+              <View key={m.id} style={styles.itemBlock}>
+                <Text style={styles.small}>
+                  {fmtDate(m.created_at)} · {m.type}
+                </Text>
+                <Text>{m.body ? m.body.slice(0, 280) : m.has_media ? "[mídia]" : "—"}</Text>
+                {m.media_derived_text ? (
+                  <Text style={styles.small}>
+                    transcrição/texto extraído da mídia: {m.media_derived_text.slice(0, 280)}
+                  </Text>
+                ) : null}
               </View>
             ))}
           </View>
@@ -311,6 +456,27 @@ export function LgpdExportPdf({ data, unsignedWarning }: Props): React.ReactElem
                   {o.status} · {fmtMoney(o.total_cents, o.currency)}
                 </Text>
                 <Text style={styles.small}>Pedido em {fmtDate(o.ordered_at)}</Text>
+              </View>
+            ))}
+          </View>
+        ) : null}
+
+        {/* Propostas — o documento comercial que a pessoa RECEBEU; sem esta
+            seção o relatório não mencionava proposta nenhuma. */}
+        {data.proposals?.length ? (
+          <View style={styles.section}>
+            <Text style={styles.sectionTitle}>Propostas comerciais</Text>
+            {data.proposals.map((p) => (
+              <View key={p.id} style={styles.itemBlock}>
+                <Text>
+                  {p.numero != null && p.ano != null ? `Nº ${p.numero}/${p.ano} · ` : ""}
+                  {p.titulo} · {p.status} · {fmtMoney(p.total_cents, p.moeda)}
+                </Text>
+                <Text style={styles.small}>
+                  Criada em {fmtDate(p.created_at)}
+                  {p.sent_at ? ` · enviada em ${fmtDate(p.sent_at)}` : ""}
+                  {p.tem_pdf ? " · documento em PDF enviado" : ""}
+                </Text>
               </View>
             ))}
           </View>
@@ -440,11 +606,20 @@ export function LgpdExportPdf({ data, unsignedWarning }: Props): React.ReactElem
         {/* Unsigned warning */}
         {unsignedWarning ? (
           <View style={styles.warningBanner}>
-            <Text>
-              ASSINATURA DIGITAL PAdES PENDENTE — chave LGPD_SIGNING_KEY não
-              configurada. A integridade do documento é garantida por hash SHA-256
-              registrado em log auditável.
-            </Text>
+            {/* Fora do Brasil o titular não lê o nome de uma variável que cita a LGPD. */}
+            {data.fuso === undefined && data.lei_rotulo === undefined ? (
+              <Text>
+                ASSINATURA DIGITAL PAdES PENDENTE — chave LGPD_SIGNING_KEY não
+                configurada. A integridade do documento é garantida por hash SHA-256
+                registrado em log auditável.
+              </Text>
+            ) : (
+              <Text>
+                ASSINATURA DIGITAL PAdES PENDENTE — a chave de assinatura não está
+                configurada. A integridade do documento é garantida por hash SHA-256
+                registrado em log auditável.
+              </Text>
+            )}
           </View>
         ) : null}
 

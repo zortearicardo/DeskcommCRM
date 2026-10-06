@@ -241,17 +241,27 @@ function detectDelimiter(text: string): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Aceita apelidos pt-BR/en porque a planilha é feita por humano: quem importa
- * tem "Telefone" no Excel, não "phone_number". Acento/caixa/separador são
- * normalizados ("Data de Nascimento" → data_de_nascimento).
+ * Aceita apelidos pt-BR/en/es porque a planilha é feita por humano: quem importa
+ * tem "Telefone" (ou "Teléfono") no Excel, não "phone_number". Acento/caixa/
+ * separador são normalizados ("Data de Nascimento" → data_de_nascimento,
+ * "Fecha de nacimiento" → fecha_de_nacimiento). Os de espanhol cumprem o que a
+ * tela de importação promete a quem a usa nesse idioma.
  */
 const HEADER_ALIASES: Record<string, readonly string[]> = {
-  name: ["name", "nome", "cliente"],
-  display_name: ["display_name", "apelido", "nome_de_exibicao"],
-  email: ["email", "e_mail"],
-  phone_number: ["phone_number", "telefone", "whatsapp", "celular", "fone"],
+  name: ["name", "nome", "cliente", "nombre"],
+  display_name: ["display_name", "apelido", "nome_de_exibicao", "apodo", "nombre_para_mostrar"],
+  email: ["email", "e_mail", "correo", "correo_electronico"],
+  phone_number: ["phone_number", "telefone", "whatsapp", "celular", "fone", "telefono", "movil"],
   cpf: ["cpf"],
-  birthdate: ["birthdate", "nascimento", "data_de_nascimento", "aniversario"],
+  birthdate: [
+    "birthdate",
+    "nascimento",
+    "data_de_nascimento",
+    "aniversario",
+    "nacimiento",
+    "fecha_de_nacimiento",
+    "cumpleanos",
+  ],
   tags: ["tags", "etiquetas", "grupos"],
 };
 
@@ -376,9 +386,13 @@ export function mapLinha(
   indices: Record<string, number>,
   t?: (text: string) => string,
   documento?: DocumentoDoTitular,
+  /** O exemplo de telefone do PAÍS da organização; sem ele, a mensagem de erro
+   *  ensinava o DDI brasileiro a quem importa uma planilha de Lisboa. */
+  telefoneExemplo?: string,
 ): { contato: LinhaNormalizada; motivo: string | null } {
   const _t = t || ((x) => x);
   const doc = documento ?? perfilDoPais(null).documento;
+  const exemploDeTelefone = telefoneExemplo ?? perfilDoPais(null).telefoneExemplo;
   const get = (campo: string): string => {
     const idx = indices[campo];
     return idx === undefined ? "" : (cells[idx] ?? "").trim();
@@ -408,7 +422,8 @@ export function mapLinha(
         motivo:
           _t("telefone inválido: ") +
           `"${phoneRaw}"` +
-          _t(" (use DDI+DDD+número, ex.: +5511999998888)"),
+          _t(" (use o número com o código do país, por exemplo ") +
+          `${exemploDeTelefone})`,
       };
     }
     contato.phone_number = phone;

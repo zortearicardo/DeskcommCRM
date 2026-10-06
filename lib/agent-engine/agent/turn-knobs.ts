@@ -13,6 +13,7 @@ export function turnKnobsFromEnv(env: Env): InboundTurnKnobs {
     maxSteps: env.AGENT_MAX_STEPS,
     maxSendsPerTurn: env.MAX_SENDS_PER_TURN,
     queuedRetryDelayMs: env.SEND_QUEUED_RETRY_MS,
+    respostaObsoletaTetoMs: env.RESPOSTA_OBSOLETA_TETO_MS,
     breaker: {
       exactFailureWarn: env.TOOL_BREAKER_EXACT_WARN,
       exactFailureBlock: env.TOOL_BREAKER_EXACT_BLOCK,
@@ -35,7 +36,7 @@ export function turnKnobsFromEnv(env: Env): InboundTurnKnobs {
       windowTurns: env.PRUNE_TOOL_RESULTS_WINDOW_TURNS,
       minResultTokens: env.PRUNE_TOOL_RESULTS_MIN_RESULT_TOKENS,
     },
-    goldenCandidatesDir: env.GOLDEN_CANDIDATES_DIR,
+    goldenCandidates: env.GOLDEN_CANDIDATES_ENABLED,
     stageClassifier: {
       ...(env.STAGE_CLASSIFIER_MODEL !== undefined ? { model: env.STAGE_CLASSIFIER_MODEL } : {}),
     },

@@ -151,12 +151,31 @@ export interface PontoDeIa {
    */
   /**
    * Ponto que o produto resolve sozinho — a escolha do painel não se aplica.
-   * `usa` diz o que ele de fato chama: sem isso a tela caía na cadeia de
-   * resolução dos pontos de conversa e anunciava um modelo de chat num ponto
-   * que fala com a API de transcrição.
+   *
+   * `usa` diz o que ele de fato chama, em par fechado: serve para o que NÃO
+   * tem degrau. `escada` é o caso contrário — o ponto não tem resposta própria,
+   * e o resolvedor devolve o degrau que quem chamou decidiu
+   * (`entrada.transcricao`). Marcar `escada` é o que impede a tela de voltar a
+   * anunciar um `whisper-1` fixo para quem transcreve pelo modelo de conversa
+   * da organização (#2190).
    */
-  fixo?: { razao: string; usa?: { provider: string; modelId: string } };
+  fixo?: {
+    razao: string;
+    usa?: { provider: string; modelId: string };
+    escada?: "transcricao";
+  };
   registraEm: DestinoDeTelemetria;
+  /**
+   * O ponto sabe ser decidido pelo Jev (`lib/ai/decisao/`), que devolve decisão
+   * tipada em vez de texto. Só marque o ponto que TEM chamador do Jev:
+   * `tests/unit/pontos-de-ia-decisao-rapida.test.ts` cobra os dois lados, porque
+   * ponto marcado sem chamador é botão que não controla nada.
+   */
+  decisaoRapida?: {
+    primitiva: "score" | "choice" | "noul";
+    /** O que o Jev faz neste ponto, para quem não é engenheiro. Vai à tela. */
+    oQueOJevFaz: string;
+  };
 }
 
 export const PONTOS_DE_IA: readonly PontoDeIa[] = [
@@ -232,6 +251,42 @@ export const PONTOS_DE_IA: readonly PontoDeIa[] = [
     registraEm: "llm_calls",
   },
   {
+    id: "proposal_assistant",
+    rotulo: "Ajustar proposta por instrução",
+    oQueFaz:
+      "Interpreta um pedido curto ('baixa 10% e tira a hospedagem') e monta as mudanças na proposta comercial, para uma pessoa revisar antes de aplicar.",
+    papel: "atender",
+    exige: { tools: true },
+    emissor: "lib/propostas/assistente.ts",
+    sintomaDeFalha:
+      "O botão de ajustar a proposta por instrução não devolve nenhuma mudança, e quem está editando precisa mexer campo por campo à mão.",
+    registraEm: "llm_calls",
+  },
+  {
+    id: "proposal_fill_from_conversation",
+    rotulo: "Preencher proposta com a conversa",
+    oQueFaz:
+      "Lê a conversa com o cliente e sugere valores para os campos que faltam preencher no documento da proposta, para uma pessoa revisar e confirmar campo por campo.",
+    papel: "atender",
+    exige: { tools: true },
+    emissor: "lib/propostas/preencher-com-conversa.ts",
+    sintomaDeFalha:
+      "O botão 'Preencher com a conversa' não sugere nada, e quem revisa preenche cada campo lendo a conversa manualmente.",
+    registraEm: "llm_calls",
+  },
+  {
+    id: "proposal_template_import",
+    rotulo: "Transformar proposta da empresa em modelo",
+    oQueFaz:
+      "Lê a proposta que a empresa já usa (PDF ou texto) e a divide em seções de modelo, trocando os dados de um cliente específico por campos preenchíveis, para uma pessoa revisar antes de salvar.",
+    papel: "atender",
+    exige: { tools: true },
+    emissor: "lib/propostas/modelos/importar.ts",
+    sintomaDeFalha:
+      "O botão de criar modelo a partir de um arquivo não devolve nada, e a pessoa monta o modelo seção por seção à mão.",
+    registraEm: "llm_calls",
+  },
+  {
     id: "bot_respond",
     rotulo: "Responder (motor antigo)",
     oQueFaz:
@@ -256,6 +311,11 @@ export const PONTOS_DE_IA: readonly PontoDeIa[] = [
     sintomaDeFalha:
       "A conversa cai sempre no mesmo agente, ou em nenhum — como se os roteadores que você configurou não existissem.",
     registraEm: "llm_calls",
+    decisaoRapida: {
+      primitiva: "choice",
+      oQueOJevFaz:
+        "Lê a última mensagem do cliente, sozinha, e escolhe entre as intenções do seu roteador qual agente deve atender.",
+    },
   },
   {
     id: "stage_classifier",
@@ -298,18 +358,31 @@ export const PONTOS_DE_IA: readonly PontoDeIa[] = [
     sintomaDeFalha:
       "Cliente irritado não é mais escalado para um humano, e a insatisfação só aparece quando ele já sumiu.",
     registraEm: "llm_calls",
+    decisaoRapida: {
+      primitiva: "score",
+      oQueOJevFaz:
+        "Percebe, geralmente em menos de um segundo, se o cliente está irritado — e avisa para passar a conversa a uma pessoa.",
+    },
   },
   {
     id: "followup_classify",
     rotulo: "Ler a resposta ao follow-up",
+    // As saídas são as que a empresa criou no passo "Classificar (IA)", não uma
+    // lista fixa: "aceitou, recusou ou pediu para falar depois" prometia classes
+    // que o fluxo pode nem ter.
     oQueFaz:
-      "Entende se o cliente aceitou, recusou ou pediu para falar depois, e encaminha o fluxo conforme isso.",
+      "Lê a resposta do cliente à mensagem do follow-up e diz em qual das saídas que você criou no fluxo ela se encaixa — o fluxo segue por essa saída.",
     papel: "entender",
     exige: {},
     emissor: "lib/agent-engine/agent/followup-flow-classify.ts",
     sintomaDeFalha:
       "O follow-up trava no mesmo passo: o cliente respondeu, mas o fluxo não segue para lugar nenhum.",
     registraEm: "llm_calls",
+    decisaoRapida: {
+      primitiva: "choice",
+      oQueOJevFaz:
+        "Lê a resposta do cliente à mensagem do follow-up, sozinha, e diz em qual das saídas que você criou no fluxo ela se encaixa.",
+    },
   },
   {
     id: "followup_decide_timing",
@@ -320,6 +393,31 @@ export const PONTOS_DE_IA: readonly PontoDeIa[] = [
     emissor: "lib/agent-engine/agent/followup-flow-classify.ts",
     sintomaDeFalha:
       "As retomadas saem todas no mesmo horário fixo, sem respeitar o ritmo de cada cliente.",
+    registraEm: "llm_calls",
+  },
+
+  {
+    id: "flow_validate",
+    rotulo: "Validar a resposta do fluxo",
+    oQueFaz:
+      "Quando o fluxo está esperando uma resposta, lê a mensagem do cliente com o contexto da conversa e devolve SÓ o dado que deve ser salvo — ou diz que ele não respondeu.",
+    papel: "entender",
+    exige: {},
+    emissor: "lib/agent-engine/agent/flow-validate.ts",
+    sintomaDeFalha:
+      "Dado errado entra no cadastro do cliente (ex.: o modelo grava a resposta na pergunta errada) ou o cliente fica sem a pergunta seguinte.",
+    registraEm: "llm_calls",
+  },
+  {
+    id: "conversion_value_from_conversation",
+    rotulo: "Ler o valor da venda na conversa",
+    oQueFaz:
+      "Quando um negócio vindo de anúncio da Meta é ganho sem valor preenchido, lê a conversa e acha o valor e o produto vendidos, para a compra ser reportada à Meta. Só aceita valor que aparece escrito na conversa.",
+    papel: "entender",
+    exige: { tools: true },
+    emissor: "lib/conversoes/valor-da-conversa.ts",
+    sintomaDeFalha:
+      "A venda vinda de anúncio fica como pendência 'sem valor' em Configurações › Conversões, e a Meta não recebe a compra até alguém preencher o valor do negócio.",
     registraEm: "llm_calls",
   },
 
@@ -335,6 +433,11 @@ export const PONTOS_DE_IA: readonly PontoDeIa[] = [
     sintomaDeFalha:
       "O agente passa a aceitar instruções de estranhos e pode falar em nome da empresa coisas que você nunca autorizou.",
     registraEm: "llm_calls",
+    decisaoRapida: {
+      primitiva: "choice",
+      oQueOJevFaz:
+        "Percebe, na mensagem do cliente, quem tenta enganar o agente para ele fugir das suas regras — e soma esse sinal ao da sua IA de sempre, sem nunca apagá-lo.",
+    },
   },
   {
     id: "promise_semantic",
@@ -433,21 +536,26 @@ export const PONTOS_DE_IA: readonly PontoDeIa[] = [
     emissor: "lib/messaging/media/transcription.ts",
     fixo: {
       razao:
-        "Usa o padrão de transcrição da OpenAI, que é o formato que os serviços do mercado implementam. Aceita apontar para outro serviço compatível — inclusive um rodando na sua própria máquina — mas exige uma chave desse serviço, separada da chave do modelo de conversa.",
-      // ⚠️ O QUE ELE USA DE VERDADE, e por que precisa estar escrito aqui.
+        "Este ponto não tem modelo escolhido no painel: quem ouve o áudio é a escada de transcrição, e ela decide a cada nota de voz. Primeiro o serviço desta instalação (TRANSCRIPTION_API_KEY); na falta dele, a chave OpenAI com o modelo de transcrição de sempre (whisper-1, ou o que TRANSCRIPTION_MODEL trouxer); e quando não há chave OpenAI nenhuma, o modelo de conversa da organização — desde que ele declare a capacidade de áudio, que é como uma organização só com Gemini transcreve. Sem nenhum dos três, o áudio não vira texto, e o motivo aparece aqui. Por isso fixar um provedor aqui apagaria os degraus seguintes.",
+      // ⚠️ POR QUE NÃO HÁ MAIS um par fixo (provider "openai" + "whisper-1")
+      // neste ponto (#2190): o objeto `fixo` vive sem o campo que declarava
+      // esse par.
       //
-      // A tela mostrava `claude-sonnet-5` neste ponto, com "usando o padrão da
-      // organização" — porque um ponto `fixo` percorria a mesma cadeia de
-      // resolução dos pontos de conversa e caía no último degrau. O texto ao
-      // lado dizia "usa o padrão de transcrição da OpenAI", então a mesma tela
-      // afirmava duas coisas incompatíveis sobre o mesmo ponto.
+      // Depois da #2189 quem ouve o áudio é a ESCADA
+      // (`lib/messaging/media/escada-de-transcricao.ts`), e a organização SEM
+      // chave OpenAI transcreve pelo próprio modelo de conversa. O par fixo
+      // continuava anunciando `whisper-1` — e o texto ao lado dizendo "exige
+      // uma chave desse serviço" —, ou seja, a tela apontava um caminho que
+      // ninguém vai usar para uma organização que já está ouvindo o áudio. Dois
+      // caminhos anunciados para o mesmo áudio.
       //
-      // Um modelo de conversa NÃO transcreve áudio. Anunciar um ali é dizer a
-      // quem opera que o áudio está sendo ouvido pelo modelo errado — e mandá-lo
-      // caçar um problema que não existe, ou trocar um modelo que não é o que
-      // faz o trabalho. `lib/messaging/media/transcription.ts` manda para
-      // `/v1/audio/transcriptions` com `whisper-1`.
-      usa: { provider: "openai", modelId: "whisper-1" },
+      // O anúncio certo não cabe num literal: depende de quem chamou. Por isso
+      // o ponto declara `escada: "transcricao"` e o resolvedor devolve o que a
+      // escada decidiu (`entrada.transcricao`); quem roda a escada é a rota do
+      // painel, com a MESMA `decidirTranscricao` do worker. A régua em
+      // `tests/unit/a-tela-e-o-motor-concordam-sobre-imagem.test.ts` compara os
+      // dois lados e reprova a volta de um provider fixo.
+      escada: "transcricao",
     },
     sintomaDeFalha:
       "O cliente manda áudio e o agente responde como se não tivesse recebido nada.",

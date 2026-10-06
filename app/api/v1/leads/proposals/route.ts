@@ -28,7 +28,8 @@ import { roteiaProximasAcoes, type EstadoDoContato } from "@/lib/leads/next-acti
 import { createClient } from "@/lib/supabase/server";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { isServiceRoleConfigured } from "@/lib/audit";
-import { requireAuth, resolveActiveOrg } from "@/lib/auth/server";
+import { requireAuth } from "@/lib/auth/server";
+import { orgAtivaDaApi } from "@/lib/auth/require-role";
 import { nomeDoContato } from "@/lib/contacts/rotulo-do-contato";
 import { traduzir } from "@/lib/i18n/dicionario";
 
@@ -63,7 +64,9 @@ export async function GET(req: NextRequest): Promise<Response> {
   void req;
 
   const user = await requireAuth();
-  const activeOrg = await resolveActiveOrg(user);
+  const ativa = await orgAtivaDaApi(user, requestId);
+  if (!ativa.ok) return ativa.response;
+  const activeOrg = ativa.org;
   if (!activeOrg) {
     return fail("forbidden", traduzir("sem organização ativa", user.idioma), 403, { requestId });
   }
@@ -104,7 +107,7 @@ export async function GET(req: NextRequest): Promise<Response> {
   if (leadIds.length > 0) {
     const { data: leads, error: leadsErr } = await supabase
       .from("crm_leads")
-      .select("id, title, contact_id, crm_stages(name), contacts(name, display_name)")
+      .select("id, title, contact_id, crm_stages!crm_leads_stage_id_fkey(name), contacts(name, display_name)")
       .eq("organization_id", orgId)
       .in("id", leadIds);
     if (leadsErr) return fail("internal", leadsErr.message, 500, { requestId });

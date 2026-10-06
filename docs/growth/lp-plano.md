@@ -364,6 +364,12 @@ Três colunas de apoio:
 
 Sem tabela de planos — não temos planos. Um bloco só, honesto.
 
+> ⚠️ **De quem é esta promessa.** "Não existe cobrança por usuário" e "não temos planos" são
+> promessas **do projeto** sobre o software: nem o mantenedor nem uma versão paga cobram por
+> pessoa. Quem instala e revende pode cobrar os próprios clientes com planos que limitam pessoas —
+> é a instalação dele, não a nossa ([ADR-0004](../adr/0004-cobranca-do-revendedor.md)). Esta seção
+> fala com quem instala para si; não estenda a promessa ao cliente final de um revendedor.
+
 ---
 
 ## 12. FAQ CITÁVEL
@@ -393,9 +399,11 @@ Removidos: **OpenClaw** e **Hermes** — não têm relação com o Deskcomm e di
 
 > **Eyebrow:** Parceiro oficial
 > **Título:** Soberania com IA é na HostGator
-> **Corpo:** Datacenter no Brasil, sem transferência internacional de dados. É onde o DeskcommCRM foi feito para rodar.
+> **Corpo:** Datacenter no Brasil: o CRM guarda os seus dados sem tirá-los do país. É onde o DeskcommCRM foi feito para rodar.
 > **CTA:** Assinar a VPS com desconto da parceria →
 > **Microcopy:** link de parceria — assinar por ele apoia o projeto
+
+⚠️ O corpo dizia "sem transferência internacional de dados", e isso só é inteiro enquanto nenhum provedor de IA estrangeiro estiver ligado: a IA de atendimento manda a conversa ao provedor conectado, e o Jev, quando ligado, manda cada mensagem dos clientes à TypeSafe AI, nos EUA, uma de cada vez e sem o resto da conversa. A ressalva completa está em [`docs/white-label.md`](../white-label.md), "O argumento jurídico que fecha venda no Brasil".
 
 ---
 

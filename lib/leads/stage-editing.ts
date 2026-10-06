@@ -29,6 +29,19 @@ import { rotuloDoPasso, type EtapaDoMapa } from "@/lib/leads/agent-mapping";
 
 /** O que a tela sabe de cada etapa ao editá-la. Inclui as arquivadas — quem filtra é este módulo. */
 export interface EtapaEditavel extends EtapaDoMapa {
+  /**
+   * Probabilidade de ganho, 0–100 (migration 0426), opcional porque as regras
+   * de nome/papel/ordem deste arquivo nunca a leem — quem lê é a previsão.
+   */
+  win_probability?: number | null;
+  /**
+   * Janela de "esfriando" em horas (`crm_stages.expected_duration_hours`), a
+   * coluna que o radar lê (`resolveStageWindow`). `null` = a etapa nunca
+   * configurou e vale o padrão de 24 h/72 h. Opcional pela mesma razão do
+   * campo acima: as regras deste arquivo não a decidem — quem decide é a
+   * validação de 1 a 8760, em `validarJanelaDeEsfriamento`.
+   */
+  expected_duration_hours?: number | null;
   slug: string;
   position: number;
   is_archived: boolean;
@@ -102,6 +115,34 @@ export function validarNomeDeEtapa(
   return { ok: true };
 }
 
+/** A janela de "esfriando" aceita, em horas: de uma hora a um ano. */
+export const JANELA_MIN_H = 1;
+export const JANELA_MAX_H = 8760;
+
+/**
+ * Recusa a janela de esfriamento que o radar não saberia interpretar.
+ *
+ * A coluna é `crm_stages.expected_duration_hours numeric`, SEM CHECK — a
+ * migration que colocaria o `between 1 and 8760` ficou fora deste escopo, então
+ * esta função e o Zod das rotas são a ÚNICA rede antes do banco. Fora da faixa
+ * o problema é real em duas direções: `0` ou negativo faz o radar nunca
+ * esfriar (todo lead eternamente "em dia"), e um número enorme empurra a
+ * janela crítica para anos — alarme que ninguém nunca vê, que é o mesmo
+ * defeito dos alarmes falsos que esta issue veio consertar.
+ *
+ * `null` não passa por aqui: é o valor que LIMPA a configuração e volta ao
+ * padrão de 24 h/72 h, e limpar é sempre legítimo.
+ */
+export function validarJanelaDeEsfriamento(horas: number): Resultado {
+  if (!Number.isInteger(horas) || horas < JANELA_MIN_H || horas > JANELA_MAX_H) {
+    return {
+      ok: false,
+      erro: `A janela de esfriamento vai de ${JANELA_MIN_H} a ${JANELA_MAX_H} horas (uma hora a um ano).`,
+    };
+  }
+  return { ok: true };
+}
+
 // `crm_stages_slug_format`: ^[a-z0-9_-]{2,40}$. Um caractere já viola.
 const SLUG_MIN = 2;
 const SLUG_MAX = 40;
@@ -127,9 +168,9 @@ export function slugDeNome(
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/[^a-z0-9]+/g, "-")
     .slice(0, SLUG_MAX)
-    .replace(/^_+|_+$/g, "");
+    .replace(/^-+|-+$/g, "");
 
   // Nome só de emoji, ou de uma letra só, não vira slug válido — e slug vazio
   // violaria o formato e o índice único de uma vez.
@@ -139,7 +180,7 @@ export function slugDeNome(
   if (!ocupados.has(raiz)) return raiz;
 
   for (let n = 2; ; n++) {
-    const sufixo = `_${n}`;
+    const sufixo = `-${n}`;
     const candidato = raiz.slice(0, SLUG_MAX - sufixo.length) + sufixo;
     if (!ocupados.has(candidato)) return candidato;
   }

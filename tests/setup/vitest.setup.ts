@@ -60,8 +60,9 @@ for (const envFile of [".env", ".env.local"]) {
  * teste tentar usar isto como URL de verdade, a chamada falha alto em vez de
  * bater em algum lugar existente.
  */
+const URL_DO_PLACEHOLDER = "https://test-placeholder.invalid";
 const PLACEHOLDERS: Record<string, string> = {
-  NEXT_PUBLIC_SUPABASE_URL: "https://test-placeholder.invalid",
+  NEXT_PUBLIC_SUPABASE_URL: URL_DO_PLACEHOLDER,
   NEXT_PUBLIC_SUPABASE_ANON_KEY: "test-placeholder-anon-key",
   SUPABASE_SERVICE_ROLE_KEY: "test-placeholder-service-role-key",
 };
@@ -69,7 +70,63 @@ for (const [chave, valor] of Object.entries(PLACEHOLDERS)) {
   process.env[chave] ??= valor;
 }
 
+/**
+ * O placeholder falha NA HORA — sem perguntar ao DNS.
+ *
+ * "Falha alto" (acima) valia para o resultado, não para o RELÓGIO: `.invalid`
+ * reprova, mas só quando o resolvedor responde, e isso é tempo de rede. Quem
+ * chega aqui por um caminho fire-and-forget — `void audit(...)` nos handlers —
+ * não é esperado por teste nenhum: o arquivo termina, e o `console.error` do
+ * `reportAuditFailure` (lib/audit/index.ts) cai depois, às vezes BEM na hora em
+ * que o vitest fecha o canal do worker. Aí a suíte inteira reprova com todos os
+ * arquivos verdes:
+ *
+ *     EnvironmentTeardownError: [vitest-worker]: Closing rpc while
+ *     "onUserConsoleLog" was pending
+ *     This error originated in "tests/unit/desfecho-de-agenda-e-sobre-o-passado.test.ts"
+ *
+ * Medido de 15 a 22/09/2026: 10 runs vermelhos assim, em 8 PRs e 2 pushes da
+ * `main` (ex.: runs 35111447270, 35165421158), sempre no FIM da suíte unitária —
+ * o `verify` que "falha depois de 10 min" sem teste nenhum vermelho.
+ *
+ * Recusar aqui, sem rede, é a mesma resposta que o DNS daria (`TypeError: fetch
+ * failed`), só que decidida no mesmo tique: o trabalho solto termina enquanto o
+ * teste que o disparou ainda está vivo, e não sobra nada em voo no teardown.
+ * Só o host do placeholder é recusado; com `.env` de verdade ele nem é usado.
+ */
+const HOST_DO_PLACEHOLDER = new URL(URL_DO_PLACEHOLDER).host;
+const fetchDoAmbiente = globalThis.fetch;
+globalThis.fetch = async (entrada, init) => {
+  const url = entrada instanceof Request ? entrada.url : String(entrada);
+  if (URL.canParse(url) && new URL(url).host === HOST_DO_PLACEHOLDER) {
+    throw new TypeError("fetch failed", {
+      cause: new Error(
+        `${HOST_DO_PLACEHOLDER} é o placeholder do setup de teste (tests/setup/vitest.setup.ts): nenhum teste unitário fala com um Supabase de verdade`,
+      ),
+    });
+  }
+  return fetchDoAmbiente(entrada, init);
+};
+
 import "@testing-library/jest-dom/vitest";
+
+// Node 25+ expõe `localStorage`/`sessionStorage` nativos que não servem sem
+// `--localstorage-file` (no 26.8 valem `undefined`; no 25.4 são um objeto sem `.clear`),
+// e o jsdom não os sobrescreve: `localStorage.clear()` quebrava ~100 testes. A guarda
+// testa a capacidade, não o tipo, para cobrir os dois. Quando o global nativo não serve,
+// devolve o storage do jsdom do arquivo. Em Node 22 o global já é o do jsdom e este
+// bloco não faz nada.
+const jsdomDoArquivo = (globalThis as { jsdom?: { window: Window } }).jsdom;
+if (jsdomDoArquivo) {
+  for (const nome of ["localStorage", "sessionStorage"] as const) {
+    if (typeof globalThis[nome]?.clear !== "function") {
+      Object.defineProperty(globalThis, nome, {
+        configurable: true,
+        get: () => jsdomDoArquivo.window[nome],
+      });
+    }
+  }
+}
 
 // jsdom não implementa ResizeObserver; Radix (ex.: Switch) usa em layout effects.
 if (typeof globalThis.ResizeObserver === "undefined") {
@@ -107,4 +164,41 @@ if (typeof document !== "undefined") {
     if (vi.isFakeTimers()) return;
     await new Promise((resolver) => setTimeout(resolver, 0));
   });
+}
+
+/**
+ * `URL.createObjectURL` no ambiente jsdom do vitest — melgarafael/DeskcommCRM#1745.
+ *
+ * O `createObjectURL` que o vitest instala no ambiente jsdom passa por
+ * `makeCompatBlob`, que lê o interno do Blob do jsdom pelo primeiro símbolo
+ * próprio da instância. Desde o jsdom 30.1 esse interno é o campo privado
+ * `#impl`, o símbolo não existe mais e a chamada estoura
+ * `Cannot read properties of undefined (reading '_buffer')` — em
+ * `URL.createObjectURL(file)` (AttachmentPreviewDialog) e na conversão de um
+ * `FormData` com `File` no corpo de um `NextRequest`. Upstream:
+ * vitest-dev/vitest#11336; medido aqui: nenhuma release da linha 4 conserta
+ * (4.1.11, a mais nova, ainda quebra).
+ *
+ * A sonda é por CAPACIDADE, não por versão: tenta mesmo usar o duviê do
+ * vitest. Se ele funciona (jsdom 30.0.x, ou o vitest consertar o #11336), o
+ * original fica intocado; se estoura, instala um duviê próprio — o objectUrl
+ * só alimenta `src` de `<img>`/`<video>` dentro do teste, o jsdom nunca teve
+ * blob URL de verdade, e o `revokeObjectURL` vira no-op. O caminho contrário
+ * (continuar dependendo do interno do jsdom) também é internals —
+ * `implForWrapper` — só que dentro do nosso código.
+ */
+const criarObjectURL = URL.createObjectURL;
+if (typeof criarObjectURL === "function") {
+  let funciona = true;
+  try {
+    const urlDeProva = criarObjectURL(new Blob(["prova"], { type: "text/plain" }));
+    URL.revokeObjectURL?.(urlDeProva);
+  } catch {
+    funciona = false;
+  }
+  if (!funciona) {
+    let sequencia = 0;
+    URL.createObjectURL = () => `blob:jsdom-test/${++sequencia}`;
+    URL.revokeObjectURL = () => {};
+  }
 }

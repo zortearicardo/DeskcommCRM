@@ -34,7 +34,10 @@ import { z } from "zod";
 
 import { sendMessageHandler } from "@/app/api/v1/messages/_handler";
 import { openSharedContactConversation } from "@/lib/messaging/open-shared-contact-conversation";
+import { encontrarContatoPorTelefone } from "@/lib/channels/contato-por-telefone";
 import { sendMessageSchema } from "@/lib/schemas/messaging";
+import { depsDoRitmo, registrarEnvioPorToken, segurarEnvioPorToken } from "@/lib/messaging/ritmo-do-envio-por-token";
+import { createAdminClient } from "@/lib/supabase/admin";
 import type { McpToolDefinition } from "../types";
 
 const ENDPOINT_TAG = "mcp:crm_start_conversation_and_send";
@@ -90,6 +93,37 @@ export const crmStartConversationAndSend: McpToolDefinition<typeof inputShape> =
       throw new Error("Informe contact_id ou phone_number.");
     }
 
+    // Abrir conversa com pessoal é escrita para fora da operação (spec 21,
+    // etapa 12): recusa ANTES de abrir — depois de aberta, o `send` recusaria
+    // mas a conversa vazia já teria nascido. Contato novo (telefone sem dono)
+    // nunca é pessoal, então só confere quem já existe.
+    let candidato: string | null = input.contact_id ?? null;
+    if (!candidato && input.phone_number?.trim()) {
+      const achado = await encontrarContatoPorTelefone(
+        ctx.supabase,
+        ctx.organizationId,
+        input.phone_number.trim(),
+      );
+      candidato = achado?.id ?? null;
+    }
+    if (candidato) {
+      const { data: alvo } = await ctx.supabase
+        .from("contacts")
+        .select("is_personal")
+        .eq("organization_id", ctx.organizationId)
+        .eq("id", candidato)
+        .maybeSingle();
+      if ((alvo as { is_personal?: boolean } | null)?.is_personal === true) {
+        return {
+          permitido: false,
+          motivo: "contato_pessoal",
+          mensagem:
+            "este contato foi marcado como pessoal — ele está fora da operação: não abra " +
+            "conversa nem envie nada para ele.",
+        };
+      }
+    }
+
     const requestHash = hashRequest({
       channel_session_id: input.channel_session_id,
       contact_id: input.contact_id,
@@ -114,6 +148,16 @@ export const crmStartConversationAndSend: McpToolDefinition<typeof inputShape> =
         };
       }
     }
+
+    // Freio anti-ban do número (#1491): aplicar ANTES de criar ou reabrir a conversa.
+    // Se o freio segurar o envio por teto diário ou espaçamento, recusa com 429
+    // sem deixar uma conversa vazia pendente no CRM.
+    const ritmo = await depsDoRitmo(createAdminClient());
+    const segurado = await segurarEnvioPorToken(ritmo, {
+      organizationId: ctx.organizationId,
+      channelSessionId: input.channel_session_id,
+      requestId: ctx.requestId,
+    });
 
     // Referencia a mesma origem autorizada que `open-with-contact` usa —
     // fn_service_begin decide reaproveitar a conversa aberta ou criar uma.
@@ -141,6 +185,7 @@ export const crmStartConversationAndSend: McpToolDefinition<typeof inputShape> =
       },
       parsed,
     );
+    await registrarEnvioPorToken(ritmo, ctx.organizationId, segurado, message.status);
 
     const response = {
       contact_id: opened.contact_id,

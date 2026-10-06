@@ -15,13 +15,18 @@
 import { z } from 'zod';
 import type pg from 'pg';
 
+import { loadConversationAgentConfig } from '../../agent/agent-config';
 import { insertInboxItem } from '../../db/repository';
 import type { Logger } from '../../obs/logger';
 import { enqueueJob } from '../../queue/queue';
-import { decidirRajada } from './debounce';
+import { decidirRajada, debounceEfetivo } from './debounce';
 import { avisoDeEventoMorto, IA_QUE_NAO_RESPONDEU } from '@/lib/event-log/aviso-de-evento-morto';
+import { canalDesativado } from '@/lib/channels/desativado';
 import { TIPOS_DERIVAVEIS, DERIVACAO_TERMINADA } from '@/lib/messaging/media/derivable';
+import { haQuemAtendaASessao } from '@/lib/ai/agents/quem-atende-a-sessao';
 import { decidirElegibilidadeDaConversa } from '@/lib/ai/elegibilidade/consulta-pg';
+import { deveCederTurnoAoRetorno } from '@/lib/followup/ceder-turno-ao-retorno';
+import { ehOperante } from '@/lib/organizacao/operante';
 
 const DRAIN_CONSUMER = 'agent-engine';
 
@@ -196,6 +201,45 @@ const TETO_ESPERA_DERIVACAO_MS = 120_000;
 
 type DesfechoEvento = 'processado' | 'adiar';
 
+/**
+ * Janela de rajada EFETIVA para o evento: a configurada na versão do agente
+ * desta conversa (#1856), com o `INBOUND_DEBOUNCE_MS` da instalação como
+ * default e clamp no teto de 60s (`debounceEfetivo`).
+ *
+ * A resolução é a de `loadConversationAgentConfig` — o `active_ai_agent_id` da
+ * conversa quando há dono explícito, senão o agente publicado da sessão. NÃO é
+ * a resolução completa do turno (`resolveTurnAgent`: router, classificador,
+ * campanha): numa conversa que o turno entregaria a outro agente sem torná-lo
+ * dono, vale a janela do agente da sessão (ou a env). Com o campo vazio
+ * (default de toda instalação) o valor vira o da env — regressão zero.
+ *
+ * Falha da consulta NÃO derruba o evento: degrada para a env, como a checagem
+ * de elegibilidade acima. A janela é afinação, não motivo para retry.
+ */
+async function debounceDoEvento(
+  pool: pg.Pool,
+  event: EventRow,
+  p: { conversation_id: string; channel_session_id: string },
+  padraoInstalacao: number,
+  log: Logger,
+): Promise<number> {
+  try {
+    const agentConfig = await loadConversationAgentConfig(
+      pool,
+      event.organization_id,
+      p.conversation_id,
+      p.channel_session_id,
+    );
+    return debounceEfetivo(agentConfig?.inboundDebounceMs ?? null, padraoInstalacao);
+  } catch (err) {
+    log.warn('drain: janela de rajada do agente não resolveu — usando a da instalação', {
+      event_id: event.id,
+      error: (err instanceof Error ? err.message : String(err)).slice(0, 160),
+    });
+    return padraoInstalacao;
+  }
+}
+
 async function processEvent(
   pool: pg.Pool,
   event: EventRow,
@@ -213,15 +257,37 @@ async function processEvent(
   }
   const p = parsed.data;
 
-  // Spec 14: org em modo 'external' tem agente EXTERNO como dono da conversa —
-  // o engine não responde por cima. Evento é consumido (done) sem job.
-  const { rows: modeRows } = await pool.query<{ mode: string | null }>(
-    `select settings->>'ai_dispatch_mode' as mode from organizations where id = $1`,
+  // Organização parada (suspensa, redigida, arquivada) não gera turno: o evento
+  // é consumido sem job. Vai na MESMA consulta do modo externo — uma ida ao banco
+  // por evento, não duas — e vem ANTES do `canAssist`, que desliga o gate.
+  const { rows: modeRows } = await pool.query<{ mode: string | null; status: string | null }>(
+    `select settings->>'ai_dispatch_mode' as mode, status from organizations where id = $1`,
     [event.organization_id],
   );
+  if (!ehOperante(modeRows[0]?.status)) {
+    log.info('drain: organização não operante — evento consumido sem job', { event_id: event.id });
+    return 'processado';
+  }
+  // Spec 14: org em modo 'external' tem agente EXTERNO como dono da conversa —
+  // o engine não responde por cima. Evento é consumido (done) sem job.
   if (modeRows[0]?.mode === 'external') {
     log.info('drain: org em modo external (spec 14) — evento pulado', { event_id: event.id });
     return 'processado';
+  }
+
+  // Canal desativado pelo operador: defesa em profundidade do `pedirDespachoDoAgente`
+  // (que já não emite para desativado). Evento antigo em voo ou emit direto cai
+  // aqui e é consumido sem job, antes de qualquer custo.
+  if (p.channel_session_id) {
+    const { rows: canalRows } = await pool.query<{ metadata: unknown }>(
+      'select metadata from channel_sessions where organization_id = $1 and id = $2',
+      [event.organization_id, p.channel_session_id],
+    );
+    const meta = canalRows[0]?.metadata;
+    if (canalDesativado(meta)) {
+      log.info('drain: canal desativado — evento consumido sem job', { event_id: event.id });
+      return 'processado';
+    }
   }
 
   // Grupos: skip, sem exceção (regra dura nº 12).
@@ -257,51 +323,12 @@ async function processEvent(
   // EXISTÊNCIA da linha deixava o portão aberto para um roteador cujos membros
   // foram todos pausados — exatamente o caso que o parágrafo acima diz estar
   // cobrindo, entrando pela outra porta.
-  const { rows: capacidade } = await pool.query<{
-    tem_agente: boolean;
-    tem_roteador: boolean;
-  }>(
-    `select
-       exists(
-         select 1 from ai_agents a
-         join ai_agent_versions v on v.id = a.published_version_id
-         where a.organization_id = $1 and a.archived_at is null
-           and v.status = 'published' and v.channel_session_id = $2
-       ) as tem_agente,
-       exists(
-         select 1 from ai_routers r
-         where r.organization_id = $1 and r.is_active
-           and r.channel_session_id = $2
-           and (
-             -- O fallback e os membros contam pelo que PODEM EXECUTAR, não por
-             -- existirem. A versão anterior media fallback_agent_id is not null
-             -- e a existência de LINHA em ai_router_members — e as duas
-             -- sobrevivem à pausa do agente, que só limpa published_version_id.
-             -- Um roteador cujos membros foram todos pausados continuava
-             -- abrindo o portão: a organização pagava o classificador e o turno
-             -- inteiro por mensagem recebida, para responder pelo genérico.
-             -- O predicado aqui é o MESMO que loadConversationAgentConfigById
-             -- aplica na hora de executar (agent-config.ts) — é o que garante
-             -- que o portão não promete um agente que o resolvedor vai recusar.
-             exists (
-               select 1 from ai_agents fa
-               join ai_agent_versions fv on fv.id = fa.published_version_id
-               where fa.id = r.fallback_agent_id and fa.organization_id = $1
-                 and fa.archived_at is null and fv.status = 'published'
-             )
-             or exists (
-               select 1 from ai_router_members m
-               join ai_agents ma on ma.id = m.agent_id
-               join ai_agent_versions mv on mv.id = ma.published_version_id
-               where m.router_id = r.id and ma.organization_id = $1
-                 and ma.archived_at is null and mv.status = 'published'
-             )
-           )
-       ) as tem_roteador`,
-    [event.organization_id, p.channel_session_id],
-  );
-  const cap = capacidade[0];
-  if (cap !== undefined && !cap.tem_agente && !cap.tem_roteador) {
+  //
+  // A pergunta mora em `haQuemAtendaASessao` porque o worker de clima faz a
+  // MESMA antes de perguntar ao Jev pelos pedidos do cliente: ele só conta um
+  // pedido que a regra de hoje deixou passar onde este turno rodaria.
+  const haQuem = await haQuemAtendaASessao(pool, event.organization_id, p.channel_session_id);
+  if (haQuem === false) {
     log.info('drain: nenhum agente publicado para a sessão — turno pulado (sem gasto)', {
       event_id: event.id,
       channel_session_id: p.channel_session_id,
@@ -337,6 +364,23 @@ async function processEvent(
       event_id: event.id,
       inbound_message_id: p.inbound_message_id,
       ultima_inbound_id: ultimaInbound[0].id,
+    });
+    return 'processado';
+  }
+
+  // UMA VOZ: se o gatilho "cliente voltou" enrollaria neste inbound, o LLM
+  // não responde por cima. Fail-open dentro do helper — consulta falha = turno segue.
+  if (
+    await deveCederTurnoAoRetorno(pool, {
+      organizationId: event.organization_id,
+      contactId: p.contact_id,
+      conversationId: p.conversation_id,
+      messageId: p.inbound_message_id,
+    })
+  ) {
+    log.info('drain: turno cedido ao follow-up de retorno — inbound_turn pulado', {
+      event_id: event.id,
+      contact_id: p.contact_id,
     });
     return 'processado';
   }
@@ -396,32 +440,65 @@ async function processEvent(
   // baixado e transcrito — e o cliente recebia "recebi seu áudio, mas não
   // consigo ouvi-lo" segundos ANTES de a transcrição ficar pronta. Medido nesta
   // VPS: dispatch às 20:24:22, derivação só pedida às 20:25:03.
-  const { rows: msgRows } = await pool.query<{
+  //
+  // ─── A espera olha a CONVERSA, não a mensagem que disparou o evento ────────
+  //
+  // Antes olhava só `p.inbound_message_id`. Quando o cliente manda a FOTO e,
+  // logo depois, a pergunta em TEXTO ("isso é de vocês?"), o turno dispara pelo
+  // TEXTO — que não é derivável — e seguia sem esperar a visão da foto. O
+  // cliente recebia "me conta o que aparece nela?" sobre uma foto cujo texto
+  // derivado o próprio sistema terminou de gerar 3s depois. Medido nesta VPS,
+  // 24/09/2026: foto 13:28:16 · texto 13:28:19 · turno enfileirado 13:28:28 ·
+  // derivação concluída 13:28:35.
+  //
+  // O caso que isso quebra é o mais comum de todos: o cliente manda o
+  // COMPROVANTE e escreve "já paguei, e vocês estão me cobrando". A evidência e
+  // a alegação chegam em mensagens separadas, e o turno precisa das duas.
+  //
+  // A âncora do teto passou a ser a hora DA MÍDIA, não a do evento: é a idade
+  // da derivação que diz se ainda vale esperar. Mídia antiga e travada não segura
+  // o turno para sempre — sai do teto e o turno segue com o marcador `[tipo]`.
+  //
+  // E a hora da mídia é `created_at` — quando ELA CHEGOU A NÓS —, nunca
+  // `sent_at`. No inbound, `sent_at` é o timestamp do WhatsApp, o relógio do
+  // aparelho (a ingestão do canal, `dataDoTimestamp(p.timestamp)`): uma foto
+  // entregue com atraso (aparelho offline, canal reconectando) nasceria "além do
+  // teto" e o turno seguiria sem esperar a leitura que acabou de começar.
+  //
+  // `media_url is not null` é a pré-condição de TODA a esteira: sem ela o
+  // `media.persist_requested` nem é emitido, a derivação nunca é pedida e o
+  // status fica null para sempre — esperar por ela só atrasaria a resposta.
+  const { rows: midias } = await pool.query<{
     type: string;
     media_derived_status: string | null;
+    quando: string;
   }>(
-    `select type, media_derived_status from messages
-     where organization_id = $1 and id = $2`,
-    [event.organization_id, p.inbound_message_id],
+    `select type, media_derived_status, created_at as quando
+       from messages
+      where organization_id = $1
+        and conversation_id = $2
+        and direction = 'inbound'
+        and type = any($3::text[])
+        and media_url is not null
+      order by created_at desc
+      limit 20`,
+    [event.organization_id, p.conversation_id, [...TIPOS_DERIVAVEIS]],
   );
-  const msg = msgRows[0];
-  if (
-    msg !== undefined &&
-    TIPOS_DERIVAVEIS.has(msg.type) &&
-    !DERIVACAO_TERMINADA.has(msg.media_derived_status ?? '')
-  ) {
-    const esperandoHa = Date.now() - new Date(event.created_at).getTime();
+  // A mais RECENTE que ainda não terminou: é ela que o turno não pode perder.
+  const midia = midias.find((m) => !DERIVACAO_TERMINADA.has(m.media_derived_status ?? ''));
+  if (midia !== undefined) {
+    const esperandoHa = Date.now() - new Date(midia.quando).getTime();
     if (esperandoHa < TETO_ESPERA_DERIVACAO_MS) {
       log.info('drain: mídia ainda sendo transcrita — turno adiado', {
         event_id: event.id,
-        tipo: msg.type,
+        tipo: midia.type,
         esperando_ha_ms: esperandoHa,
       });
       return 'adiar';
     }
     log.warn('drain: derivação não concluiu no teto — seguindo sem o texto', {
       event_id: event.id,
-      tipo: msg.type,
+      tipo: midia.type,
       esperando_ha_ms: esperandoHa,
     });
   }
@@ -434,7 +511,7 @@ async function processEvent(
   const rajada = await decidirRajada(
     pool,
     { organizationId: event.organization_id, contactId: p.contact_id },
-    knobs.debounceMs,
+    await debounceDoEvento(pool, event, p, knobs.debounceMs, log),
   );
   if (rajada.tipo === 'coalescido') {
     log.info('drain: rajada coalescida em job pendente', {

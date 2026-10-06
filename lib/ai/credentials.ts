@@ -9,12 +9,19 @@
 import { byteaToBuffer, decryptKey } from "@/lib/crypto/aes_gcm";
 import { createAdminClient } from "@/lib/supabase/admin";
 
-import type { Provider } from "./provider-validators";
+import { PROVEDOR_POR_ASSINATURA, type ProvedorComChave } from "@/lib/ai/pontos/provedores";
 
 export interface LoadedCredential {
   apiKey: string;
-  provider: Provider;
+  provider: ProvedorComChave;
   label: string;
+  /**
+   * O endereço da API quando a credencial É de provedor personalizado (#1642);
+   * `null` nos nativos, cujo endpoint é intrínseco. Lido numa segunda consulta
+   * e só para `custom`, para que uma clone sem a migration 0413 continue
+   * carregando as quatro chave nativas que já carrega hoje.
+   */
+  baseUrl: string | null;
 }
 
 export class CredentialUnavailableError extends Error {
@@ -34,7 +41,7 @@ export class CredentialUnavailableError extends Error {
 interface CredentialRow {
   id: string;
   organization_id: string;
-  provider: Provider;
+  provider: ProvedorComChave;
   label: string;
   api_key_encrypted: unknown;
   api_key_iv: unknown;
@@ -76,6 +83,18 @@ export async function loadCredential(
   if (!data.is_active) {
     throw new CredentialUnavailableError("inactive", "credential desativada");
   }
+  // O RAMO DO LOGIN POR ASSINATURA (#1672, item 9): esta linha guarda um PAR
+  // DE TOKENOS, não uma chave de API. Decifrar aqui e devolver como `apiKey`
+  // mandaria o JSON dos tokens para o provedor no lugar de uma chave — é
+  // exatamente o que o caminho por `credentialId` de `resolveOrgLlmConfig`
+  // fazia. Nenhum leitor GENÉRICO usa esta linha: quem lê tokens é
+  // `lib/ai/credenciais/login-codex.ts`, que ainda consulta o módulo.
+  if (data.provider === PROVEDOR_POR_ASSINATURA) {
+    throw new CredentialUnavailableError(
+      "not_found",
+      "credencial de login por assinatura: fora do caminho genérico de chave",
+    );
+  }
   if (!data.validated_at) {
     throw new CredentialUnavailableError(
       "not_validated",
@@ -97,5 +116,18 @@ export async function loadCredential(
     );
   }
 
-  return { apiKey, provider: data.provider, label: data.label };
+  let baseUrl: string | null = null;
+  if (data.provider === "custom") {
+    const { data: endereco } = await admin
+      .from("ai_provider_credentials")
+      .select("base_url")
+      .eq("id", id)
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+    // Coluna ausente (clone atrás da 0413) devolve `error`, não lança: fica
+    // `null` e `buildModel` recusa a chamada dizendo qual endereço falta.
+    baseUrl = typeof endereco?.base_url === "string" ? endereco.base_url : null;
+  }
+
+  return { apiKey, provider: data.provider, label: data.label, baseUrl };
 }

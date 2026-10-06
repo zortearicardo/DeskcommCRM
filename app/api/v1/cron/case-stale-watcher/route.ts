@@ -51,11 +51,11 @@ import type { NextRequest } from "next/server";
 
 import { ok, fail } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
-import { env } from "@/lib/env";
 import { traduzir } from "@/lib/i18n/dicionario";
 import { normalizarIdioma, type Idioma } from "@/lib/i18n/idiomas";
 import { logger } from "@/lib/logger";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { autorizaCron } from "@/lib/auth/cron-auth";
 
 export const dynamic = "force-dynamic";
 
@@ -88,6 +88,8 @@ function comoFaz(horas: number): string {
  * chave nenhuma no dicionário e devolveria o português para quem escolheu
  * espanhol, em silêncio, que é o modo de falha de i18n que esta casa já pagou.
  * Aqui o número fica fora da tradução e só as palavras passam por `t()`.
+ * O "há" é uma chave com lacuna (`há {tempo}`), e não um pedaço solto, porque
+ * a ordem é da língua: o inglês põe o marcador depois ("3 days ago").
  *
  * ⚠️ O braço dos CASOS continua usando `comoFaz` e continua saindo em português
  * para toda organização. É dívida ANTERIOR a esta onda e está declarada, não
@@ -96,18 +98,15 @@ function comoFaz(horas: number): string {
  */
 function esperaEmPalavras(horas: number, t: (texto: string) => string): string {
   const dias = Math.floor(horas / 24);
-  if (dias >= 1) return `${t("há")} ${dias} ${dias === 1 ? t("dia") : t("dias")}`;
+  if (dias >= 1) return t("há {tempo}").replace("{tempo}", `${dias} ${dias === 1 ? t("dia") : t("dias")}`);
   const h = Math.max(1, Math.round(horas));
-  return `${t("há")} ${h} ${h === 1 ? t("hora") : t("horas")}`;
+  return t("há {tempo}").replace("{tempo}", `${h} ${h === 1 ? t("hora") : t("horas")}`);
 }
 
 async function handle(req: NextRequest): Promise<Response> {
   const requestId = randomUUID();
 
-  const auth = req.headers.get("authorization") ?? "";
-  const fornecido = auth.startsWith("Bearer ") ? auth.slice("Bearer ".length).trim() : "";
-  const aceitos = [env.INTERNAL_CRON_SECRET, env.INTERNAL_SECRET].filter(Boolean);
-  if (aceitos.length === 0 || !fornecido || !aceitos.includes(fornecido)) {
+  if (!autorizaCron(req)) {
     return fail("forbidden", "Cron secret missing or invalid.", 403, { requestId });
   }
 

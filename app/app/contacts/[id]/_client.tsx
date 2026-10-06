@@ -5,14 +5,30 @@ import { useLocaleDeData } from "@/hooks/i18n/useLocaleDeData";
 import { useT } from "@/hooks/i18n/useT";
 import { useState } from "react";
 import { format } from "date-fns";
-import { ShieldCheck, PencilSimple } from "@/lib/ui/icons";
+import { ShieldCheck, PencilSimple, LockOpen } from "@/lib/ui/icons";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Card } from "@/components/ui/card";
 import { ChipDeEtiqueta } from "@/components/tags/ChipDeEtiqueta";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "@/components/ui/alert-dialog";
 import { Skeleton } from "@/components/ui/skeleton";
 import { useContact } from "@/hooks/contacts/useContact";
+import { useUnblockContact } from "@/hooks/contacts/useUnblockContact";
+import {
+  useMarkPersonalContact,
+  useUnmarkPersonalContact,
+} from "@/hooks/contacts/usePersonalContact";
 import { useHierarquiaDoAnuncio } from "@/hooks/contacts/useHierarquiaDoAnuncio";
 import { useAuth } from "@/hooks/auth/AuthProvider";
 import { useDefaultPipeline } from "@/hooks/pipelines/useDefaultPipeline";
@@ -22,6 +38,7 @@ import { TimelineView } from "@/components/contacts/TimelineView";
 import { EditContactDialog } from "@/components/contacts/EditContactDialog";
 import { AnonymizeDialog } from "@/components/contacts/AnonymizeDialog";
 import { PropostasDeDado } from "@/components/contacts/PropostasDeDado";
+import { RoteirosDoContato } from "@/components/contacts/RoteirosDoContato";
 import { ConversaNoDossie } from "@/components/kanban/ConversaNoDossie";
 import { rotuloDoContato } from "@/lib/contacts/rotulo-do-contato";
 import { origemDoContato } from "@/lib/leads/origem-do-contato";
@@ -61,6 +78,14 @@ export function ContactDetailClient({ contactId }: Props) {
   const pipelineQuery = useDefaultPipeline(Boolean(activeOrg));
   const [editOpen, setEditOpen] = useState(false);
   const [anonOpen, setAnonOpen] = useState(false);
+  // Desfazer o descadastro é o override da regra W-02 — só admin, e auditado.
+  // O hook fica ANTES dos early returns: chamá-lo depois mudaria a ordem dos
+  // hooks entre renderizações e o React reprova.
+  const desbloquear = useUnblockContact(contactId);
+  // Marcar/desmarcar pessoal (spec 21, etapa 15): os hooks ficam aqui pelo
+  // mesmo motivo do `desbloquear` acima.
+  const marcarPessoal = useMarkPersonalContact(contactId);
+  const desmarcarPessoal = useUnmarkPersonalContact(contactId);
 
   /*
     Pede o nome da campanha SÓ quando há um anúncio e ainda não há nome.
@@ -99,6 +124,13 @@ export function ContactDetailClient({ contactId }: Props) {
   const contact = q.data.data;
   const isAdmin =
     (user.is_platform_admin && !user.support) || (activeOrg && ROLE_RANK[activeOrg.role] >= ROLE_RANK.admin);
+  // Gerente e dono marcam/desmarcam pessoal (spec 21, decisão 1, D3) — e este
+  // gate fica LADO A LADO com o `isAdmin` do desbloquear, cada um com seu
+  // motivo: desfazer descadastro reabre um canal que o cliente fechou (só
+  // admin, LGPD); pessoal é decisão operacional (gerente pode).
+  const podeMarcarPessoal =
+    (user.is_platform_admin && !user.support) ||
+    (activeOrg && ROLE_RANK[activeOrg.role] >= ROLE_RANK.manager);
 
   // Uma decisão, um lugar (lib/contacts/rotulo-do-contato.ts). Esta tela era
   // uma das DUAS que ignoravam o telefone: contato com número e sem nome
@@ -152,11 +184,97 @@ export function ContactDetailClient({ contactId }: Props) {
               <ChipDeEtiqueta key={t} tag={t} />
             ))}
             {contact.is_blocked && <Badge variant="warning">{t("Bloqueado")}</Badge>}
+            {/* Selo lido da COLUNA, nunca da etiqueta (critério 5): editar
+                etiquetas não apaga o selo — mesma regra do "Bloqueado" acima. */}
+            {contact.is_personal && <Badge variant="secondary">{t("Pessoal")}</Badge>}
             {contact.is_anonymized && <Badge variant="destructive">{t("Anonimizado")}</Badge>}
           </div>
         </div>
         {!contact.is_anonymized && user.support?.access_mode !== "support_readonly" && (
-          <div className="flex shrink-0 items-center gap-2">
+          <div className="flex shrink-0 flex-wrap items-center gap-2">
+            {/* O CAMINHO DE VOLTA do descadastro. Sem ele, o contato que pediu
+                para sair — ou que caiu num falso positivo — ficava preso para
+                sempre: `before-send` recusa todo envio, o funil não cria lead,
+                o follow-up não retoma. A regra W-02 previu o override
+                ("Tenant admin pode desbloquear manualmente; ação auditada") e o
+                produto não tinha porta nenhuma para exercê-lo.
+
+                Só ADMIN, como a regra nomeia: desfazer um pedido de descadastro
+                não é editar cadastro, é reabrir um canal que o cliente fechou —
+                e quem clica responde pela decisão. */}
+            {/* Confirmação antes do clique: nenhum caminho do produto bloqueia
+                de novo à mão (o único escritor de is_blocked=true é o STOP do
+                próprio cliente, em lib/channels/pos-entrada.ts), então um clique
+                errado ao lado do "Editar" reabriria um canal que só o cliente
+                consegue fechar outra vez. */}
+            {contact.is_blocked && isAdmin && (
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button variant="outline" disabled={desbloquear.isPending} className="shrink-0">
+                    <LockOpen size={16} weight="bold" aria-hidden />
+                    <span>{t("Desbloquear")}</span>
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>{t("Desbloquear este contato?")}</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      {t("Este contato pediu para não receber mais mensagens. Desbloquear volta a permitir campanhas, follow-ups e respostas da IA para ele, e a ação fica registrada na auditoria em seu nome.")}
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>{t("Cancelar")}</AlertDialogCancel>
+                    <AlertDialogAction onClick={() => desbloquear.mutate()}>
+                      {t("Desbloquear")}
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            )}
+            {/* PESSOAL (spec 21, etapa 15): gerente marca e desmarca; sem
+                exceção de envio — quem é pessoal não recebe por nenhum caminho.
+                Marcar confirma (esconde da operação); desmarcar é direto. */}
+            {!contact.is_personal && podeMarcarPessoal && (
+              <AlertDialog>
+                <AlertDialogTrigger asChild>
+                  <Button
+                    variant="outline"
+                    disabled={marcarPessoal.isPending}
+                    className="shrink-0"
+                    data-testid="marcar-pessoal"
+                  >
+                    <span>{t("Marcar como pessoal")}</span>
+                  </Button>
+                </AlertDialogTrigger>
+                <AlertDialogContent>
+                  <AlertDialogHeader>
+                    <AlertDialogTitle>{t("Marcar este contato como pessoal?")}</AlertDialogTitle>
+                    <AlertDialogDescription>
+                      {t("O contato sai da operação: conversas fecham, IA, follow-ups, campanha e envios param. O histórico continua no banco e volta à vista ao desmarcar; follow-ups e campanhas cancelados não voltam.")}
+                    </AlertDialogDescription>
+                  </AlertDialogHeader>
+                  <AlertDialogFooter>
+                    <AlertDialogCancel>{t("Cancelar")}</AlertDialogCancel>
+                    <AlertDialogAction onClick={() => marcarPessoal.mutate()}>
+                      {t("Marcar como pessoal")}
+                    </AlertDialogAction>
+                  </AlertDialogFooter>
+                </AlertDialogContent>
+              </AlertDialog>
+            )}
+            {contact.is_personal && podeMarcarPessoal && (
+              <Button
+                variant="outline"
+                disabled={desmarcarPessoal.isPending}
+                className="shrink-0"
+                data-testid="desmarcar-pessoal"
+                onClick={() => desmarcarPessoal.mutate()}
+              >
+                <span>
+                  {desmarcarPessoal.isPending ? t("Desmarcando...") : t("Desmarcar pessoal")}
+                </span>
+              </Button>
+            )}
             <DialButton contactId={contactId} hasPhone={!!contact.phone_number} />
             <Button variant="outline" onClick={() => setEditOpen(true)} className="shrink-0">
               <PencilSimple size={16} weight="bold" aria-hidden />
@@ -206,6 +324,22 @@ export function ContactDetailClient({ contactId }: Props) {
                 <dt className="text-xs uppercase text-muted-foreground">{t("Telefone")}</dt>
                 <dd className="mt-1">
                   {contact.phone_number ? phoneForDisplay(contact.phone_number) : "—"}
+                </dd>
+              </div>
+              {/*
+                A data gravada pelo "Editar contato" (e pela proposta aprovada),
+                enxergada aqui — é ela que o cron `contact-birthdays` lê para
+                emitir `contact.birthday`. A string vira `dd/MM/yyyy` PELOS
+                PEDAÇOS: `new Date("1990-09-14")` nasce à meia-noite em UTC, e
+                `format` no fuso da tela (UTC-3) devolveria 13/09 — o
+                aniversário de ontem para quem olha.
+              */}
+              <div>
+                <dt className="text-xs uppercase text-muted-foreground">
+                  {t("Data de nascimento")}
+                </dt>
+                <dd className="mt-1">
+                  {contact.birthdate ? contact.birthdate.split("-").reverse().join("/") : "—"}
                 </dd>
               </div>
               {/*
@@ -279,6 +413,9 @@ export function ContactDetailClient({ contactId }: Props) {
               </div>
             </dl>
           </Card>
+          <div className="mt-4">
+            <RoteirosDoContato contactId={contactId} />
+          </div>
         </TabsContent>
 
         <TabsContent value="timeline" className="mt-4">

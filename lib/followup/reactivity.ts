@@ -53,6 +53,7 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 
 import type { EventRow } from "@/lib/event-log/dispatcher";
+import { inboundEhDestaPergunta } from "@/lib/followup/aplicar-inbound";
 import type { EnrollmentPatch } from "./engine";
 import { triggerConfigSchema } from "./api-schemas";
 import type { EnrollmentOutcome, EnrollmentStatus } from "./node-handlers";
@@ -81,7 +82,7 @@ export const LIVE_STATUSES: readonly EnrollmentStatus[] = ["active", "waiting_re
  * dias que sobrevivesse ao "pare de me mandar mensagem" voltaria a falar com
  * quem pediu silêncio — um mês depois, quando ninguém mais lembra por quê.
  */
-const STATUS_ALCANCADOS_PELO_OPT_OUT: readonly EnrollmentStatus[] = [...LIVE_STATUSES, "dormente"];
+const STATUS_ALCANCADOS_PELO_OPT_OUT: readonly EnrollmentStatus[] = [...LIVE_STATUSES, "dormente", "coletando"];
 
 export interface LiveEnrollmentRef {
   id: string;
@@ -92,6 +93,9 @@ export interface LiveEnrollmentRef {
   handoff_policy: "pause" | "cancel" | "allow";
   /** jsonb bruto do pointer — parseado defensivamente aqui (safeParse, default false). */
   trigger_config: unknown;
+  /** Instante em que o nó estacionou. Sem isto o inbound de uma pergunta
+   *  anterior acorda a espera seguinte (ALWAYS → menu de novo). */
+  updated_at?: string;
 }
 
 /** Interface estreita de DB (mesma doutrina de `AdminClient`/`TurnBridgeAdminClient`
@@ -100,6 +104,15 @@ export interface LiveEnrollmentRef {
 export interface ReactivityAdminClient {
   loadConversationContactId(orgId: string, conversationId: string): Promise<string | null>;
   loadContactBlocked(orgId: string, contactId: string): Promise<boolean>;
+  /**
+   * Spec 21 (caminho 4): o inbound de pessoal cancela tudo, como o STOP.
+   *
+   * OPCIONAL de propósito: a interface tem falsos em `tests/unit` e em
+   * `tests/invariants` (congelado) que implementam só o que medem — exigir
+   * quebraria todos. A produção implementa (ver
+   * `createSupabaseReactivityClient`); ausente lê-se como "não é pessoal".
+   */
+  loadContactPersonal?(orgId: string, contactId: string): Promise<boolean>;
   /**
    * `statuses` existe só para o ramo de opt-out, que precisa alcançar o
    * `dormente`. As demais reações usam o default e seguem sem enxergá-lo — em
@@ -221,6 +234,12 @@ async function reactToInbound(
   if (!contactId) return { matched: false, reacted: 0 };
 
   const isBlocked = await db.loadContactBlocked(row.organization_id, contactId);
+  // Contato pessoal (spec 21, caminho 4): trata igual ao bloqueio — cancela
+  // TUDO que está vivo, sem exceção de status. O motivo próprio (`pessoal`,
+  // nunca `stop_keyword`) é o que distingue na auditoria; o `outcome`
+  // reaproveita `opted_out` porque o CHECK da coluna é fechado (mesma decisão
+  // da rota de marcar, etapa 4).
+  const isPersonal = (await db.loadContactPersonal?.(row.organization_id, contactId)) ?? false;
   // Carrega JÁ com o dormente: o ramo de opt-out abaixo precisa alcançá-lo, e
   // uma segunda consulta só para o caso bloqueado pagaria uma ida ao banco em
   // toda mensagem recebida da instalação para servir a minoria.
@@ -229,6 +248,11 @@ async function reactToInbound(
     contactId,
     STATUS_ALCANCADOS_PELO_OPT_OUT,
   );
+
+  if (isPersonal) {
+    const reacted = await cancelAll(db, row.organization_id, row.id, live, "opted_out", "pessoal", "reactivity_personal", clock);
+    return { matched: true, reacted };
+  }
 
   if (isBlocked) {
     // STOP/opt-out (a regex já rodou em lib/waha/ingest.ts e setou is_blocked
@@ -290,10 +314,17 @@ async function reactToInbound(
 
 async function acordarPorInbound(
   db: ReactivityAdminClient,
-  clock: () => Date,
+  _clock: () => Date,
   row: EventRow,
   e: LiveEnrollmentRef,
 ): Promise<boolean> {
+  // A mensagem que acabou de avançar o nó (e estacionou uma espera NOVA)
+  // não acorda essa espera. Sem `created_at`/`sent_at` falha aberto: o
+  // kick sintético ainda precisa acordar a espera que já existia.
+  const enviadaEm = strOrNull(row.payload.sent_at) ?? row.created_at ?? null;
+  if (enviadaEm && e.updated_at && !inboundEhDestaPergunta(enviadaEm, e.updated_at)) {
+    return false;
+  }
   const wakeKey = `${e.current_node_id}:${e.steps_taken}:wake`;
   const agora = await db.agoraNoBanco();
   return applyStep(
@@ -303,7 +334,10 @@ async function acordarPorInbound(
     wakeKey,
     "inbound_woke",
     {},
-    { next_eval_at: agora, updated_at: clock().toISOString() },
+    // Não toca `updated_at`: o piso do inbound da pergunta é o instante em que
+    // o nó estacionou. Regravar agora faria a mensagem que acordou a espera
+    // parecer anterior à pergunta (`enviadaEm >= updated_at` falha).
+    { next_eval_at: agora },
   );
 }
 
@@ -451,11 +485,21 @@ export function createSupabaseReactivityClient(admin: SupabaseClient): Reactivit
       if (error) throw new Error(error.message);
       return data?.is_blocked ?? false;
     },
+    async loadContactPersonal(orgId, contactId) {
+      const { data, error } = await admin
+        .from("contacts")
+        .select("is_personal")
+        .eq("id", contactId)
+        .eq("organization_id", orgId)
+        .maybeSingle();
+      if (error) throw new Error(error.message);
+      return (data as { is_personal?: boolean } | null)?.is_personal ?? false;
+    },
     async loadLiveEnrollmentsForContact(orgId, contactId, statuses = LIVE_STATUSES) {
       const ids = await idsDoContatoEGemeos(admin, orgId, contactId);
       const { data: enrollments, error } = await admin
         .from("followup_enrollments")
-        .select("id, status, current_node_id, steps_taken, pointer_id")
+        .select("id, status, current_node_id, steps_taken, pointer_id, updated_at")
         .eq("organization_id", orgId)
         .in("contact_id", ids)
         .in("status", statuses);
@@ -481,6 +525,7 @@ export function createSupabaseReactivityClient(admin: SupabaseClient): Reactivit
           pointer_id: e.pointer_id,
           handoff_policy: (p?.handoff_policy as LiveEnrollmentRef["handoff_policy"]) ?? "pause",
           trigger_config: p?.trigger_config ?? null,
+          updated_at: typeof e.updated_at === "string" ? e.updated_at : undefined,
         };
       });
     },

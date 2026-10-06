@@ -29,6 +29,9 @@ import type { ApiSuccess } from "@/lib/api/wrappers";
 import type { Contact } from "@/lib/types/contacts";
 import { NewContactDialog } from "@/components/contacts/NewContactDialog";
 
+vi.mock("@/hooks/auth/AuthProvider", () => ({
+  useActiveOrg: () => ({ currency: "BRL", country: null }),
+}));
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }));
 vi.mock("@/hooks/i18n/useT", () => ({ useT: () => (s: string) => s }));
 vi.mock("@/components/feedback/ApiErrorToast", () => ({ showApiError: vi.fn() }));
@@ -44,6 +47,7 @@ const CONTATO = {
   cpf_hash: null,
   birthdate: null,
   is_blocked: false,
+  is_personal: false,
   blocked_reason: null,
   is_anonymized: false,
   anonymized_at: null,

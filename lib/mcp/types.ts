@@ -15,6 +15,30 @@ import type { Role } from "@/lib/auth/types";
 export interface McpContext {
   /** Somente o runtime in-process fornece o job original, nunca o cliente MCP. */
   meetingBooking?: MeetingBookingContext;
+  /** Chave `Idempotency-Key` da requisição MCP externa, quando enviada. */
+  idempotencyKey?: string;
+  /** Job estável do runtime in-process; nunca vem dos argumentos da tool. */
+  sourceJobId?: string;
+  /**
+   * O CONTATO que este turno atende — contexto de CONFIANÇA do handler.
+   *
+   * Mesmo status de `sourceJobId`: nasce do lado de quem monta o turno e NUNCA
+   * vem dos argumentos da tool — o modelo não escreve este campo nem tem como
+   * alcançá-lo. `lib/ai/runtime/tools.ts` o injeta na chamada do handler, que é
+   * o único ponto que tem `input.contatoDoTurno`, para valer para todo chamador
+   * de `pickToolsFromMcp`.
+   *
+   * Ausente nos ingressos de fora do turno (rota HTTP, MCP externo) — e a
+   * ausência é o que mantém o comportamento deles intacto. O Operador NÃO está
+   * entre eles: `operator-turn.ts` monta o turno com `contactId: job.contact_id`,
+   * então ele também recebe o contato da conversa e também fica escopado. Uso hoje: o
+   * escopo de LEITURA de contato de `lib/mcp/tools/contacts.ts` (#2158) e das
+   * demais leituras do atendimento — `conversations.ts` (lista, conversa,
+   * histórico) e `comercio.ts` (pedidos) (#2178). A conversa é com alguém, e a
+   * ficha, a busca, a conversa, o histórico e os pedidos de outro cliente não
+   * saem do turno.
+   */
+  contatoDoTurno?: string;
   organizationId: string;
   role: Role;
   actor: Actor;
@@ -38,6 +62,22 @@ export interface McpToolDefinition<TInput extends z.ZodRawShape = z.ZodRawShape>
    * Ausência → -32002 forbidden.
    */
   requiresScope: "mcp:read" | "mcp:write";
+  /**
+   * Atende token de empresa SUSPENSA (`McpAuthResult.orgSuspensa`). Só a
+   * privacidade (LGPD nunca é bloqueada — decisão do dono, 30/09); a cerca
+   * `tests/unit/org-suspensa-so-nas-rotas-permitidas.test.ts` vigia onde aparece.
+   */
+  permiteOrgSuspensa?: true;
+  /**
+   * Limpa os args ANTES da auditoria (os dois ingressos: runtime e `/api/mcp`).
+   *
+   * Existe porque `auditMcpToolCall` grava os args em `api_audit_log.metadata` e
+   * só redige um punhado de chaves conhecidas (token, senha…). Uma tool cujos
+   * args carregam PII por DESENHO — os valores de filtro de uma consulta a banco
+   * externo, por exemplo — precisa tirá-los por conta própria: o valor filtrado
+   * é o dado do cliente, e log é lugar de metadado, não de conteúdo.
+   */
+  redigirParaAuditoria?: (args: Record<string, unknown>) => Record<string, unknown>;
   /**
    * O que a tool DECLARA quando a resposta é um vazio que NÃO é sucesso.
    *

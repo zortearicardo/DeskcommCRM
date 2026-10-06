@@ -35,6 +35,7 @@
  * de precedência é a parte que erra, e ela precisa ser exercitável por teste
  * unitário. O I/O fica em quem chama.
  */
+import type { DecisaoDeTranscricao } from "@/lib/messaging/media/escada-de-transcricao";
 import { PONTO_POR_ID, type PontoDeIa } from "./registro";
 
 /** De onde a escolha efetiva veio — vai para a tela e para o log. */
@@ -44,7 +45,27 @@ export type OrigemDaEscolha =
   | "binding"
   | "variavel_de_ambiente"
   | "herdado_de_quem_chamou"
-  | "padrao_da_organizacao";
+  | "padrao_da_organizacao"
+  /** O Jev mediu e a nota dele decidiu. Também a linha de falha do clima sem reserva (ver Execuções). */
+  | "jev"
+  /**
+   * O Jev respondeu e a resposta dele não decidiu nada: a IA de sempre decidiu,
+   * ou, sem ela, a regra de antes. Também a linha de falha do Jev numa tarefa do
+   * turno (a manipulação, o roteador, a resposta ao follow-up): o turno seguiu como sem ele (ver Execuções).
+   */
+  | "jev_observacao"
+  /**
+   * O clique em "Testar classificação" do roteador: custou (R8), mas não
+   * atendeu ninguém nem entra na comparação (R5).
+   */
+  | "jev_teste"
+  /**
+   * O Jev estava ligado e não respondeu: a IA de sempre mediu no lugar dele. No
+   * roteador decidindo, é a linha de ERRO do Jev que a leva (`lib/ai/decisao/roteador.ts`).
+   */
+  | "reserva_do_jev"
+  /** Observação: a IA de sempre falhou, e a nota do Jev, já medida, decidiu. */
+  | "jev_cobriu";
 
 export const EXPLICACAO_DA_ORIGEM: Record<OrigemDaEscolha, string> = {
   agente_publicado: "Definido na versão publicada do agente.",
@@ -54,6 +75,16 @@ export const EXPLICACAO_DA_ORIGEM: Record<OrigemDaEscolha, string> = {
     "Herdado de quem disparou a chamada — o agente publicado, ou o roteador de intenção.",
   padrao_da_organizacao: "Usando o padrão da organização.",
   fixo_do_produto: "O produto resolve este ponto sozinho — não há modelo a escolher.",
+  // Duas origens, uma por desfecho: a frase única ("se ele está em observação,
+  // quem decide é…") não dizia o que aconteceu NAQUELA mensagem.
+  jev: "O Jev decidiu.",
+  // Não "quem decidiu foi a IA de sempre": a mesma origem vale quando ela
+  // falhou (valeu a regra de antes). O que é verdade nas duas é que ele não
+  // decidiu. O clique de teste, que não entra na comparação, tem a sua.
+  jev_observacao: "O Jev observou: a resposta dele ficou registrada para comparar, e não decidiu nada.",
+  jev_teste: "Teste na tela do roteador — não entra na comparação.",
+  reserva_do_jev: "O Jev não respondeu; a IA de sempre mediu no lugar dele.",
+  jev_cobriu: "A IA de sempre falhou, mas o Jev já tinha medido esta mensagem: nada se perdeu.",
 };
 
 /** Uma linha de `ai_purpose_bindings`, já filtrada por organização. */
@@ -86,6 +117,13 @@ export interface EntradaDaDecisao {
   /** O knob de ambiente daquele ponto, quando existe. */
   modeloDeAmbiente: string | undefined;
   padraoDaOrganizacao: PadraoDaOrganizacao;
+  /**
+   * A escada de transcrição, já decidida por quem TEM OS DADOS — a rota do
+   * painel (#2190). Este resolvedor é puro: não lê `.env` nem banco, então o
+   * ponto `fixo.escada` responde com o que quem chamou lhe entregou. Sem nada
+   * entregue ele NÃO inventa `whisper-1`: devolve "—" e diz que faltou.
+   */
+  transcricao?: DecisaoDeTranscricao | null;
 }
 
 export interface DecisaoDeBinding {
@@ -94,6 +132,13 @@ export interface DecisaoDeBinding {
   credentialId: string | null;
   baseUrl: string | null;
   origem: OrigemDaEscolha;
+  /**
+   * O motivo ESCOLHIDO pela origem, em PT-BR, pronto para a tela. Quando
+   * existe, ele substitui a frase genérica de `EXPLICACAO_DA_ORIGEM`: é o que
+   * a escada de transcrição devolve (#2190) — "por que ESTE áudio vai para
+   * AQUELE degrau", que nenhuma frase fixa sabe dizer.
+   */
+  motivo?: string;
   /**
    * Incoerências que NÃO impedem a chamada, mas que alguém precisa ver. A
    * validação dura acontece na escrita (a API recusa binding incompatível); na
@@ -162,15 +207,46 @@ export function decidirBinding(entrada: EntradaDaDecisao): DecisaoDeBinding {
   const ponto = PONTO_POR_ID.get(entrada.pontoId);
   const avisos: string[] = [];
 
-  // 0 · Ponto FIXO responde por si, antes de qualquer cadeia.
+  // 0 · Pontos FIXOS respondem por si, antes de qualquer cadeia.
   //
-  // ⚠️ Sem este degrau, um ponto fixo percorria a resolução inteira e caía no
-  // padrão da organização — e a tela anunciava `claude-sonnet-5` em "Ouvir o
-  // áudio do cliente", ao lado do texto que diz "usa o padrão de transcrição
-  // da OpenAI". A mesma tela afirmando duas coisas incompatíveis.
+  // ⚠️ Dois defeitos, dois desfechos — e o segundo é o pior:
   //
-  // Modelo de conversa não transcreve áudio: anunciar um ali manda quem opera
-  // caçar um problema que não existe, ou trocar o modelo errado.
+  //  a) Sem este degrau, um ponto fixo percorria a resolução inteira e caía no
+  //     padrão da organização — e a tela anunciava `claude-sonnet-5` em "Ouvir
+  //     o áudio do cliente", ao lado do texto que diz "usa o padrão de
+  //     transcrição da OpenAI". Modelo de conversa não transcreve áudio.
+  //  b) Mas FIXAR `whisper-1` também mentia (#2190): depois da #2189 a
+  //     transcrição é uma ESCADA, e a organização sem chave OpenAI transcreve
+  //     pelo próprio modelo de conversa. Anunciar `whisper-1` ali empurra quem
+  //     opera a cadastrar uma conta que não vai usar.
+  //
+  // O ponto marcado com `fixo.escada` não tem resposta própria: ele devolve o
+  // que a escada decidiu (quem chama é quem tem os dados), e SEM escada
+  // entregue não anuncia nada — "—" com o motivo é a única resposta honesta.
+  if (ponto?.fixo?.escada) {
+    const escada = entrada.transcricao;
+    if (!escada) {
+      return {
+        provider: "",
+        modelId: null,
+        credentialId: null,
+        baseUrl: null,
+        origem: "fixo_do_produto",
+        motivo: "a escada de transcrição não foi resolvida nesta chamada — não há o que anunciar",
+        avisos,
+      };
+    }
+    return {
+      provider: escada.anuncio.provider,
+      modelId: escada.anuncio.modelId,
+      credentialId: null,
+      baseUrl: null,
+      origem: "fixo_do_produto",
+      motivo: escada.motivo,
+      avisos,
+    };
+  }
+
   if (ponto?.fixo?.usa) {
     return {
       provider: ponto.fixo.usa.provider,

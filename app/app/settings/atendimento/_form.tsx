@@ -17,6 +17,7 @@ import { Label } from "@/components/ui/label";
 import { apiClient } from "@/lib/api/client";
 import type { VisibilityMode } from "@/lib/auth/types";
 import { PRAZO_MAX_MINUTOS, PRAZO_MIN_MINUTOS } from "@/lib/escalacao/devolucao-automatica";
+import { PRAZO_PADRAO_DO_SILENCIO_MINUTOS } from "@/lib/escalacao/atendimento-manual";
 import { ROUTING_MODES, VISIBILITY_MODES, type RoutingMode } from "@/lib/schemas/routing";
 import { useT } from "@/hooks/i18n/useT";
 
@@ -27,6 +28,10 @@ export interface AtendimentoConfig {
   visibility_mode: VisibilityMode;
   /** `null` = nunca devolve sozinho (o padrão do produto). */
   handoff_return_after_minutes: number | null;
+  /** "A conversa fica com quem atendeu" — desligado é o padrão do produto. */
+  conversation_stays_with_attendant: boolean;
+  /** Minutos de silêncio da IA após resposta pelo celular. `null` = o padrão de 60. */
+  manual_reply_silence_minutes: number | null;
 }
 
 const MODO_COPY: Record<RoutingMode, { titulo: string; corpo: string }> = {
@@ -42,6 +47,14 @@ const MODO_COPY: Record<RoutingMode, { titulo: string; corpo: string }> = {
       "Cliente 1 vai para o atendente A, cliente 2 para o B, e ao acabar a lista volta ao " +
       "primeiro. Quem recebe é sempre quem está há mais tempo sem receber — entre os que " +
       "estão disponíveis e dentro do horário. Ninguém escolhe, então não há fila furada.",
+  },
+  load: {
+    titulo: "Vai para quem tem menos conversas na mão",
+    corpo:
+      "Cada cliente novo cai com quem está com MENOR número de conversas em aberto. Em caso " +
+      "de empate vale o rodízio — quem está há mais tempo sem receber leva. Entre os que estão " +
+      "disponíveis e dentro do horário, como nos outros modos. É o modo para time grande, " +
+      "onde deixar uma pessoa com tudo e outra parada custa caro.",
   },
 };
 
@@ -162,7 +175,7 @@ export function AtendimentoForm({ initial }: { initial: AtendimentoConfig }) {
           ))}
         </div>
 
-        {form.mode === "round_robin" ? (
+        {form.mode !== "manual" ? (
           <div className="grid gap-4 border-t pt-4 sm:grid-cols-2">
             <div className="space-y-1">
               <Label htmlFor="max_retries">{t("Tentativas antes de desistir")}</Label>
@@ -289,6 +302,73 @@ export function AtendimentoForm({ initial }: { initial: AtendimentoConfig }) {
             </p>
           </div>
         ) : null}
+      </Card>
+
+      <Card className="space-y-4 p-4" data-testid="silencio-apos-resposta-pelo-celular">
+        <div>
+          <h2 className="text-sm font-semibold">
+            {t("Quando alguém responde pelo celular, a IA espera quanto tempo?")}
+          </h2>
+          <p className="text-xs text-muted-foreground">
+            {t(
+              "Quando alguém da equipe responde o cliente direto pelo celular, fora do sistema, o agente de IA fica calado naquela conversa por este tempo. Cada nova resposta pelo celular recomeça a contagem.",
+            )}
+          </p>
+        </div>
+        <div className="max-w-xs space-y-1">
+          <Label htmlFor="manual_reply_silence_minutes">
+            {t("Minutos de silêncio da IA depois de uma resposta pelo celular")}
+          </Label>
+          <Input
+            id="manual_reply_silence_minutes"
+            type="number"
+            min={PRAZO_MIN_MINUTOS}
+            max={PRAZO_MAX_MINUTOS}
+            value={form.manual_reply_silence_minutes ?? PRAZO_PADRAO_DO_SILENCIO_MINUTOS}
+            disabled={isPending}
+            onChange={(e) =>
+              setForm((f) => ({ ...f, manual_reply_silence_minutes: Number(e.target.value) }))
+            }
+          />
+          <p className="text-xs text-muted-foreground">
+            {t(
+              "Entre 5 minutos e 24 horas. O padrão é 60. Quem atende o dia inteiro pelo celular costuma preferir um prazo curto, como 15, para a IA voltar a responder entre um atendimento e outro.",
+            )}
+          </p>
+        </div>
+      </Card>
+
+      <Card className="space-y-4 p-4" data-testid="conversa-fica-com-quem-atendeu">
+        <div>
+          <h2 className="text-sm font-semibold">
+            {t("Quando alguém responde, a conversa fica com essa pessoa?")}
+          </h2>
+          <p className="text-xs text-muted-foreground">
+            {t(
+              "Desligado, vale a regra de sempre: responder pela tela cala a IA por alguns minutos, e a conversa encerrada que recebe mensagem nova volta para a fila.",
+            )}
+          </p>
+        </div>
+        <label className="flex cursor-pointer items-start gap-3">
+          <input
+            type="checkbox"
+            data-testid="fica-com-quem-atendeu"
+            checked={form.conversation_stays_with_attendant}
+            disabled={isPending}
+            onChange={(e) =>
+              setForm((f) => ({ ...f, conversation_stays_with_attendant: e.target.checked }))
+            }
+            className="mt-1 h-4 w-4 shrink-0 accent-primary"
+          />
+          <span className="space-y-1">
+            <span className="block text-sm font-medium">{t("A conversa fica com quem atendeu")}</span>
+            <span className="block text-xs text-muted-foreground">
+              {t(
+                "Responder pelo Inbox numa conversa sem dono passa a assumi-la, e a IA fica calada até alguém devolver. Quando o cliente escreve numa conversa encerrada, ela volta direto para o último atendente, sem passar pela distribuição, se ele ainda faz parte da equipe.",
+              )}
+            </span>
+          </span>
+        </label>
       </Card>
 
       <div className="flex items-center gap-3">

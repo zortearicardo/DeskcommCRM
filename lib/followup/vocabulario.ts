@@ -38,6 +38,7 @@
  * próprio schema (Zod) e dos tipos de `node-handlers.ts` — nenhuma cópia à mão.
  */
 import type { z } from "zod";
+import type { PrioridadeDaTarefa } from "@/lib/tarefas/tipos";
 
 import type { TriggerConfig } from "./api-schemas";
 import { conditionLabel } from "./edge-condition-options";
@@ -52,10 +53,12 @@ import {
   type actionConfigSchema,
   type aiClassifyConfigSchema,
   type conditionConfigSchema,
+  type contactFlowFieldTypeSchema,
   type endConfigSchema,
   type waitConfigSchema,
 } from "./graph-schema";
 import type { EnrollmentOutcome, EnrollmentStatus } from "./node-handlers";
+import type { BaseDaPausa } from "./pausa-de-reentrada";
 
 type ConditionConfig = z.infer<typeof conditionConfigSchema>;
 type Check = ConditionConfig["checks"][number];
@@ -69,6 +72,7 @@ export type AlvoDaClassificacao = z.infer<typeof aiClassifyConfigSchema>["target
 export type ResultadoDoFim = z.infer<typeof endConfigSchema>["outcome"];
 export type ModoDeEspera = z.infer<typeof waitConfigSchema>["mode"];
 export type ModoDaAcao = z.infer<typeof actionConfigSchema>["mode"];
+export type TipoDeCampo = z.infer<typeof contactFlowFieldTypeSchema>;
 export type TipoDeGatilho = TriggerConfig["kind"];
 
 /** `{ valor, rotulo }` na ordem de declaração do mapa — pronto para um `<Select>`. */
@@ -511,6 +515,28 @@ export const MODOS_DA_ACAO: Record<ModoDaAcao, string> = {
   template: "Modelo de mensagem pronto",
 };
 
+// ─── prioridade da tarefa (ação create_task, #1540) ────────────────────────
+
+/** Wire de prioridade da tarefa — rótulos do formulário e do card. */
+export const PRIORIDADES_DA_TAREFA: Record<PrioridadeDaTarefa, string> = {
+  low: "Baixa",
+  medium: "Média",
+  high: "Alta",
+  urgent: "Urgente",
+};
+
+// ─── pergunta do fluxo de atendimento (nó collect) ───────────────────────
+
+/** Tipo do valor que uma pergunta espera — rótulos do formulário e do card. */
+export const TIPOS_DE_CAMPO: Record<TipoDeCampo, string> = {
+  text: "Texto livre",
+  number: "Número",
+  date: "Data",
+  boolean: "Sim ou não",
+  select: "Escolha numa lista",
+  cpf: "CPF (confere o dígito)",
+};
+
 // ─── nó final ────────────────────────────────────────────────────────────
 
 /**
@@ -539,16 +565,32 @@ export const SITUACOES_DO_ACOMPANHAMENTO: Record<EnrollmentStatus, string> = {
   // precisa saber que este acompanhamento está vivo e só não fala agora.
   dormente: "Aguardando a data do retorno",
   paused_handoff: "Pausado — um humano assumiu",
+  coletando: "Coletando respostas do roteiro",
   completed: "Concluído",
   cancelled: "Cancelado",
   dead: "Parou por falha",
 };
 
-/** Como o acompanhamento terminou. Sem tradução em lugar nenhum do produto até aqui. */
+/**
+ * Como o acompanhamento terminou — na voz de quem opera o dossiê (#2014).
+ *
+ * Antes este mapa existia só para o teste. O desfecho agora sai por aqui na
+ * tela do dossiê, e o rótulo de `exhausted` diverge de `RESULTADOS_DO_FIM` de
+ * propósito: lá é a opção do nó final no construtor, sob contrato do e2e
+ * ("Esgotado"); aqui é como o operador lê o fim do acompanhamento.
+ *
+ * De onde `exhausted` vem, para o rótulo não afirmar mais do que o dado sabe:
+ * do nó Fim (que NASCE com `exhausted` — nodeVisuals.ts) ou de uma pergunta de
+ * coleta esgotada (atendimento.ts), sempre como a alternativa a `converted`.
+ * NÃO vem de esgotar as novas tentativas do motor: isso leva o enrollment a
+ * `status='dead'` (`markDead`, engine.ts) sem tocar em `outcome`. E não prova
+ * que o contato ficou calado — um fluxo pode chegar ao nó Fim padrão depois de
+ * uma resposta. Por isso "sem conversão", e não "sem resposta".
+ */
 export const DESFECHOS: Record<EnrollmentOutcome, string> = {
   converted: "Convertido",
   replied: "O contato respondeu",
-  exhausted: "Esgotado",
+  exhausted: "Encerrado sem conversão",
   opted_out: "Pediu para parar",
   handoff: "Passou para um humano",
 };
@@ -563,11 +605,23 @@ export const GATILHOS: Record<TipoDeGatilho, string> = {
   appointment_no_show:"Falta confirmada pela equipe",
   manual: "Manual",
   webhook: "Disparado por uma automação em Webhooks",
+  lead_created: "Lead criado",
   silence: "Silêncio",
   stage_change: "Mudança de etapa no funil",
   // "Caso" é a palavra que a tela de escalação já usa. O rótulo diz o FATO que
   // dispara ("o agente pediu ajuda"), não o nome da tabela — quem lê é dono de
   // clínica, não quem escreveu o schema.
   case_opened: "Quando o agente pede ajuda de um humano",
+  inbound_after_silence: "Cliente voltou",
   conversation_end: "Fim da conversa",
+};
+
+/**
+ * De onde conta a pausa antes de o gatilho de silêncio recomeçar
+ * (`params.reentry_pause_basis`). A tela a oferece como um interruptor, mas o
+ * valor não pode chegar cru a quem lê o gatilho em outro lugar.
+ */
+export const BASES_DA_PAUSA_DE_REENTRADA: Record<BaseDaPausa, string> = {
+  ultima_mensagem: "Da última mensagem do cliente",
+  ultimo_envio: "Do último envio deste fluxo",
 };

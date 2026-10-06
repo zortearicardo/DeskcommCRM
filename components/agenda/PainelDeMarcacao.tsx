@@ -10,7 +10,7 @@ import * as React from "react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { instanteDe } from "@/lib/agenda/fuso";
+import { dataDeParede, instanteDe } from "@/lib/agenda/fuso";
 import { ApiError } from "@/lib/api/types";
 import { CaretLeft, CaretRight, CheckCircle, Clock, MapPin, Warning } from "@/lib/ui/icons";
 import { cn } from "@/lib/utils";
@@ -82,6 +82,7 @@ export function PainelDeMarcacao({
   fontesDefasadas,
   googleCoberturaParcial,
   onMesVisivel,
+  mesCarregado,
   quemSeraAtendido,
   horarioInicial,
   permiteEncaixe = false,
@@ -150,6 +151,18 @@ export function PainelDeMarcacao({
    * entrega 42 dias mortos ou desliga para não produzir esse estado.
    */
   onMesVisivel?: (mes: Date) => void;
+  /**
+   * De que mês são os `horariosPorDia` que chegaram — `null` enquanto a
+   * consulta não respondeu. Ausente (a vitrine, com dado fixo), o painel
+   * confia nos horários como sempre.
+   *
+   * O mês em tela mora aqui e o da consulta mora em quem chama, e os dois
+   * trocam em momentos diferentes. Sem saber de que mês são os dados, o painel
+   * (a) acendia o dia 1º do mês novo com a sobra da janela do velho
+   * (`janelaDoMesVisivel` vai até `endOfMonth + 1 dia`) e (b) não tinha como
+   * distinguir "carregando" de "este mês acabou" — ver a abertura, abaixo.
+   */
+  mesCarregado?: Date | null;
   /** Agenda conectada que parou de atualizar: o horário fica bloqueado, e a tela diz desde quando. */
   fontesDefasadas?: Array<{ nome?: string; desde?: string }>;
   /**
@@ -261,12 +274,23 @@ export function PainelDeMarcacao({
    * chamador, novo a cada render dele, e um efeito com o objeto na lista
    * dispararia para sempre.
    */
+  /**
+   * A data de parede no fuso que o painel EXIBE.
+   *
+   * Toda formatação do painel passa por aqui. Enquanto cada `format` lia o
+   * relógio do navegador, o horário oferecido no cabeçalho e a confirmação
+   * logo abaixo podiam dizer horas diferentes para o mesmo agendamento —
+   * silenciosamente, e só quando os dois fusos diferiam.
+   */
+  const parede = (iso: string): Date =>
+    fuso ? dataDeParede(new Date(iso), fuso) : new Date(iso);
+
   const instanteInicial = horarioInicial?.instante;
   React.useEffect(() => {
     if (!instanteInicial) return;
     const d = new Date(instanteInicial);
     setDia(d);
-    setHorario({ instante: instanteInicial, rotulo: format(d, "HH:mm") });
+    setHorario({ instante: instanteInicial, rotulo: format(parede(instanteInicial), "HH:mm") });
     setMes(startOfMonth(d));
     setMarcado(null);
   }, [instanteInicial]);
@@ -313,10 +337,36 @@ export function PainelDeMarcacao({
    * É a ÚNICA expressão de clicável: o botão do dia e `nenhumDiaClicavel` leem
    * esta função, para os dois não voltarem a divergir (ver o bloco acima).
    */
+  const dadosDoMesEmTela = mesCarregado === undefined || (mesCarregado !== null && isSameMonth(mesCarregado, mes));
+  /** Tem horário publicado — a única fonte de `data-disponivel` e da abertura. */
+  const temHorario = (d: Date): boolean =>
+    dadosDoMesEmTela && isSameMonth(d, mes) && (horariosPorDia[format(d, "yyyy-MM-dd")]?.length ?? 0) > 0;
   const diaClicavel = (d: Date): boolean =>
-    isSameMonth(d, mes) &&
-    ((horariosPorDia[format(d, "yyyy-MM-dd")]?.length ?? 0) > 0 ||
-      (encaixeLigado && d.getTime() >= inicioDeHoje));
+    temHorario(d) || (isSameMonth(d, mes) && encaixeLigado && d.getTime() >= inicioDeHoje);
+
+  /**
+   * A ABERTURA NÃO CAI NUM MÊS QUE ACABOU.
+   *
+   * No último dia útil do mês, depois do último horário, o painel abria no mês
+   * de hoje com todo dia apagado e "Nenhum horário livre em setembro" — e o
+   * próximo horário, amanhã, atrás de uma seta que nada apontava. Todo mês.
+   * Foi o que reprovou o e2e de todos os PRs em 30/09/2026 a partir de ~16h BRT.
+   *
+   * A decisão é tomada UMA vez, quando os horários do mês de abertura chegam:
+   * sem nenhum horário publicado nele, o painel passa ao mês seguinte. Quem
+   * volta à mão (para um encaixe hoje) fica onde voltou. Sem jornada publicada
+   * não há o que procurar no mês seguinte, e o aviso é o próximo passo.
+   */
+  // Ajuste de estado DURANTE o render, não num efeito: o mês morto nem chega a
+  // ser pintado (https://react.dev/learn/you-might-not-need-an-effect).
+  const [aberturaDecidida, setAberturaDecidida] = React.useState(false);
+  const aberturaCarregada = mesCarregado != null && dadosDoMesEmTela && isSameMonth(mes, ancora);
+  if (!aberturaDecidida && aberturaCarregada && !instanteInicial) {
+    setAberturaDecidida(true);
+    if (publicouHorarios && !erroAoCarregar && !semanas.flat().some(temHorario)) {
+      setMes(startOfMonth(addDays(startOfMonth(mes), 32)));
+    }
+  }
 
   const nenhumDiaClicavel = semanas.flat().every((d) => !diaClicavel(d));
 
@@ -469,7 +519,7 @@ export function PainelDeMarcacao({
               também. */}
           <h3 className="mt-3 text-base font-semibold">{t("Marcado.")}</h3>
           <p className="mt-1 text-sm text-text-muted">
-            {format(new Date(marcado.instante), t("EEEE, d 'de' MMMM 'às' HH:mm"), { locale: localeDaData })}
+            {format(parede(marcado.instante), t("EEEE, d 'de' MMMM 'às' HH:mm"), { locale: localeDaData })}
           </p>
           <p className="mt-0.5 text-xs text-text-subtle">
             {t(tipo)} · {duracaoMin} {t("min · com")} {responsavel.nome}
@@ -554,10 +604,8 @@ export function PainelDeMarcacao({
         // colunas cabem com folga. Abaixo disso o painel EMPILHA — os horários
         // viram uma seção sob o calendário, que é o que o cal.com faz e o que
         // esta base já fazia no celular.
-        // `lg:min-h-0` junto do piso: em janela larga e BAIXA (menos de ~560px
-        // de altura) um `min-h-[450px]` sem teto estoura o Sheet e o
-        // `overflow-hidden` corta em silêncio — o mesmo modo de falha que este
-        // painel já teve na horizontal.
+        // `lg:min-h-0`: de `lg` para cima o painel tem a altura do conteúdo e
+        // quem rola é o Sheet (`_client.tsx`); o piso de 450px é do empilhado.
         "flex min-h-[450px] flex-col overflow-hidden rounded-lg border border-border bg-surface lg:min-h-0 lg:w-fit lg:flex-row",
         className,
       )}
@@ -595,24 +643,20 @@ export function PainelDeMarcacao({
       {/* CORPO — o mês. 420–480px é a faixa medida no cal.com; aqui ela é
           `min-width` e não largura fixa, porque no celular a coluna ocupa tudo. */}
       {/*
-        ⚠️ `lg:min-h-0 lg:overflow-y-auto` — A CONFIRMAÇÃO FICAVA FORA DO ALCANCE.
+        ⚠️ SEM rolagem própria — o corpo cresce e quem rola é o Sheet.
 
-        De `lg` para cima o painel tem a altura do Sheet, e o Sheet não rola
-        (`_client.tsx`). O corpo não tinha teto nem rolagem: mês + confirmação
-        passavam da caixa, e o `overflow-hidden` do painel cortava EM SILÊNCIO.
-        Medido em 2026-09-15 pela tela, com o bloco "Quem será atendido" acima:
-        o botão Confirmar começava em 840px numa janela de 800 (1280×800) e em
-        821px numa de 768 (1366×768), com o painel terminando em 776 e 744 —
-        inteiro fora da caixa, sem barra e sem como clicar. Em 1440×900 ele saía
-        cortado ao meio, e a recusa do servidor logo acima dele também.
-
-        Rolar o CORPO, e não o Sheet, pelo mesmo motivo que a lista rola sozinha:
-        o contexto e os horários ficam parados, e não nasce barra horizontal no
-        Sheet. Abaixo de `lg` nada muda — ali quem rola é o diálogo.
+        Em 2026-09-15 o Confirmar ficou fora da caixa (1280×800: começava em
+        840px) porque o painel tinha a altura do Sheet e o Sheet não rolava; o
+        remendo foi dar `lg:overflow-y-auto` a este corpo. Não bastou: a altura
+        que sobrava para o painel era o que o formulário acima deixava, e em
+        janela baixa (1280×500, 1024×560), pela conta das alturas do formulário,
+        isso é quase nada — o corpo rolava dentro de uma fresta. Agora o Sheet
+        rola (`_client.tsx`), e um segundo rolador aqui dentro só prenderia a
+        roda do mouse no de dentro.
       */}
       <div
         data-testid="corpo-da-marcacao"
-        className="flex min-w-0 flex-1 flex-col p-4 lg:min-h-0 lg:min-w-[420px] lg:overflow-y-auto"
+        className="flex min-w-0 flex-1 flex-col p-4 lg:min-w-[420px]"
       >
         <div className="mb-3 flex items-center justify-between">
           <span className="text-sm font-semibold first-letter:uppercase">
@@ -746,7 +790,7 @@ export function PainelDeMarcacao({
             // A exceção é o ENCAIXE: ali o clique entrega outra coisa — o campo
             // de hora —, e o dia sem grade fica clicável mas SEM a cor de vaga.
             // `data-disponivel` segue dizendo "tem horário publicado".
-            const disponivel = livres.length > 0 && isSameMonth(d, mes);
+            const disponivel = temHorario(d);
             const clicavel = diaClicavel(d);
             const soEncaixe = clicavel && !disponivel;
             const escolhido = dia !== null && isSameDay(d, dia);
@@ -795,7 +839,7 @@ export function PainelDeMarcacao({
             <p className="text-sm">
               <span className="text-text-muted">{t("Confirmar")} </span>
               <span className="font-semibold">
-                {format(new Date(horario.instante), t("EEEE, d 'de' MMMM 'às' HH:mm"), { locale: localeDaData })}
+                {format(parede(horario.instante), t("EEEE, d 'de' MMMM 'às' HH:mm"), { locale: localeDaData })}
               </span>
             </p>
 

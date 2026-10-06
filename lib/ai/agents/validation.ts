@@ -37,6 +37,10 @@ const triggerConfigSchema = z
             start: z.string(),
             end: z.string(),
             weekdays: z.array(z.number().int().min(0).max(6)),
+            // Aviso de fora do horário (#1926). Sem esta linha o Zod descarta o
+            // campo ao salvar e o aviso nunca liga pela tela. O teto é o mesmo
+            // de TAMANHO_MAXIMO_DO_TEXTO em aviso-fora-do-horario.ts.
+            notice: z.string().max(1000).nullable().optional(),
           })
           .nullable()
           .optional()
@@ -82,6 +86,7 @@ const followupConfigObjectSchema = z
     enabled: z.boolean().default(false),
     flow_pointer_ids: z.array(UUID).max(20).default([]),
     send_window: followupSendWindowSchema.nullable().optional().default(null),
+    callback_enabled: z.boolean().optional(),
   })
   .strict();
 
@@ -96,6 +101,7 @@ const followupPatchSchema = followupConfigObjectSchema
     enabled: followupConfigObjectSchema.shape.enabled.removeDefault(),
     flow_pointer_ids: followupConfigObjectSchema.shape.flow_pointer_ids.removeDefault(),
     send_window: followupConfigObjectSchema.shape.send_window.removeDefault(),
+    callback_enabled: followupConfigObjectSchema.shape.callback_enabled,
   })
   .partial();
 
@@ -161,11 +167,21 @@ const versionShapeSchema = z
       .max(20)
       .default(["falar com humano", "atendente", "pessoa real"]),
     handoff_tool_enabled: z.boolean().default(true),
+    proposal_ai_draft_enabled: z.boolean().default(true),
     cases_enabled: z.boolean().default(false),
     // Onda 4 — quebra a resposta em bolhas curtas (splitIntoBubbles) espaçadas
     // pelo pacing anti-ban. Defaults espelham a migration 0059.
     split_messages: z.boolean().default(false),
     split_max_chars: z.number().int().min(80).max(4000).default(600),
+    /**
+     * Janela de coalescência de rajada inbound para ESTE agente (ms).
+     *
+     * `null`/ausente = usa o `INBOUND_DEBOUNCE_MS` da instalação (comportamento
+     * de sempre — regressão zero). 0 desliga a coalescência de rajada para o
+     * agente (job imediato). 1..60000 define a janela, com TETO de 60s para
+     * ninguém travar o atendimento sem querer (#1856).
+     */
+    inbound_debounce_ms: z.number().int().min(0).max(60000).nullable().optional(),
     followup: followupConfigSchema,
     // ── Papel OPERADOR (spec 16 §3.2) ───────────────────────────────────────
     // Todos com `.default(...)`, e é o que mantém retrocompatível: agent e
@@ -232,6 +248,7 @@ export const versionPatchSchema = versionShapeSchema
     history_token_window: versionShapeSchema.shape.history_token_window.removeDefault(),
     handoff_keywords: versionShapeSchema.shape.handoff_keywords.removeDefault(),
     handoff_tool_enabled: versionShapeSchema.shape.handoff_tool_enabled.removeDefault(),
+    proposal_ai_draft_enabled: versionShapeSchema.shape.proposal_ai_draft_enabled.removeDefault(),
     cases_enabled: versionShapeSchema.shape.cases_enabled.removeDefault(),
     split_messages: versionShapeSchema.shape.split_messages.removeDefault(),
     split_max_chars: versionShapeSchema.shape.split_max_chars.removeDefault(),

@@ -14,7 +14,7 @@
  */
 import { randomUUID } from "node:crypto";
 
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page } from "./helpers/test";
 import { createClient } from "@supabase/supabase-js";
 
 const svc = createClient(
@@ -76,7 +76,7 @@ async function entrar(page: Page): Promise<void> {
   await page.goto("/login");
   await page.locator("#email").fill(email);
   await page.locator("#password").fill(SENHA);
-  await page.getByRole("button", { name: /entrar/i }).click();
+  await page.getByRole("button", { name: "Entrar", exact: true }).click();
 }
 
 /** O bloqueador de tela cheia, pelo texto que só ele mostra. */
@@ -117,7 +117,11 @@ test.describe("a verificação em duas etapas é escolha, não imposição", () 
     await page.waitForURL(/\/app\//, { timeout: 30_000 });
     await page.goto("/app/settings/security");
 
-    await page.locator('input[type="checkbox"]').click();
+    // A caixa única virou seletor de nível mínimo + carência (#1533): o valor
+    // gravado são as três chaves novas, e `mfa_required` continua sendo escrito
+    // junto para a leitura legada continuar verdadeira.
+    await page.locator("#mfa-papel-minimo").selectOption("admin");
+    await page.getByRole("button", { name: /^salvar$/i }).click();
     await page.waitForLoadState("networkidle");
 
     // A escrita é por service role com a organização resolvida da sessão: a
@@ -129,8 +133,11 @@ test.describe("a verificação em duas etapas é escolha, não imposição", () 
       .select("settings")
       .eq("id", orgId)
       .maybeSingle();
-    const settings = org?.settings as { security?: { mfa_required?: boolean } } | null;
+    const settings = org?.settings as {
+      security?: { mfa_required?: boolean; mfa_required_min_role?: string };
+    } | null;
     expect(settings?.security?.mfa_required).toBe(true);
+    expect(settings?.security?.mfa_required_min_role).toBe("admin");
 
     // E agora o bloqueador aparece — o mesmo que não aparecia no primeiro caso.
     await page.goto("/app/inbox");

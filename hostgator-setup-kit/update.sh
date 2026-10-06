@@ -21,6 +21,21 @@ source "$KIT_DIR/_common.sh"
 source "$KIT_DIR/manutencao.sh"
 enter_project
 
+# ── 0-. O laço do diagnóstico (#1955) ───────────────────────────────────────
+# Toda execução termina com um arquivo legível — inclusive as que MORREM antes
+# de chegar ao banco (preflight, backup, checkout), que é justamente onde não
+# havia rastro nenhum: o que sobrava era a cauda do log que o agente guarda, e
+# o apagão de resolver da issue não deixava rastro do POR QUÊ.
+#
+# O gatilho do passo do banco (`trap restaurar_servicos EXIT INT TERM HUP`)
+# SUBSTITUI este — e de lá para baixo quem escreve o mesmo arquivo é
+# `restaurar_servicos`, que chama esta mesma função. Os dois caminhos escrevem
+# no MESMO arquivo, e o diagnóstico é silencioso: nunca na stdout.
+DIAGNOSTICO_ARQUIVO="$PROJECT_DIR/.deskcomm-update-diagnostico.log"
+UPDATE_STATUS="em andamento"
+UPDATE_ETAPA="início, antes de decidir a versão"
+trap diagnostico_de_atualizacao EXIT
+
 FORCE=""; SKIP_BACKUP=""; TARGET_TAG=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -37,6 +52,30 @@ done
 # em 401. Ver `recusar_projeto_de_outra_arvore` em _common.sh.
 recusar_projeto_de_outra_arvore || die "Atualização interrompida para não quebrar a instalação que está no ar."
 
+# Single-server: o Supabase desta VPS também tem dono. E o e-mail de acesso
+# (GoTrue) acompanha o SMTP do CRM AQUI, antes da decisão de versão: é este
+# comando que o instalador ensina a rodar depois de configurar /admin/email, e
+# "já está na versão mais recente" sairia sem entregar a troca.
+if [ "${SINGLE_SERVER:-0}" = "1" ]; then
+  recusar_supabase_de_outra_arvore || die "Atualização interrompida para não mexer no Supabase de outra instalação."
+  # A porta direta do GoTrue acompanha o `signup_mode` da instalação (#1653).
+  # Antes do SMTP de propósito: é o caminho que roda MESMO quando o update não
+  # tem nada a atualizar (a saída "você já está na versão mais recente" fica
+  # mais abaixo), então quem trocou "só convite" na tela e rodou o update leva
+  # o `DISABLE_SIGNUP` no mesmo comando — e é ele que fecha
+  # `POST /auth/v1/signup` para quem tem a anon key. Esta chamada roda com o
+  # kit ANTERIOR ao checkout; a da versão nova fica dentro de
+  # `atualizar_supabase_single_server` (_common.sh), mais abaixo.
+  if sincronizar_signup_mode_do_gotrue; then
+    dc_supabase up -d --no-deps auth >/dev/null 2>&1 || c_ylw "⚠ Não consegui reiniciar o auth do Supabase com o modo de cadastro (#1653)."
+  fi
+  if sincronizar_smtp_do_gotrue; then
+    dc_supabase up -d --no-deps auth >/dev/null 2>&1 || c_ylw "⚠ Não consegui reiniciar o auth do Supabase com o SMTP do CRM."
+  else
+    c_ylw "⚠ Sem SMTP no CRM: 'esqueci a senha' e a confirmação de cadastro não enviam e-mail. Configure em /admin/email e rode o update.sh de novo."
+  fi
+fi
+
 # ── 0. Liga o agente da tela ANTES de qualquer decisão de versão ─────────────
 # Instalar o cron aqui, e não no fim, é o que faz o bootstrap ter fim: os
 # caminhos "já está na versão mais recente" e "essa versão é anterior à sua"
@@ -47,8 +86,13 @@ setup_update_agent_cron
 # ── 1. Tem atualização mesmo? ────────────────────────────────────────────────
 step "Procurando atualizações"
 git fetch --tags --quiet origin 2>/dev/null || c_ylw "⚠ não consegui falar com o GitHub — sigo com o código que já está aqui."
-[ -n "$TARGET_TAG" ] || TARGET_TAG="$(git tag -l 'v*' --sort=-v:refname | head -1)"
-[ -n "$TARGET_TAG" ] || die "Não encontrei nenhuma versão publicada para instalar."
+# A AUTORIDADE é a release publicada, NUNCA a maior tag — ver
+# `ultima_release_estavel` em _common.sh. Um `TARGET_TAG` passado à mão
+# continua valendo (instalar uma versão específica é operação legítima de
+# quem sabe o que está fazendo); o que deixou de existir é ESCOLHER sozinho a
+# maior tag, que instalaria código sem release publicada.
+[ -n "$TARGET_TAG" ] || TARGET_TAG="$(ultima_release_estavel)"
+[ -n "$TARGET_TAG" ] || die "Não encontrei nenhuma versão publicada para instalar. (Tag existir não basta: o alvo é a última release estável publicada no GitHub. Se o servidor não conseguiu falar com a API, tente de novo mais tarde; para instalar uma versão específica, passe --to vX.Y.Z.)"
 git rev-parse --verify --quiet "${TARGET_TAG}^{commit}" >/dev/null \
   || die "Não conheço a versão $TARGET_TAG aqui. Confira o nome (ex.: v1.1.0) ou tente de novo quando o servidor conseguir falar com o GitHub."
 CURRENT_TAG="$(git describe --tags --exact-match HEAD 2>/dev/null || true)"
@@ -78,6 +122,30 @@ MESMA_TAG=""
 [ "$CURRENT_TAG" = "$TARGET_TAG" ] && MESMA_TAG=1
 
 if [ -n "$MESMA_TAG" ] && [ -z "$FORCE" ] && ! image_desatualizada; then
+  # ⛔ O AVISO TAMBÉM DESCE AQUI — esta saída é anterior ao `manutencao_desce`
+  # do fluxo normal (mais abaixo) e ao `restaurar_servicos` do caminho de erro.
+  #
+  # MEDIDO numa VPS real: uma atualização morreu logo depois de `manutencao_sobe`
+  # (tag nova já no disco, imagem antiga ainda rodando). O aviso ficou de pé com
+  # o apelido de rede `app`, e o Caddy passou a entregar ELE — 503 em tudo:
+  # site, crons e webhook do WAHA. O app estava saudável o tempo todo.
+  #
+  # A volta por cima não existia: como o `git checkout` da tag JÁ tinha
+  # acontecido, toda execução seguinte caía nesta linha, dizia "nada a
+  # atualizar" e saía — sem nunca tocar no aviso. O CRM ficou 6h30 fora do ar
+  # e nem o botão da tela voltava, porque o agente do host também levava 503.
+  #
+  # `manutencao_desce` é `docker rm -f ... || true`: idempotente, custa nada
+  # quando não há aviso nenhum de pé, que é o caso comum desta saída.
+  if docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$NOME_DA_MANUTENCAO"; then
+    manutencao_desce
+    c_ylw "⚠ Havia um aviso de manutenção preso de uma atualização anterior — removido."
+    c_ylw "  Enquanto ele estava de pé, o CRM respondia 503 para todo mundo."
+    # Aviso preso = a execução anterior morreu no meio (banco e/ou imagem pela
+    # metade); "nada a atualizar" sozinho deixaria o app na imagem antiga.
+    c_ylw "  A atualização anterior não terminou. Para concluí-la:"
+    c_ylw "    bash hostgator-setup-kit/update.sh --to $TARGET_TAG --force"
+  fi
   c_grn "✓ Você já está na versão mais recente ($TARGET_TAG). Nada a atualizar."
   exit 0
 fi
@@ -123,10 +191,32 @@ else
   c_ylw "Vou atualizar para a versão $TARGET_TAG com segurança."
 fi
 
+# ── 1.5 Preflight: dá para atualizar sem derrubar o que está no ar? (#1955) ──
+# MEDIDO numa instalação real, reproduzido 2x: sem esta pergunta o update parava
+# os serviços e só descobria a hora que o registro não respondia — aí o fallback
+# de construção local consumiu a memória inteira da VPS (OOM no `next-build`) e
+# o app ficou 502 até um restart manual do Docker.
+#
+# ANTES do backup, do checkout e de QUALQUER `docker stop`, de propósito: quando
+# o preflight falha, `refuse` devolve RC 3 (o agent.sh lê como "esta atualização
+# nunca começou" e não tenta desfazer nada) e a versão ATUAL segue no ar.
+step "Conferindo se dá para atualizar (preflight)"
+if ! MOTIVO_PREFLIGHT="$(preflight_atualizacao "$TARGET_TAG")"; then
+  refuse "Atualização NÃO começou — nada foi parado, nada foi baixado, e a versão atual segue no ar.
+  Motivo: $MOTIVO_PREFLIGHT
+  Resolva o motivo acima e rode de novo:
+    bash hostgator-setup-kit/update.sh"
+fi
+if build_local_pedido; then
+  c_grn "✓ preflight — o Docker respondeu; construção local pedida (DESKCOMM_BUILD_LOCAL), sem depender do registro."
+else
+  c_grn "✓ preflight — as quatro imagens da $TARGET_TAG estão prontas no registro."
+fi
+
 # ── 2. Backup de segurança ANTES de tocar no banco ───────────────────────────
 if [ -z "$SKIP_BACKUP" ]; then
   step "Backup de segurança (antes de mexer no banco)"
-  if bash "$(dirname "$0")/backup.sh"; then
+  if bash "$KIT_DIR/backup.sh"; then
     c_grn "✓ backup feito — se algo der errado, dá pra restaurar (restore.sh)."
   else
     if [ -n "${DESKCOMM_AGENT_REPORT:-}" ] || [ ! -t 0 ]; then
@@ -170,6 +260,15 @@ source "$KIT_DIR/_common.sh"
 # manutenção chegaria uma atualização atrasada, que é exatamente o defeito que a
 # releitura existe para fechar.
 source "$KIT_DIR/manutencao.sh"
+
+# Single-server: o Supabase vai para a versão pinada no código novo ANTES do
+# banco (o passo 4 pausa peças dele, e um `up` depois as religaria).
+if [ "${SINGLE_SERVER:-0}" = "1" ]; then
+  # Esta função também sincroniza o modo de cadastro com o GoTrue (#1653). A
+  # chamada mora DENTRO dela, e não numa linha aqui, porque é o corpo dela que
+  # o update.sh antigo executa na atualização que traz o conserto.
+  atualizar_supabase_single_server || die "O Supabase desta VPS não subiu (erro acima). NÃO mexi no banco do CRM."
+fi
 
 [ -n "${DESKCOMM_AGENT_REPORT:-}" ] && eval "${DESKCOMM_AGENT_REPORT_CMD}" codigo
 
@@ -242,7 +341,7 @@ if [ -f supabase/baseline.sql ]; then
   manutencao_sobe
   pausar_o_que_fala_com_o_banco
   # Extensões que o schema exige (idempotente; iguais ao install.sh).
-  docker run --rm postgres:17-alpine psql "$(url_do_schema)" -c \
+  pg_container postgres:17-alpine psql "$(url_do_schema)" -c \
     "create extension if not exists vector with schema public; create extension if not exists citext with schema public; create extension if not exists pg_trgm with schema public;" \
     >/dev/null 2>&1 || true
 
@@ -302,6 +401,35 @@ if [ -f supabase/baseline.sql ]; then
   # cima de decisão deliberada, e falso positivo derruba a confiança no aviso
   # inteiro. Vale a ÚLTIMA operação de cada regra no arquivo: quem termina
   # criada é esperada; quem termina apagada, não.
+  #
+  # ── E A COMPARAÇÃO RODA EM ORDEM DE BYTES, SEMPRE ─────────────────────────
+  #
+  # ⛔ `sort` e `comm` precisam concordar na ordenação. No GNU coreutils os dois
+  # seguem o mesmo locale e concordam (medido: Ubuntu 20.04–25.10, Debian 12,
+  # AlmaLinux 8/9 dão 0 em C, C.UTF-8, en_US e pt_BR). No Ubuntu 26.04, que troca
+  # o coreutils pelo uutils (Rust, 0.8.0), o `sort` ordena pelo locale e o `comm`
+  # compara BYTES: sob en_US/pt_BR.UTF-8, `orgs_select` cai entre `org_guardrail_*`
+  # e `org_voice_calls_*`, o `comm` perde o passo — "comm: file 2 is not in
+  # sorted order" na stderr — e o que devolve depois é lixo.
+  #
+  # MEDIDO numa instalação real, 2026-09-28: com as 114 regras TODAS no banco, a
+  # comparação acusou 2 faltando (`org_voice_calls_admin_write` e
+  # `org_voice_calls_select`). O alarme falso faz o script tentar recriar as
+  # duas, o banco responde "already exists", a conferência seguinte tropeça no
+  # mesmo erro de ordenação — e a atualização PARA, deixando o aviso de
+  # manutenção de pé. O CRM passou 8 horas em 503 com o banco íntegro, e a tela
+  # mandava o dono procurar regra que nunca faltou.
+  #
+  # A cura é forçar o locale da comparação para `C`, que é ordem de bytes: aí o
+  # `sort` produz exatamente o que o `comm` espera, em qualquer ambiente.
+  #
+  # ⚠️ `LC_COLLATE=C` NÃO basta, e a diferença custa uma sessão de depuração:
+  # o POSIX dá precedência a `LC_ALL` sobre `LC_COLLATE`, então basta alguém
+  # exportar `LC_ALL=…UTF-8` — systemd, um `docker exec`, o terminal de quem
+  # roda o update à mão — para o pin virar enfeite e o defeito voltar inteiro.
+  # MEDIDO, com as 114 regras reais: `LC_ALL=C` devolve 0 em qualquer condição;
+  # `LC_COLLATE=C` devolve 0 com `LC_ALL` vazio e 2 com `LC_ALL` preenchido.
+  # `LC_ALL=C` vale só para os comandos abaixo — não alcança as mensagens.
   esperadas="$(awk '
     match($0, /drop policy if exists "?[a-zA-Z0-9_]+"? on public\.[a-zA-Z0-9_]+/) {
       linha = substr($0, RSTART, RLENGTH); acao = "drop"
@@ -314,13 +442,52 @@ if [ -f supabase/baseline.sql ]; then
       estado[linha] = acao; acao = ""
     }
     END { for (k in estado) if (estado[k] == "create") print k }
-  ' supabase/baseline.sql | sort -u)"
+  ' supabase/baseline.sql | LC_ALL=C sort -u)"
 
-  existentes="$(docker run --rm -i postgres:17-alpine psql "$(url_do_schema)" -t -A -F'|' -c \
+  # ── E SÓ SE COBRE QUEM TEM A RELAÇÃO NO BANCO ──────────────────────────────
+  #
+  # MEDIDO na issue #1897: as 8 regras de honorários moram DENTRO do corpo de
+  # public.fn_honorarios_provisionar() (supabase/baseline.sql:36801, primeira
+  # policy em :36896), e essa função só executa quando um administrador chama
+  # fn_modulo_instalar('honorarios', …) — criar a função não cria tabela nenhuma,
+  # como a própria migration 0480 / ADR-0002 avisa. Num VPS SEM o módulo,
+  # honorarios_contratos e honorarios_parcelas não existem: o awk de cima enxerga
+  # o `create policy` no TEXTO do arquivo, a recriação responde
+  # `relation does not exist`, a segunda conferência acusa as MESMAS 8 e o script
+  # sai em 1 com o CRM parado — era a atualização inteira de toda instalação sem
+  # o módulo de honorários (a tela mostrava as 8 e mais nada).
+  #
+  # A régua passa a cobrir só policy cuja RELAÇÃO já existe em `public`. É mais
+  # genérico do que caçar `$f$`/`$$` no texto: cobre os próximos módulos da
+  # ADR-0002, venham eles por corpo de função, por migration ou por qualquer
+  # outra forma de escrever o baseline. E NÃO afrouxa nada: policy de tabela que
+  # EXISTE continua sendo cobrada, que é o caso para o qual o aviso existe — a
+  # regra que some do banco com a tabela de pé continua derrubando a atualização.
+  #
+  # ⚠️ Se a consulta vier VAZIA (banco fora do ar, URL trocada), NÃO se filtra.
+  # Sem a lista de relações, filtrar derrubaria `esperadas` inteira e o ✓ sairia
+  # com "0 declaradas" — o aviso viraria mudo exatamente quando ninguém consegue
+  # ler o banco. Vale o comportamento antigo, que é barulhento: tudo é cobrado e
+  # a conferência para. Surdo nunca.
+  tabelas="$(pg_container -i postgres:17-alpine psql "$(url_do_schema)" -t -A -c \
+    "select c.relname from pg_class c join pg_namespace n on n.oid=c.relnamespace
+       where n.nspname='public';" 2>/dev/null | LC_ALL=C sort -u)"
+
+  if [ -n "$tabelas" ]; then
+    # `esperadas` é `regra|tabela`; o filtro olha só a tabela. A saída do awk
+    # segue a ordem do SEGUNDO arquivo (o `esperadas` já ordenado), e o
+    # segundo `sort` reforça o MESMO pino de antes (LC_ALL=C): o `comm` logo
+    # abaixo lê em `LC_ALL=C` e não perdoa entrada fora de ordem.
+    esperadas="$(awk 'NR == FNR { existe[$0] = 1; next }
+      { split($0, par, "[|]"); if (existe[par[2]]) print }' \
+      <(printf '%s\n' "$tabelas") <(printf '%s\n' "$esperadas") | LC_ALL=C sort -u)"
+  fi
+
+  existentes="$(pg_container -i postgres:17-alpine psql "$(url_do_schema)" -t -A -F'|' -c \
     "select p.polname, c.relname from pg_policy p join pg_class c on c.oid=p.polrelid
-       join pg_namespace n on n.oid=c.relnamespace where n.nspname='public';" 2>/dev/null | sort -u)"
+       join pg_namespace n on n.oid=c.relnamespace where n.nspname='public';" 2>/dev/null | LC_ALL=C sort -u)"
 
-  faltando="$(comm -23 <(printf '%s\n' "$esperadas") <(printf '%s\n' "$existentes") || true)"
+  faltando="$(LC_ALL=C comm -23 <(printf '%s\n' "$esperadas") <(printf '%s\n' "$existentes") || true)"
 
   if [ -n "$faltando" ]; then
     # ── RECRIAR AS QUE FALTAM, NUNCA REAPLICAR O ARQUIVO ─────────────────────
@@ -367,15 +534,17 @@ if [ -f supabase/baseline.sql ]; then
     ' "$faltam_arq" supabase/baseline.sql)"
 
     if [ -n "$recria" ]; then
-      printf '%s\n' "$recria" | docker run --rm -i postgres:17-alpine \
+      printf '%s\n' "$recria" | pg_container -i postgres:17-alpine \
         psql "$(url_do_schema)" >> "$PROJECT_DIR/.deskcomm-banco.log" 2>&1 || true
     fi
     rm -f "$faltam_arq"
 
-    existentes="$(docker run --rm -i postgres:17-alpine psql "$(url_do_schema)" -t -A -F'|' -c \
+    existentes="$(pg_container -i postgres:17-alpine psql "$(url_do_schema)" -t -A -F'|' -c \
       "select p.polname, c.relname from pg_policy p join pg_class c on c.oid=p.polrelid
-         join pg_namespace n on n.oid=c.relnamespace where n.nspname='public';" 2>/dev/null | sort -u)"
-    faltando="$(comm -23 <(printf '%s\n' "$esperadas") <(printf '%s\n' "$existentes") || true)"
+         join pg_namespace n on n.oid=c.relnamespace where n.nspname='public';" 2>/dev/null | LC_ALL=C sort -u)"
+    # Mesma ordenação da primeira conferência, e pelo mesmo motivo: `LC_ALL=C`
+    # é o que faz `sort` e `comm` concordarem. Ver o bloco acima.
+    faltando="$(LC_ALL=C comm -23 <(printf '%s\n' "$esperadas") <(printf '%s\n' "$existentes") || true)"
   fi
 
   if [ -n "$faltando" ]; then
@@ -419,6 +588,12 @@ if [ -f supabase/baseline.sql ]; then
 else
   c_ylw "⚠ supabase/baseline.sql não encontrado — pulei a parte do banco."
 fi
+# Retentativa não cura estes: a migration NÃO chegou, e seguir daqui trocava o
+# app por cima de um banco pela metade com status 0 — o "deu certo" do cron.
+# DEPOIS da conferência das regras de isolamento, nunca antes: ela recria as que
+# faltam e, se não conseguir, mantém o CRM parado. Sair antes dela deixaria o
+# trap subir o app sem regra — tela vazia para todo mundo.
+[ -z "$BANCO_RESTANTE" ] || die "O banco NÃO terminou limpo e os erros acima repetir não cura: a migration NÃO chegou. A atualização PARA aqui."
 [ -n "${DESKCOMM_AGENT_REPORT:-}" ] && eval "${DESKCOMM_AGENT_REPORT_CMD}" banco
 
 # ── 4.5 E-mails de acesso, para quem já estava instalado ────────────────────
@@ -474,6 +649,14 @@ step "Baixando a versão nova do app e reiniciando"
 # estado que a execução ANTERIOR deixou, e o dono nunca soube: o `update.sh`
 # antigo grava só `APP_IMAGE`, e o worker fica seguindo um canal móvel.
 PIN_FALTANDO_ANTES="$(pin_incompleto .env)"
+
+# O snapshot que torna o rollback possível (#1955, critério 4): os OITO pins de
+# versão do `.env` ANTES de gravar os novos. É a última janela em que a versão
+# anterior ainda está escrita — depois de `gravar_imagens` + dos `export` logo
+# abaixo, TODO `up -d` seguinte (inclusive o da volta e o do gatilho de saída)
+# já aponta para a versão nova. É por isso que a instalação da issue terminou
+# com os serviços em `Created`: a "volta" usava imagens que não existiam.
+armar_rollback_de_versao .env
 
 VERSAO_ALVO="${TARGET_TAG#v}"
 export APP_IMAGE="${IMG_APP}:${VERSAO_ALVO}"
@@ -546,11 +729,31 @@ garantir_rede_do_proxy
 manutencao_desce
 CONSTRUIU_AQUI=""
 if ! dc up -d; then
+  # ── O PORTÃO DO BUILD LOCAL (#1955, critério 2) ─────────────────────────
+  # O gatilho continua sendo o CÓDIGO DE SAÍDA do `up -d` (nunca o texto do
+  # erro — arquitetura, tag publicando, pacote privado e registro fora caem no
+  # mesmo caminho), mas a CONSTRUÇÃO deixou de ser o que acontece SOZINHO
+  # quando quem falhou é o REGISTRO: foi o que transformou um apagão de DNS em
+  # OOM no `next-build` e a instalação em 502.
+  #
+  # Quem tem registro respondendo continua se recuperando sozinho — é a
+  # recuperação de arquitetura do #1060/#1143 e ela não pode sumir. Quem quer
+  # construir de propósito pede com DESKCOMM_BUILD_LOCAL=1.
+  if ! build_local_permitido "$VERSAO_ALVO"; then
+    c_red "✖ A atualização não terminou: o registro de imagens não responde, e a construção local está DESLIGADA por padrão."
+    c_ylw "  Sem resposta do registro (DNS/rede) a construção local gastaria a memória"
+    c_ylw "  desta VPS e deixaria os serviços parados — é exatamente o defeito da #1955."
+    c_ylw "  A versão anterior volta sozinha no fim desta saída; o diagnóstico fica em:"
+    c_ylw "    .deskcomm-update-diagnostico.log"
+    c_ylw "  Para construir as imagens aqui DE PROPÓSITO (mais lento, exige memória):"
+    c_ylw "    DESKCOMM_BUILD_LOCAL=1 bash hostgator-setup-kit/update.sh --to $TARGET_TAG --force"
+    exit 1
+  fi
   if construir_aqui_e_subir "$VERSAO_ALVO"; then
     CONSTRUIU_AQUI=1
   else
     c_red "✖ A atualização não terminou: nem as imagens prontas desta versão nem a construção aqui funcionaram."
-    c_ylw "  O CRM segue no ar, na versão anterior. O erro está logo acima;"
+    c_ylw "  A versão anterior volta sozinha no fim desta saída. O erro está logo acima;"
     c_ylw "  para reproduzir só a construção: docker compose $(dc_files) -f ${COMPOSE_BUILD} build"
     exit 1
   fi
@@ -588,6 +791,25 @@ step "Conferindo se o app voltou no ar"
 ok=""
 wait_app_healthy 20 3 >/dev/null && ok=1
 if [ -n "$ok" ]; then
+  # ── E OS OUTROS SERVIÇOS? (#1955, critério 6) ─────────────────────────
+  # O app responder não é o parque inteiro de pé: worker, scheduler e o proxy
+  # sobem no MESMO `up -d` e podem ter ficado em `Created`/`Exited` pela mesma
+  # imagem que faltou. A promessa da issue é "saiem saudáveis OU o rollback
+  # roda" — e rollback só roda se alguém CONSTATAR o serviço fora. Lista vazia
+  # (o `ps` não respondeu) não derruba nada: só se devolve a versão anterior
+  # havendo um serviço positivamente fora do ar.
+  FORA_DO_AR="$(servicos_fora_do_ar || true)"
+  if [ -n "$FORA_DO_AR" ]; then c_red "✖ O app respondeu, mas estes serviços NÃO subiram: $FORA_DO_AR"; c_ylw "  Voltando para a versão anterior automaticamente — o desfecho está no fim desta saída."; exit 1; fi
+  # Daqui para baixo a atualização ACABOU: é o único ponto em que todas as
+  # peças provaram estar de pé, e por isso é aqui que o rollback é desarmado.
+  UPDATE_STATUS="concluído"
+  desarmar_rollback_de_versao
+  # O marcador que a guarda de arquitetura lê (#1778). Instalações antigas só
+  # seriam reconhecidas pelo contêiner — que um `down` sem `-v` apaga. Gravar
+  # aqui, com o app saudável, fecha esse caso a partir desta atualização.
+  # Falhar em gravar não desfaz nada: a guarda segue caindo no sinal do
+  # contêiner para arquiteturas que ainda não têm imagens publicadas.
+  marcar_instalacao_feita "$TARGET_TAG" || true
   if [ -n "$BANCO_INCOMPLETO" ]; then
     c_ylw "⚠ App no ar e saudável, mas o banco NÃO terminou limpo — o que fazer está no fim desta saída."
   else

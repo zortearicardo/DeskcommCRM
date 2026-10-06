@@ -4,6 +4,7 @@ import { NextRequest } from "next/server";
 import { aplicarConvite } from "@/lib/auth/aplicar-convite";
 import { decidirConviteDoSignup } from "@/lib/auth/convite-no-signup";
 import { ensureTenantForUser } from "@/lib/auth/provision";
+import { modoDeCadastro } from "@/lib/auth/politica-de-cadastro";
 import { createClient } from "@/lib/supabase/server";
 
 /**
@@ -24,12 +25,22 @@ import { createClient } from "@/lib/supabase/server";
  *
  * O que NÃO pode regredir: sem token válido E sem sessão, a recusa continua
  * sendo recusa — senão a rota vira porta aberta.
+ *
+ * 3. ABRIR o link não pode gastar o token. Medido numa instalação real em
+ *    2026-10-03 (Supabase Auth logs): ~12 s depois de cada e-mail de
+ *    recuperação para um endereço Hotmail, um `verify` com 200 consumia o
+ *    token — o verificador de links da Microsoft visitando o link antes da
+ *    pessoa — e o clique de verdade, segundos depois, caía em
+ *    `One-time token not found` → `/login?error=link_invalido`. Por isso o
+ *    GET com `token_hash` só leva à tela de confirmação, e quem gasta o token
+ *    é o POST do botão "Continuar", que nenhum verificador aperta.
  */
 
 vi.mock("@/lib/supabase/server", () => ({ createClient: vi.fn() }));
 vi.mock("@/lib/auth/aplicar-convite", () => ({ aplicarConvite: vi.fn() }));
 vi.mock("@/lib/auth/convite-no-signup", () => ({ decidirConviteDoSignup: vi.fn() }));
 vi.mock("@/lib/auth/provision", () => ({ ensureTenantForUser: vi.fn(async () => undefined) }));
+vi.mock("@/lib/auth/politica-de-cadastro", () => ({ modoDeCadastro: vi.fn(async () => "aberto") }));
 vi.mock("@/lib/audit", () => ({ audit: vi.fn(async () => undefined) }));
 vi.mock("@/lib/env", () => ({ env: { NEXT_PUBLIC_APP_URL: "http://localhost:3000" } }));
 
@@ -63,6 +74,15 @@ function requisicao(qs: string) {
   return new NextRequest(`http://localhost:3000/auth/confirm?${qs}`);
 }
 
+/** O POST do botão "Continuar" da tela de confirmação — quem de fato gasta o token. */
+function envio(qs: string) {
+  return new NextRequest("http://localhost:3000/auth/confirm", {
+    method: "POST",
+    body: new URLSearchParams(qs),
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+  });
+}
+
 /** O destino do redirect, sem o host — é o que o teste realmente afirma. */
 function destino(res: Response): string {
   return new URL(res.headers.get("location") ?? "").pathname + new URL(res.headers.get("location") ?? "").search;
@@ -72,6 +92,7 @@ describe("GET /auth/confirm", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     vi.mocked(aplicarConvite).mockResolvedValue({ ok: true, membershipId: "m1", mudou: true });
+    vi.mocked(modoDeCadastro).mockResolvedValue("aberto");
   });
 
   function comSupabase(c: Cenario) {
@@ -79,6 +100,57 @@ describe("GET /auth/confirm", () => {
       stubSupabase(c) as unknown as Awaited<ReturnType<typeof createClient>>,
     );
   }
+
+  it("abrir o link (GET com token_hash) NÃO gasta o token: leva à tela de confirmação", async () => {
+    const supabase = stubSupabase({
+      verifyOtp: { data: { user: USUARIO }, error: null },
+      getUser: { data: { user: null } },
+    });
+    vi.mocked(createClient).mockResolvedValue(supabase as unknown as Awaited<ReturnType<typeof createClient>>);
+
+    const { GET } = await import("./route");
+    const res = await GET(requisicao("type=recovery&token_hash=pkce_abc"));
+
+    // Quem abre o link sem apertar nada — o verificador do Hotmail — não chega
+    // ao provedor de auth: o token continua vivo para o clique da pessoa.
+    expect(supabase.auth.verifyOtp).not.toHaveBeenCalled();
+    const alvo = new URL(res.headers.get("location") ?? "");
+    expect(alvo.pathname).toBe("/login/continuar");
+    expect(alvo.searchParams.get("type")).toBe("recovery");
+    expect(alvo.searchParams.get("token_hash")).toBe("pkce_abc");
+  });
+
+  it("o botão Continuar (POST) gasta o token e redireciona com 303, nunca reenviando o POST", async () => {
+    comSupabase({ verifyOtp: { data: { user: USUARIO }, error: null }, getUser: { data: { user: null } } });
+
+    const { POST } = await import("./route");
+    const res = await POST(envio("type=recovery&token_hash=pkce_abc"));
+
+    // 307/308 repetiriam o POST no destino; 303 vira GET, que é o que /login/reset espera.
+    expect(res.status).toBe(303);
+    expect(destino(res)).toBe("/login/reset");
+  });
+
+  it("GET sem token nenhum: continua recusando", async () => {
+    const { GET } = await import("./route");
+    const res = await GET(requisicao(""));
+
+    expect(destino(res)).toBe("/login?error=link_invalido");
+  });
+
+  it("POST sem token nenhum: recusa, não chama o provedor", async () => {
+    const supabase = stubSupabase({
+      verifyOtp: { data: { user: null }, error: null },
+      getUser: { data: { user: null } },
+    });
+    vi.mocked(createClient).mockResolvedValue(supabase as unknown as Awaited<ReturnType<typeof createClient>>);
+
+    const { POST } = await import("./route");
+    const res = await POST(envio(""));
+
+    expect(supabase.auth.verifyOtp).not.toHaveBeenCalled();
+    expect(destino(res)).toBe("/login?error=link_invalido");
+  });
 
   it("convite válido: grava o vínculo e entra no app, sem tela intermediária", async () => {
     comSupabase({ verifyOtp: { data: { user: USUARIO }, error: null }, getUser: { data: { user: null } } });
@@ -88,8 +160,8 @@ describe("GET /auth/confirm", () => {
       payload: PAYLOAD,
     } as ReturnType<typeof decidirConviteDoSignup>);
 
-    const { GET } = await import("./route");
-    const res = await GET(requisicao("type=signup&token_hash=abc"));
+    const { POST } = await import("./route");
+    const res = await POST(envio("type=signup&token_hash=abc"));
 
     expect(vi.mocked(aplicarConvite)).toHaveBeenCalledWith(
       expect.objectContaining({ userId: USUARIO.id, payload: PAYLOAD }),
@@ -110,8 +182,8 @@ describe("GET /auth/confirm", () => {
       payload: PAYLOAD,
     } as ReturnType<typeof decidirConviteDoSignup>);
 
-    const { GET } = await import("./route");
-    const res = await GET(requisicao("type=signup&token_hash=ja-usado"));
+    const { POST } = await import("./route");
+    const res = await POST(envio("type=signup&token_hash=ja-usado"));
 
     expect(destino(res)).toBe("/app");
     expect(destino(res)).not.toContain("/login");
@@ -123,8 +195,8 @@ describe("GET /auth/confirm", () => {
       getUser: { data: { user: null } },
     });
 
-    const { GET } = await import("./route");
-    const res = await GET(requisicao("type=signup&token_hash=lixo"));
+    const { POST } = await import("./route");
+    const res = await POST(envio("type=signup&token_hash=lixo"));
 
     expect(destino(res)).toBe("/login?error=link_invalido");
     expect(vi.mocked(aplicarConvite)).not.toHaveBeenCalled();
@@ -151,8 +223,8 @@ describe("GET /auth/confirm", () => {
     } as ReturnType<typeof decidirConviteDoSignup>);
     vi.mocked(aplicarConvite).mockResolvedValue({ ok: false, motivo: "invalid_or_expired" });
 
-    const { GET } = await import("./route");
-    const res = await GET(requisicao("type=signup&token_hash=abc"));
+    const { POST } = await import("./route");
+    const res = await POST(envio("type=signup&token_hash=abc"));
 
     expect(destino(res)).toBe("/team/accept-invite/tok-123");
   });
@@ -161,11 +233,41 @@ describe("GET /auth/confirm", () => {
     comSupabase({ verifyOtp: { data: { user: USUARIO }, error: null }, getUser: { data: { user: null } } });
     vi.mocked(decidirConviteDoSignup).mockReturnValue({ tipo: "provisionar" });
 
-    const { GET } = await import("./route");
-    const res = await GET(requisicao("type=signup&token_hash=abc"));
+    const { POST } = await import("./route");
+    const res = await POST(envio("type=signup&token_hash=abc"));
 
     expect(vi.mocked(ensureTenantForUser)).toHaveBeenCalledWith(USUARIO);
     expect(vi.mocked(aplicarConvite)).not.toHaveBeenCalled();
     expect(destino(res)).toBe("/onboarding/welcome");
+  });
+
+  it("sem convite em instalação com_aprovacao: e-mail confirmado, mas a empresa espera o pedido", async () => {
+    // Recorte do PR #714 (migration 0383). O e-mail acabou de ser provado pelo
+    // `verifyOtp` do provedor; a empresa só nasce na aprovação do administrador.
+    comSupabase({ verifyOtp: { data: { user: USUARIO }, error: null }, getUser: { data: { user: null } } });
+    vi.mocked(decidirConviteDoSignup).mockReturnValue({ tipo: "provisionar" });
+    vi.mocked(modoDeCadastro).mockResolvedValue("com_aprovacao");
+
+    const { POST } = await import("./route");
+    const res = await POST(envio("type=signup&token_hash=abc"));
+
+    expect(vi.mocked(ensureTenantForUser)).not.toHaveBeenCalled();
+    expect(destino(res)).toBe("/get-started");
+  });
+
+  it("convite válido em instalação com_aprovacao: entra direto, o convite já é a aprovação", async () => {
+    comSupabase({ verifyOtp: { data: { user: USUARIO }, error: null }, getUser: { data: { user: null } } });
+    vi.mocked(decidirConviteDoSignup).mockReturnValue({
+      tipo: "convite",
+      token: "tok",
+      payload: PAYLOAD,
+    } as ReturnType<typeof decidirConviteDoSignup>);
+    vi.mocked(modoDeCadastro).mockResolvedValue("com_aprovacao");
+
+    const { POST } = await import("./route");
+    const res = await POST(envio("type=signup&token_hash=abc"));
+
+    expect(destino(res)).toBe("/app");
+    expect(vi.mocked(ensureTenantForUser)).not.toHaveBeenCalled();
   });
 });

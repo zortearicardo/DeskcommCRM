@@ -6,11 +6,16 @@ import { requireSupportWrite } from "@/lib/impersonate/support";
 import { requireRole } from "@/lib/auth/require-role";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { publishFirstVersion } from "@/lib/ai/agents/first-publication";
+import { mensagemDoEscopo, validarEscopoDaVersao } from "@/lib/ai/agents/escopo";
 import { ok, fail } from "@/lib/api/wrappers";
 import { audit } from "@/lib/audit";
+import { ehProvedorSuportado } from "@/lib/ai/pontos/provedores";
 const input = z.object({
   channel_id: z.uuid(),
-  provider: z.string().min(1).max(80),
+  // Só quem CONVERSA: o Jev tem chave cadastrável, mas escolhido como cérebro
+  // do agente todo turno morreria. Antes era qualquer texto, barrado só de
+  // raspão (catálogo sem linha e o credential_provider_mismatch da RPC).
+  provider: z.string().min(1).max(80).refine(ehProvedorSuportado),
   model: z.string().min(1).max(200),
   credential_id: z.uuid().nullable(),
 });
@@ -55,8 +60,11 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
       409,
       { requestId },
     );
-  const p = parsed.data,
-    result = await publishFirstVersion(
+  const p = parsed.data;
+  // O canal já é conferido contra a organização em `publishFirstVersion`.
+  const escopo = await validarEscopoDaVersao(admin, auth.org.orgId, { credential_id: p.credential_id });
+  if (!escopo.ok) return fail("validation_failed", mensagemDoEscopo(escopo), 422, { requestId });
+  const result = await publishFirstVersion(
       admin,
       auth.org.orgId,
       agent,

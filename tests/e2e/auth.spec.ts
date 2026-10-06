@@ -1,4 +1,4 @@
-import { test, expect } from "@playwright/test";
+import { test, expect } from "./helpers/test";
 import AxeBuilder from "@axe-core/playwright";
 
 test.describe("auth flow", () => {
@@ -13,7 +13,7 @@ test.describe("auth flow", () => {
     await page.goto("/login");
     await page.locator("#email").fill("nobody@example.com");
     await page.locator("#password").fill("wrong-password-xyz");
-    await page.getByRole("button", { name: /entrar/i }).click();
+    await page.getByRole("button", { name: "Entrar", exact: true }).click();
     // Wait for either an inline error or that we did NOT navigate to /app
     await page.waitForTimeout(1500);
     expect(page.url()).not.toMatch(/\/app\//);
@@ -26,8 +26,11 @@ test.describe("auth flow", () => {
     await page.keyboard.press("Tab");
     await expect(page.locator("#password")).toBeFocused();
     await page.keyboard.press("Tab");
+    // O botão de mostrar a senha fica no Tab de propósito: quem usa só o teclado precisa alcançá-lo.
+    await expect(page.getByRole("button", { name: "Mostrar senha" })).toBeFocused();
+    await page.keyboard.press("Tab");
     // Next focusable is the submit button
-    const submit = page.getByRole("button", { name: /entrar/i });
+    const submit = page.getByRole("button", { name: "Entrar", exact: true });
     await expect(submit).toBeFocused();
   });
 

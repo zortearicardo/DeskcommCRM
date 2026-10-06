@@ -1,7 +1,13 @@
 import { notFound } from "next/navigation";
 
+import { CssPersonalizado } from "./_css-personalizado";
 import { loadAuthUser } from "@/lib/auth/server";
+import {
+  cssPersonalizadoDaInstalacao,
+  validarCssPersonalizado,
+} from "@/lib/branding/css-personalizado";
 import { marcaDaInstalacao } from "@/lib/branding/instalacao";
+import { logoDaCamada } from "@/lib/branding/logo";
 import { REGUA_DO_PRODUTO } from "@/lib/branding/regua-do-produto";
 import { camadaDaInstalacao, camadaDoAmbiente, resolverMarca } from "@/lib/branding/resolve";
 import { env } from "@/lib/env";
@@ -59,14 +65,15 @@ export default async function Page() {
   if (!usuario?.is_platform_admin) notFound();
   const idioma = normalizarIdioma(usuario.locale);
 
-  const linha = await marcaDaInstalacao();
+  const [linha, cssPersonalizado] = await Promise.all([
+    marcaDaInstalacao(),
+    cssPersonalizadoDaInstalacao(),
+  ]);
+  const validacaoCss = validarCssPersonalizado(cssPersonalizado);
   // A MESMA pilha do `app/layout.tsx` — banco acima, arquivo de instalação
   // embaixo. Montar outra aqui faria a tela relatar uma precedência que o
   // produto não usa, que é a pior mentira possível numa tela de diagnóstico.
-  const marca = resolverMarca(
-    [camadaDaInstalacao(linha), camadaDoAmbiente(env)],
-    REGUA_DO_PRODUTO,
-  );
+  const marca = resolverMarca([camadaDaInstalacao(linha), camadaDoAmbiente(env)], REGUA_DO_PRODUTO);
 
   // O que apareceria SEM o arquivo subido — a MESMA pilha com `logo_path`
   // zerado, e não uma leitura solta de `APP_LOGO_URL`. É assim que a prévia
@@ -102,6 +109,9 @@ export default async function Page() {
         }}
         nomeEmVigor={marca.name}
         logoEmVigor={marca.logoUrl}
+        logoEscuroEmVigor={marca.logoDarkUrl}
+        // Mesma conversão caminho → URL do logo; `null` sem arquivo subido.
+        iconeDaAba={logoDaCamada(linha?.favicon_path, null)}
         logoDoAmbiente={semOArquivo.logoUrl}
         origens={marca.origens}
         // `seeded_from_env` ligado significa que a linha é cópia do arquivo de
@@ -110,6 +120,7 @@ export default async function Page() {
         fallbackEm={instanteLegivel(linha?.fallback_at ?? null, tagDeIdioma(idioma))}
         fallbackMotivo={linha?.fallback_reason ?? null}
       />
+      <CssPersonalizado gravado={cssPersonalizado} erroAtual={validacaoCss.erro} />
     </div>
   );
 }

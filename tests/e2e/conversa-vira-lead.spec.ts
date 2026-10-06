@@ -15,14 +15,15 @@
  * Cobre:
  *  1. mensagem nova de contato desconhecido ⇒ card no funil de entrada, com o
  *     nome de quem escreveu;
- *  2. a timeline explica de onde ele veio ("Entrou pelo WhatsApp");
+ *  2. a timeline explica de onde ele veio ("Entrou no funil" + "primeira mensagem
+ *     recebida no WhatsApp");
  *  3. a segunda mensagem do MESMO contato não abre um segundo card.
  */
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-import { test, expect, type Page } from "@playwright/test";
+import { test, expect, type Page } from "./helpers/test";
 
 const CREDS_PATH = path.join(process.cwd(), ".e2e-creds.json");
 
@@ -66,7 +67,7 @@ async function login(page: Page): Promise<void> {
   await page.goto("/login");
   await page.locator("#email").fill(creds.users.manager!.email);
   await page.locator("#password").fill(creds.password);
-  await page.getByRole("button", { name: /entrar/i }).click();
+  await page.getByRole("button", { name: "Entrar", exact: true }).click();
   await page.waitForURL(/\/app/, { timeout: 30_000 });
 }
 
@@ -117,10 +118,12 @@ test.describe("a conversa vira lead", () => {
 
     await page.getByText(NOME, { exact: false }).first().click();
 
-    // "Entrou pelo WhatsApp" é o rótulo de `lead_created`. Card que aparece sem
-    // explicação é como se perde a confiança num automatismo — o dono não sabe
-    // se foi ele, a IA, ou um erro.
-    await expect(page.getByText(/entrou pelo whatsapp/i).first()).toBeVisible({ timeout: 20_000 });
+    // "Entrou no funil" é o rótulo de `lead_created`; o CANAL vem no motivo,
+    // tirado de `conversations.channel` (`lib/channels/origem-do-negocio.ts`).
+    // Card que aparece sem explicação é como se perde a confiança num
+    // automatismo — o dono não sabe se foi ele, a IA, ou um erro.
+    await expect(page.getByText(/entrou no funil/i).first()).toBeVisible({ timeout: 20_000 });
+    await expect(page.getByText(/primeira mensagem recebida no whatsapp/i).first()).toBeVisible();
   });
 
   test("a segunda mensagem do mesmo contato NÃO abre um segundo card", async ({ page }) => {

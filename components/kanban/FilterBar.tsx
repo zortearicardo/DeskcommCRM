@@ -5,9 +5,12 @@ import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
+  DropdownMenuCheckboxItem,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
@@ -20,15 +23,24 @@ import { marcadoresDoCard } from "@/lib/kanban/marcadores-do-card";
 import { OwnerBadge } from "./OwnerBadge";
 import {
   agentOwnerFilter,
+  marcadoresDoFiltro,
   parseAgentOwnerFilter,
   type LeadFilters,
 } from "@/lib/kanban/filters";
+import { categoriaDoMotivo } from "@/lib/leads/motivos-de-perda-do-funil";
+import { rotuloDoMotivoDePerda } from "@/lib/schemas/leads";
 import { cn } from "@/lib/utils";
 
 interface FilterBarProps {
   filters: LeadFilters;
   onChange: (next: LeadFilters) => void;
   leads: Lead[];
+  /**
+   * O `settings` do funil do quadro (issue #1537) — é dele que sai a categoria
+   * de cada motivo, que não é coluna do lead nem está no card. Sem isto o filtro
+   * de categoria não teria o que oferecer.
+   */
+  settings?: Record<string, unknown>;
 }
 
 const STATUS_OPTIONS: Array<{ value: NonNullable<LeadFilters["status"]>; label: string }> = [
@@ -38,7 +50,7 @@ const STATUS_OPTIONS: Array<{ value: NonNullable<LeadFilters["status"]>; label: 
   { value: "lost", label: "Perdidos" },
 ];
 
-export function FilterBar({ filters, onChange, leads }: FilterBarProps) {
+export function FilterBar({ filters, onChange, leads, settings }: FilterBarProps) {
   const t = useT();
   const user = useUser();
   const { data: members } = useAssignableMembers(true);
@@ -121,7 +133,60 @@ export function FilterBar({ filters, onChange, leads }: FilterBarProps) {
     STATUS_OPTIONS.find((o) => o.value === (filters.status ?? "all"))?.label ?? "Todos",
   );
 
-  const tagLabel = filters.tag ?? t("Tag: todas");
+  // ⚠️ O RÓTULO DO GATILHO RESUME, E NÃO CORTA O FILTRO (#1274). O nome da
+  // primeira etiqueta e o resto viram contagem: o que importa na tela é que há
+  // filtro com DUAS etiquetas, e não qual é a segunda — ela está no menu, com a
+  // caixa marcada. Uma etiqueta só mostra o nome dela, como sempre.
+  const marcadoresEscolhidos = marcadoresDoFiltro(filters.tag);
+  const tagLabel =
+    marcadoresEscolhidos.length === 0
+      ? t("Tag: todas")
+      : marcadoresEscolhidos.length === 1
+        ? `${t("Tag")}: ${marcadoresEscolhidos[0]}`
+        : `${t("Tag")}: ${marcadoresEscolhidos[0]} +${marcadoresEscolhidos.length - 1}`;
+  const alternaEtiqueta = (tag: string) => {
+    const escolhida = marcadoresEscolhidos.includes(tag);
+    const proximas = escolhida
+      ? marcadoresEscolhidos.filter((m) => m !== tag)
+      : [...marcadoresEscolhidos, tag];
+    onChange({
+      ...filters,
+      tag: proximas.length === 0 ? undefined : proximas,
+      // O modo só faz sentido com DUAS: `?tag=vip&modo=ou` é um link que não
+      // significa nada, e a chave de cache/url mudaria à toa.
+      tagMode: proximas.length > 1 ? filters.tagMode : undefined,
+    });
+  };
+
+  /**
+   * Motivo e categoria da perda (issue #1537). As opções vêm do que ESTÁ no
+   * quadro, não do cadastro: um motivo que nenhum card tem nunca acharia nada.
+   * A categoria resolve pela MESMA régua de quem filtra (`applyFilters` →
+   * `categoriaDoMotivo`), porque filtrar por uma regra e mostrar por outra é o
+   * defeito que o filtro de marcador já teve.
+   */
+  const motivosPerdidos = useMemo(() => {
+    const set = new Set<string>();
+    for (const l of leads) if (l.status === "lost" && l.lost_reason) set.add(l.lost_reason);
+    return Array.from(set).sort((a, b) => a.localeCompare(b, "pt-BR"));
+  }, [leads]);
+  const categoriasPerdidas = useMemo(() => {
+    const set = new Set<string>();
+    for (const motivo of motivosPerdidos) {
+      const categoria = categoriaDoMotivo(motivo, settings);
+      if (categoria) set.add(categoria);
+    }
+    return Array.from(set).sort((a, b) => a.localeCompare(b, "pt-BR"));
+  }, [motivosPerdidos, settings]);
+  /** Só com a aba em Perdidos: fora dela os dois filtros esconderiam tudo. */
+  const mostraPerda = (filters.status ?? "all") === "lost" && motivosPerdidos.length > 0;
+  // Canônico vira o rótulo traduzido; motivo próprio do funil é dado e sai como está.
+  const rotuloDoMotivo = (motivo: string) => {
+    const rotulo = rotuloDoMotivoDePerda(motivo);
+    return rotulo === motivo ? motivo : t(rotulo);
+  };
+  const motivoLabel = filters.lostReason ? rotuloDoMotivo(filters.lostReason) : t("Todos");
+  const categoriaLabel = filters.lostCategory ?? t("Todas");
 
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-lg border border-border bg-surface p-2">
@@ -196,23 +261,105 @@ export function FilterBar({ filters, onChange, leads }: FilterBarProps) {
         </DropdownMenuContent>
       </DropdownMenu>
 
+      {mostraPerda ? (
+        <>
+          <DropdownMenu>
+            <DropdownMenuTrigger asChild>
+              <Button variant="outline" size="sm">
+                {t("Motivo")}: {motivoLabel}
+              </Button>
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="start">
+              <DropdownMenuItem onClick={() => onChange({ ...filters, lostReason: undefined })}>
+                {t("Todos")}
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+              {motivosPerdidos.map((motivo) => (
+                <DropdownMenuItem
+                  key={motivo}
+                  onClick={() => onChange({ ...filters, lostReason: motivo })}
+                >
+                  {rotuloDoMotivo(motivo)}
+                </DropdownMenuItem>
+              ))}
+            </DropdownMenuContent>
+          </DropdownMenu>
+
+          {categoriasPerdidas.length > 0 ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="sm">
+                  {t("Categoria")}: {categoriaLabel}
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent align="start">
+                <DropdownMenuItem
+                  onClick={() => onChange({ ...filters, lostCategory: undefined })}
+                >
+                  {t("Todas")}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
+                {categoriasPerdidas.map((categoria) => (
+                  <DropdownMenuItem
+                    key={categoria}
+                    onClick={() => onChange({ ...filters, lostCategory: categoria })}
+                  >
+                    {categoria}
+                  </DropdownMenuItem>
+                ))}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : null}
+        </>
+      ) : null}
+
       <DropdownMenu>
         <DropdownMenuTrigger asChild>
           <Button variant="outline" size="sm" disabled={tagOptions.length === 0}>
-            {filters.tag ? <PontoDaEtiqueta tag={filters.tag} className="mr-2" /> : null}
+            {marcadoresEscolhidos[0] ? (
+              <PontoDaEtiqueta tag={marcadoresEscolhidos[0]} className="mr-2" />
+            ) : null}
             {tagLabel}
           </Button>
         </DropdownMenuTrigger>
         <DropdownMenuContent align="start">
-          <DropdownMenuItem onClick={() => onChange({ ...filters, tag: undefined })}>
+          <DropdownMenuItem
+            onClick={() => onChange({ ...filters, tag: undefined, tagMode: undefined })}
+          >
             {t("Todas")}
           </DropdownMenuItem>
+          {/* O E/OU só aparece com DUAS etiquetas. Com uma só o parâmetro não
+              muda o resultado — e um controle que não muda nada é pior do que
+              nenhum. */}
+          {marcadoresEscolhidos.length > 1 && (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuRadioGroup
+                value={filters.tagMode === "ou" ? "ou" : "e"}
+                onValueChange={(modo) =>
+                  onChange({ ...filters, tagMode: modo === "ou" ? "ou" : undefined })
+                }
+              >
+                <DropdownMenuRadioItem value="e">{t("Todas (E)")}</DropdownMenuRadioItem>
+                <DropdownMenuRadioItem value="ou">{t("Qualquer uma (OU)")}</DropdownMenuRadioItem>
+              </DropdownMenuRadioGroup>
+            </>
+          )}
           <DropdownMenuSeparator />
+          {/* Checkbox, e não item comum: `DropdownMenuCheckboxItem` marca e NÃO
+              fecha o menu, que é o que permite escolher a segunda etiqueta sem
+              reabrir o menu. O `onSelect` com `preventDefault` trava esse
+              comportamento, porque o item de checkbox fecha por padrão. */}
           {tagOptions.map((tag) => (
-            <DropdownMenuItem key={tag} onClick={() => onChange({ ...filters, tag })}>
+            <DropdownMenuCheckboxItem
+              key={tag}
+              checked={marcadoresEscolhidos.includes(tag)}
+              onCheckedChange={() => alternaEtiqueta(tag)}
+              onSelect={(e) => e.preventDefault()}
+            >
               <PontoDaEtiqueta tag={tag} className="mr-2" />
               {tag}
-            </DropdownMenuItem>
+            </DropdownMenuCheckboxItem>
           ))}
         </DropdownMenuContent>
       </DropdownMenu>
@@ -233,8 +380,10 @@ export function FilterBar({ filters, onChange, leads }: FilterBarProps) {
 
       {(filters.search ||
         filters.owner ||
-        filters.tag ||
+        marcadoresEscolhidos.length > 0 ||
         filters.overdueOnly ||
+        filters.lostReason ||
+        filters.lostCategory ||
         (filters.status && filters.status !== "all")) && (
         <Button
           variant="ghost"

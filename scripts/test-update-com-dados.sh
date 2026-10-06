@@ -191,6 +191,15 @@ insert into public.calendar_connections
 values ('22222222-0000-4000-8000-00000000000a', '11111111-0000-4000-8000-000000000002',
         'agenda@update-com-dados.test', 'healthy')
 on conflict do nothing;
+
+-- #1998: o mesmo model_id em dois provedores e sem linha em ai_pricing. O
+-- backfill 0068 roda ANTES do seed da Requesty, então depois do install
+-- 'openai/gpt-4o-mini' existe só sob requesty e sem preço. A re-aplicação
+-- abaixo tem de criar UMA linha de preço, e não quebrar em ai_pricing_pkey.
+insert into public.ai_models
+  (provider, model_id, display_name, input_price_per_million_cents, output_price_per_million_cents)
+values ('openrouter', 'openai/gpt-4o-mini', 'GPT-4o mini (OpenRouter)', 14, 60)
+on conflict (provider, model_id) do nothing;
 SQL
 linhas=$(docker exec "$CONTAINER" psql -U postgres -d postgres -tAc "
   select (select count(*) from public.organizations)
@@ -207,6 +216,79 @@ echo "    ✓ $linhas linhas semeadas (event_types vêm do trigger da 0185)"
   exit 1
 }
 
+# A IDENTIDADE DO QUE JÁ ESTAVA CERTO (issue #1041).
+#
+# "A re-aplicação não errou e não perdeu dado" não diz se ela REFEZ trabalho.
+# Um bloco que derruba e recria uma coluna gerada reescreve a tabela inteira sob
+# trava exclusiva, com o app no ar, e termina no mesmo estado: as duas checagens
+# acima continuam verdes. O que denuncia o trabalho refeito é o catálogo:
+#
+#   - reescrita de tabela troca o `relfilenode`;
+#   - coluna derrubada e recriada gasta um número de coluna (`attnum`) que não
+#     volta, e o Postgres conta coluna apagada no teto de 1600;
+#   - índice, constraint ou view derrubados e recriados ganham OID novo.
+#
+# Nada disso depende do volume de dados, então a sonda vale no banco pequeno
+# daqui.
+#
+# ⚠️ É uma LISTA FIXA dos objetos que a #1041 guardou, não uma varredura do
+# arquivo: um bloco novo que derrube e recrie algo fora desta lista nasce
+# invisível aqui, e o verde não afirma nada sobre ele. O apêndice ainda tem
+# outros pares "derruba e recria" — dezenas de CHECK e FK (que revalidam sem
+# reescrever a tabela), policies e gatilhos. (A view
+# `calendar_selected_external_events` tem sonda própria neste script, a da
+# issue #1086.) Para virar catraca, esta sonda teria de varrer o catálogo
+# inteiro, e não é o que ela faz.
+identidade() {
+  docker exec "$CONTAINER" psql -U postgres -d postgres -tA -c "
+    with alvo(item, rel) as (values
+      ('índice idx_followup_enrollments_one_live',           'public.idx_followup_enrollments_one_live'),
+      ('índice calendar_appointments_google_evento_key',     'public.calendar_appointments_google_evento_key'),
+      ('índice calendar_appointments_pendente_no_google_idx','public.calendar_appointments_pendente_no_google_idx'),
+      ('view calendar_google_reconcilable_appointments',     'public.calendar_google_reconcilable_appointments'))
+    select item || '=' || coalesce(to_regclass(rel)::oid::text, 'AUSENTE') from alvo
+    union all
+    select 'constraint calendar_external_events_periodo_valido=' || coalesce((
+      select oid::text from pg_constraint
+       where conname = 'calendar_external_events_periodo_valido'
+         and conrelid = 'public.calendar_external_events'::regclass), 'AUSENTE')
+    union all
+    select 'arquivo da tabela calendar_appointments=' || relfilenode
+      from pg_class where oid = 'public.calendar_appointments'::regclass
+    union all
+    select 'colunas já numeradas em ' || c.relname || '=' || max(a.attnum)
+      from pg_attribute a join pg_class c on c.oid = a.attrelid
+     where a.attrelid in ('public.calendar_appointments'::regclass, 'public.user_organizations'::regclass)
+     group by c.relname
+    order by 1;"
+}
+identidade_antes=$(identidade)
+# Guarda de vacuidade: um objeto que não existisse antes compararia AUSENTE com
+# AUSENTE e passaria verde sem medir nada.
+if grep -q 'AUSENTE' <<<"$identidade_antes"; then
+  echo "FATAL: a sonda de identidade não achou um dos objetos que ela vigia:" >&2
+  grep 'AUSENTE' <<<"$identidade_antes" >&2
+  echo "       Renomearam ou removeram o objeto? Atualize a lista em identidade()." >&2
+  exit 1
+fi
+[ "$(wc -l <<<"$identidade_antes" | tr -d ' ')" -eq 8 ] || {
+  echo "FATAL: a sonda de identidade devolveu $(wc -l <<<"$identidade_antes" | tr -d ' ') itens, e não 8." >&2
+  exit 1
+}
+
+# Guarda de vacuidade do caso #1998: sem os dois provedores e sem preço, o
+# update abaixo passaria verde sem exercitar o backfill 0068.
+caso_1998=$(docker exec "$CONTAINER" psql -U postgres -d postgres -tAc "
+  select (select count(*) from public.ai_models
+           where model_id = 'openai/gpt-4o-mini' and deprecated_at is null)
+    || '/' || (select count(*) from public.ai_pricing
+           where model = 'openai/gpt-4o-mini' and superseded_at is null);")
+[ "$caso_1998" = "2/0" ] || {
+  echo "FATAL: o caso do #1998 não foi plantado (modelos/preços = $caso_1998, esperado 2/0)." >&2
+  echo "       Sem ele, o update não exercita o backfill 0068 com model_id em dois provedores." >&2
+  exit 1
+}
+
 echo "==> UPDATE: re-aplicando baseline.sql SOBRE OS DADOS, com ON_ERROR_STOP=1"
 # O OID é lido ANTES da passada que o aceite da issue #1086 mede: este banco já
 # está no estado final (o install acabou de rodar), então a view não pode ser
@@ -219,6 +301,15 @@ oid_antes=$(oid_da_view)
 }
 psql_stop < "$BASELINE" >/dev/null
 echo "    ✓ update ok — nenhuma constraint quebrou sobre dado existente"
+preco_1998=$(docker exec "$CONTAINER" psql -U postgres -d postgres -tAc "
+  select count(*) || '/' || coalesce(min(prompt_cents_per_million_tokens)::int::text, '-')
+    from public.ai_pricing where model = 'openai/gpt-4o-mini' and superseded_at is null;")
+[ "$preco_1998" = "1/14" ] || {
+  echo "FATAL: o backfill 0068 deixou $preco_1998 (linhas/menor preço) para openai/gpt-4o-mini;" >&2
+  echo "       o esperado é 1/14: UMA linha, com o menor preço de entrada (#1998)." >&2
+  exit 1
+}
+echo "    ✓ #1998: model_id em dois provedores virou UMA linha de preço ($preco_1998)"
 
 echo "==> a view de ocupação não pode ser derrubada nem recriada pelo update (issue #1086)"
 oid_depois=$(oid_da_view)
@@ -249,6 +340,19 @@ if [ "$depois" != "$linhas" ]; then
   exit 1
 fi
 echo "    ✓ $depois linhas, iguais antes e depois"
+
+echo "==> conferindo que a re-aplicação não REFEZ o que já estava certo (issue #1041)"
+identidade_depois=$(identidade)
+if [ "$identidade_depois" != "$identidade_antes" ]; then
+  echo "FATAL: a re-aplicação refez trabalho num banco que já estava no estado final:" >&2
+  diff <(printf '%s\n' "$identidade_antes") <(printf '%s\n' "$identidade_depois") \
+    | sed -n 's/^> /       depois: /p; s/^< /       antes:  /p' >&2
+  echo "       Cada linha acima é um bloco do baseline que derruba e recria sem conferir" >&2
+  echo "       se o banco já está como ele quer. Guarde o bloco num 'do \$\$' que só age" >&2
+  echo "       quando o catálogo difere do alvo." >&2
+  exit 1
+fi
+echo "    ✓ $(wc -l <<<"$identidade_depois" | tr -d ' ') objetos com a mesma identidade antes e depois"
 
 echo "==> clone antigo: a view da v1.26.0 (select e.*, com title) tem de continuar migrando"
 # O estado da v1.26.0, no banco: a view com `e.*`. É o ÚNICO caminho em que a

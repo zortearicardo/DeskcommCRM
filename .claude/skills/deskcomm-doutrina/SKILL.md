@@ -29,7 +29,7 @@ filtra `organization_id` **manualmente**, resolvido de fonte confiável (cookie,
 webhook, token de path), **nunca do body**. No backend é sempre `getUser()`, nunca `getSession()`.
 
 **Schema sai em tripla.** Arquivo em `supabase/migrations/`, apêndice **idempotente** no
-`supabase/baseline.sql`, e linha no `MANIFEST.md`. O kit self-host aplica **só o baseline** — o que
+`supabase/baseline.sql`, e linha `-- manifest: <o quê e por quê>` no cabeçalho do `.sql` (o `MANIFEST.md` é histórico; não recebe linha nova). O kit self-host aplica **só o baseline** — o que
 não chega lá não chega em quem instalou numa VPS, que é o cliente que paga. Constraint nova exige
 corrigir os dados **antes**, senão o `update.sh` do clone quebra.
 
@@ -50,6 +50,12 @@ produto que a pessoa instala sozinha, ela não descobre que está quebrado.
 Verde de teste não é prova de comportamento. Sabote a linha que você corrigiu e confirme que a suíte
 fica **vermelha** — teste que não reprova não guarda nada. E declare o que **não** mediu: é o campo
 que separa medição de relato.
+
+E se o caminho de usuário que você provou passa por um **agente de IA**, o verde do agente não é
+prova da camada de baixo: todo caso de aceite que atravessa o agente **vem em par** com a medição
+direta da ferramenta, com o **mesmo texto cru** — o par é a unidade — e as duas medições só contam
+quando concordam. Discordância entre os dois significa que você mediu o modelo. Lei em
+[`docs/doctrine/prova-em-par.md`](../../../docs/doctrine/prova-em-par.md).
 
 ## Não-objetivos
 

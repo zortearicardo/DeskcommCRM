@@ -2,15 +2,11 @@ import { NextResponse, type NextRequest } from "next/server";
 import { refreshCatalog, syncCalendar } from "@/lib/agenda/google/calendar-executor";
 import { apenasDeMembrosAtivos } from "@/lib/agenda/google/membros";
 import { audit } from "@/lib/audit";
-import { env } from "@/lib/env";
 import { createAdminClient } from "@/lib/supabase/admin";
+import { autorizaCron } from "@/lib/auth/cron-auth";
 export const dynamic = "force-dynamic";
 async function executar(req: NextRequest) {
-  if (
-    ![env.INTERNAL_CRON_SECRET, env.INTERNAL_SECRET]
-      .filter(Boolean)
-      .some((s) => req.headers.get("authorization") === `Bearer ${s}`)
-  )
+  if (!autorizaCron(req))
     return NextResponse.json(
       { error: { code: "unauthenticated", message: "cron secret inválido" } },
       { status: 401 },
@@ -89,6 +85,23 @@ async function executar(req: NextRequest) {
         if (result !== "complete") complete = false;
         else completedCalendars += 1;
         if (result !== "busy") effects.set(org, (effects.get(org) ?? 0) + 1);
+        // O marco da PRÓPRIA leitura desta agenda. `last_sync_at` é por agenda,
+        // não por conta: quem só bloqueia horário foi lida na mesma rodada que a
+        // de destino, e a tela ("Ainda não sincronizada") não pode dizer o
+        // contrário. Só quem leu de verdade carimba: `busy` não leu nada (outra
+        // rodada segura a aquisição ou a agenda está indisponível) e `failed`
+        // não terminou — nesse caso é a `sync_error` da própria linha que conta
+        // o que houve, e um carimbo aqui mentiria. `partial` avançou um
+        // checkpoint do ciclo (página gravada no cursor), então é leitura real.
+        if (result === "complete" || result === "partial") {
+          const { error: stampError } = await db
+            .from("calendar_connection_calendars")
+            .update({ last_sync_at: new Date().toISOString() })
+            .eq("organization_id", org)
+            .eq("connection_id", connection.id)
+            .eq("id", calendar.id);
+          if (stampError) throw stampError;
+        }
       }
       await db
         .from("calendar_connections")

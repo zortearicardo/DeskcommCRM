@@ -94,10 +94,11 @@ worker:
 ### 2. Publicação é ato do CI, e carrega procedência
 
 Imagem nossa só existe se saiu de `.github/workflows/publish-image.yml`. Ela carrega os labels
-OCI — no mínimo `source`, `revision`, `version`, `licenses` — e é construída para `linux/amd64`.
+OCI — no mínimo `source`, `revision`, `version`, `licenses` — e é construída para `linux/amd64` e `linux/arm64`.
 
-- **Por quê:** duas razões distintas. **(a) Arquitetura:** um `docker build` num Mac ARM produz
-  imagem que não roda na VPS amd64 do cliente, e a falha aparece só no `up -d` dele. **(b)
+- **Por quê:** duas razões distintas. **(a) Arquitetura:** um `docker build` local pode produzir
+  imagem para a plataforma errada; o CI publica manifestos linux/amd64 e linux/arm64 e os testa
+  em runners nativos, antes de qualquer cliente chegar ao `up -d`. **(b)
   Rastreabilidade:** sem `org.opencontainers.image.revision` não existe resposta para "que
   código está rodando neste cliente?", e o suporte vira adivinhação.
 - **Verificação:** o job **`imagens-ok`** de `publish-image.yml` reprova quando qualquer uma
@@ -320,6 +321,15 @@ mesma VPS **recusa** mexer, e diz por quê.
   escrevê-lo no arquivo não desliga nada (medido: bloqueia igual). É a mesma via dos
   outros dois call sites.
 
+- **Modo single-server (o kit opera o Supabase na própria VPS):** o Supabase é um SEGUNDO
+  projeto Docker, e a regra vale para ele também. O compose oficial fixa `name: supabase` e
+  `container_name` (supabase-db, supabase-envoy…); o override do kit os retira e o projeto se
+  chama `<projeto do CRM>-supabase`, com rede privada própria. `install-single-server.sh`
+  roda os dois guardas (CRM e Supabase, `recusar_supabase_de_outra_arvore`) antes de baixar
+  ou subir qualquer coisa, e o `update.sh` roda o do Supabase. Coberto por
+  `tests/shell/single-server-operacao.test.sh`, que também resolve o override com
+  `docker compose config` (zero `container_name`, só a porta do gateway, em loopback).
+
 ---
 
 ## Política de canais
@@ -506,4 +516,7 @@ receber atualização —, nunca economia de plano.
 não fatal) abaixo desse valor, e não em 4.000.000, porque `MemTotal` é o que sobra depois do
 que o kernel reserva: uma VPS de 4 GiB reporta ~4.012.000 KB e uma de "4 GB" decimais reporta
 ~3.735.000 KB. Cortar em 4.000.000 acusaria justamente quem acabou de comprar o plano
-recomendado, na pior hora possível. Coberto por `hostgator-setup-kit/test-validators.sh`.
+recomendado, na pior hora possível. Coberto por `hostgator-setup-kit/test-validators.sh`. O modo
+single-server (`install-single-server.sh`) usa o MESMO piso, mas recusa abaixo dele (sobe o
+Supabase inteiro na VPS) e recomenda 8 GB; a igualdade dos dois números é vigiada por
+`tests/shell/single-server-installer.test.sh`.

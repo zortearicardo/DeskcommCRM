@@ -4,9 +4,12 @@ import {
   BACKOFF_MS,
   actionTurnCompleted,
   occupancyEventCount,
+  pisoDoInboundDaEspera,
   processNode,
+  rechecksOciososDaAcao,
   resolveWaitPhase,
   selectEdge,
+  turnoDaAcaoDescartado,
   type EnrollmentRow,
   type LeadFacts,
 } from "./node-handlers";
@@ -142,6 +145,34 @@ describe("occupancyEventCount", () => {
   });
 });
 
+describe("pisoDoInboundDaEspera", () => {
+  const no = {
+    id: "mr1",
+    type: "match_reply" as const,
+    label: "Casar",
+    position: { x: 0, y: 0 },
+    config: {
+      branches: [{ id: "br_sim", label: "1", op: "eq" as const, pattern: "1" }],
+      grace_timeout_ms: 7_200_000,
+    },
+  };
+  const park = "2026-09-20T17:02:31.053Z";
+  const wait = {
+    node_id: "mr1",
+    idempotency_key: "mr1:3",
+    event_type: "wait_started",
+    payload: { wake_status: "waiting_reply", next_eval_at: "2026-09-20T19:02:31.053Z" },
+  };
+
+  it("volta ao instante em que a espera começou, não ao updated_at do wake", () => {
+    expect(pisoDoInboundDaEspera(no, [wait], "2026-09-20T19:18:00.000Z")).toBe(park);
+  });
+
+  it("sem wait_started, usa o fallback", () => {
+    expect(pisoDoInboundDaEspera(no, [], "2026-09-20T19:18:00.000Z")).toBe("2026-09-20T19:18:00.000Z");
+  });
+});
+
 describe("actionTurnCompleted", () => {
   it("is true when action_sent sits in the current occupancy suffix", () => {
     const events = [
@@ -198,6 +229,50 @@ describe("processNode — action after send closed", () => {
       actionRecheckCount: 1,
     });
     expect(result.kind).toBe("recheck");
+  });
+});
+
+describe("processNode — collect/skill (passagem no relógio)", () => {
+  // Os dois nós são do fluxo de ATENDIMENTO: quem coleta e quem ativa a skill é
+  // o executor in-turn. Aqui, no motor de relógio, eles apenas seguem pela
+  // aresta única — o teste fixa esse contrato para o dia em que alguém tentar
+  // dar semântica de coleta ao tick.
+  it("collect avança pela aresta única", () => {
+    const node: FlowNode = {
+      id: "c1",
+      type: "collect",
+      label: "Cidade",
+      position: { x: 0, y: 0 },
+      config: { key: "cidade", label: "Cidade", type: "text", required: true, permite_correcao: true },
+    };
+    const edges = [edge({ source: "c1", target: "n2", condition: { type: "always" } })];
+    const r = processNode({ node, edges, enrollment: enrollment(), lead: lead(), clock });
+    expect(r).toMatchObject({ kind: "advance", next_node_id: "n2" });
+  });
+
+  it("skill avança pela aresta única", () => {
+    const node: FlowNode = {
+      id: "s1",
+      type: "skill",
+      label: "Catálogo",
+      position: { x: 0, y: 0 },
+      config: { skill_name: "catalogo-apresentacao" },
+    };
+    const edges = [edge({ source: "s1", target: "n2", condition: { type: "always" } })];
+    const r = processNode({ node, edges, enrollment: enrollment(), lead: lead(), clock });
+    expect(r).toMatchObject({ kind: "advance", next_node_id: "n2" });
+  });
+
+  it("collect sem aresta de saída falha com motivo claro", () => {
+    const node: FlowNode = {
+      id: "c1",
+      type: "collect",
+      label: "Cidade",
+      position: { x: 0, y: 0 },
+      config: { key: "cidade", label: "Cidade", type: "text", required: true, permite_correcao: true },
+    };
+    const r = processNode({ node, edges: [], enrollment: enrollment(), lead: lead(), clock });
+    expect(r).toMatchObject({ kind: "fail" });
   });
 });
 
@@ -642,7 +717,8 @@ describe("processNode — ai_classify / action", () => {
       edge({ source: "ac1", target: "no-reply-node", condition: { type: "class_match", value: "no_reply" } }),
     ];
     const result = processNode({ node, edges, enrollment: enrollment(), lead: lead(), clock, waitElapsed: true });
-    expect(result).toEqual({ kind: "advance", next_node_id: "no-reply-node", next_eval_at: NOW });
+    // `class` é o desfecho que a condição "Desfecho do passo anterior" lê depois.
+    expect(result).toEqual({ kind: "advance", next_node_id: "no-reply-node", next_eval_at: NOW, class: "no_reply" });
   });
 
   it("ai_classify re-entry without an explicit no_reply edge falls back to the 'always' edge", () => {
@@ -658,7 +734,8 @@ describe("processNode — ai_classify / action", () => {
       edge({ source: "ac1", target: "fallback-node", condition: { type: "always" } }),
     ];
     const result = processNode({ node, edges, enrollment: enrollment(), lead: lead(), clock, waitElapsed: true });
-    expect(result).toEqual({ kind: "advance", next_node_id: "fallback-node", next_eval_at: NOW });
+    // Pela saída de escape ou não, o lead saiu por "sem resposta": é esse o desfecho.
+    expect(result).toEqual({ kind: "advance", next_node_id: "fallback-node", next_eval_at: NOW, class: "no_reply" });
   });
 
   it("ai_classify re-entry with neither a no_reply nor an always edge: fails", () => {
@@ -900,6 +977,21 @@ describe("processNode — match_reply", () => {
     expect(result).toMatchObject({ kind: "advance", next_node_id: "escape" });
   });
 
+  it("wokeEarly sem texto desta pergunta permanece na espera — não ALWAYS", () => {
+    const result = processNode({
+      node: matchNode(),
+      edges,
+      enrollment: enrollment(),
+      lead: lead(),
+      clock,
+      waitElapsed: false,
+      wokeEarly: true,
+      lastInboundBody: "",
+    });
+    expect(result.kind).toBe("wait");
+    expect(result).toMatchObject({ wake_status: "waiting_reply" });
+  });
+
   it("wokeEarly + save_to sem aresta Sempre usa o primeiro ramo que não é no_reply", () => {
     const node = matchNode({ save_to: { kind: "contact_name" } });
     const soRamo = [
@@ -1081,5 +1173,30 @@ describe("processNode — repeat", () => {
       repeatTotal: null,
     });
     expect(result).toMatchObject({ kind: "advance", next_node_id: "de-novo" });
+  });
+});
+
+describe("turno descartado pela suspensão (migration 0501)", () => {
+  const ev = (event_type: string, node_id = "a1") => ({ node_id, event_type, idempotency_key: null, payload: {} });
+
+  it("o último turno descartado e não substituído pede um turno novo", () => {
+    const eventos = [ev("turn_enqueued"), ev("action_recheck"), ev("turn_discarded")];
+    expect(turnoDaAcaoDescartado(eventos, "a1")).toBe(true);
+  });
+
+  it("depois do turno novo, a estadia volta a esperar por ele", () => {
+    const eventos = [ev("turn_enqueued"), ev("turn_discarded"), ev("turn_enqueued"), ev("action_recheck")];
+    expect(turnoDaAcaoDescartado(eventos, "a1")).toBe(false);
+  });
+
+  it("descarte de outra estadia (outro nó no meio) não vale", () => {
+    const eventos = [ev("turn_discarded"), ev("node_advanced", "w1"), ev("turn_enqueued")];
+    expect(turnoDaAcaoDescartado(eventos, "a1")).toBe(false);
+  });
+
+  it("o dead-man recomeça no descarte: o turno novo tem o orçamento inteiro", () => {
+    const antes = [ev("turn_enqueued"), ...Array.from({ length: 13 }, () => ev("action_recheck"))];
+    expect(rechecksOciososDaAcao(antes, "a1")).toBe(14);
+    expect(rechecksOciososDaAcao([...antes, ev("turn_discarded"), ev("turn_enqueued")], "a1")).toBe(1);
   });
 });

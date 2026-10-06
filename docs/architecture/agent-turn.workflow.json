@@ -172,7 +172,7 @@
       "col": 3,
       "type": "frontend",
       "label": "Capacidades",
-      "sublabel": "pacotes + uso real (app/app/ai/agents)",
+      "sublabel": "pacotes + uso real + callback_enabled (app/app/ai/agents)",
       "width": 150
     },
     {
@@ -303,6 +303,46 @@
       "type": "service",
       "label": "Entrega da resposta aprovada",
       "sublabel": "Texto autorizado, fronteira e aquisição originais; recibo e liquidação recuperáveis, sem novo LLM"
+    },
+    {
+      "id": "jevRoteador",
+      "lane": "router",
+      "col": 2,
+      "type": "external",
+      "label": "Jev no roteador",
+      "sublabel": "lib/ai/decisao/roteador.ts — só a mensagem atual (R4; o histórico espera a TypeSafe, DEC-012); comparação paralela ou Jev primeiro com a IA de sempre só em reserva, e só onde a empresa a tem (R2); min_confidence e sticky preservados"
+    },
+    {
+      "id": "jevObservacoesRoteador",
+      "lane": "router",
+      "col": 3,
+      "type": "database",
+      "label": "jev_observacoes (roteador)",
+      "sublabel": "o par: agente a que o Jev levaria × agente a que a IA de sempre levou — mesmo agente final = concordou; + custo em llm_calls (intent_router, typesafe)"
+    },
+    {
+      "id": "jevCartaoRoteador",
+      "lane": "router",
+      "col": 4,
+      "type": "frontend",
+      "label": "Cartão do Jev (/app/ai/providers)",
+      "sublabel": "'Escolher qual agente atende': concordou em X de Y (30 dias); modo comparação ou sob demanda quando decide; link para resultados"
+    },
+    {
+      "id": "jevDecisoesRoteador",
+      "lane": "router",
+      "col": 3,
+      "type": "database",
+      "label": "jev_router_decisions",
+      "sublabel": "uma decisão por mensagem; modo, origem, motivo da reserva, contexto, custo, tempo e revisão humana, sem texto da conversa"
+    },
+    {
+      "id": "jevResultadosRoteador",
+      "lane": "router",
+      "col": 4,
+      "type": "frontend",
+      "label": "IA › Execuções › Roteamento",
+      "sublabel": "até 500 casos; custo e latência por modo, concordância separada de acurácia revisada; administrador marca acerto"
     }
   ],
   "edges": [
@@ -539,7 +579,7 @@
       "id": "capacidades-turn",
       "from": "capacidades",
       "to": "turn",
-      "label": "tool_ids da versão",
+      "label": "tool_ids + callback_enabled da versão",
       "variant": "dashed",
       "labelDy": 120,
       "fromSide": "right",
@@ -705,6 +745,69 @@
       "to": "reply_review",
       "label": "envio, falha ou contexto obsoleto aparecem na conversa",
       "route": "drop"
+    },
+    {
+      "id": "routerconfig-jevroteador",
+      "from": "routerconfig",
+      "to": "jevRoteador",
+      "label": "as intenções (1 a 254) viram as opções da escolha; a mesma régua de sticky e min_confidence (destinoDoVeredito)"
+    },
+    {
+      "id": "jevroteador-turn",
+      "from": "jevRoteador",
+      "to": "turn",
+      "label": "decidindo: a escolha dele decide o agente do turno",
+      "variant": "dashed"
+    },
+    {
+      "id": "routerscreen-jevroteador",
+      "from": "routerscreen",
+      "to": "jevRoteador",
+      "label": "Testar classificação: as duas escolhas lado a lado, sem observação (R5)"
+    },
+    {
+      "id": "jevroteador-observacoes",
+      "from": "jevRoteador",
+      "to": "jevObservacoesRoteador",
+      "label": "gravado quando ele responde, depois de o turno seguir"
+    },
+    {
+      "id": "observacoes-cartao",
+      "from": "jevObservacoesRoteador",
+      "to": "jevCartaoRoteador",
+      "label": "concordância por tarefa, contada no banco — o laço de retorno"
+    },
+    {
+      "id": "cartao-jevroteador",
+      "from": "jevCartaoRoteador",
+      "to": "jevRoteador",
+      "label": "Deixar o Jev decidir / Pausar; comparação ou sob demanda (settings.jev.modo_roteador), só com a IA de sempre",
+      "variant": "emphasis"
+    },
+    {
+      "id": "turn-jevdecisoesroteador",
+      "from": "turn",
+      "to": "jevDecisoesRoteador",
+      "label": "registra a decisão e o motivo da reserva depois de resolver o turno"
+    },
+    {
+      "id": "jevdecisoes-resultados",
+      "from": "jevDecisoesRoteador",
+      "to": "jevResultadosRoteador",
+      "label": "lê casos, custos e revisões por organização"
+    },
+    {
+      "id": "resultados-jevconfig",
+      "from": "jevResultadosRoteador",
+      "to": "jevCartaoRoteador",
+      "label": "resultado permite escolher o modo e rever o comportamento",
+      "variant": "dashed"
+    },
+    {
+      "id": "evidencias-comerciais-gates",
+      "from": "turn",
+      "to": "gates",
+      "label": "Catálogo/acervo consultados no turno → contexto limitado da promessa semântica; sem bypass"
     }
   ],
   "cards": [
@@ -734,7 +837,7 @@
       "title": "Capacidades: configurar e observar são a mesma peça",
       "items": [
         "Entrada: o humano liga pacotes por jornada; capacidade de risco crítico exige marcação individual",
-        "Saída: tool_ids da versão publicada é o que pickToolsFromMcp entrega ao modelo",
+        "Saída: tool_ids da versão publicada escolhe capacidades; callback_enabled filtra só a criação de retorno",
         "Volta: api_audit_log (mcp.tool_called) → fn_agent_tool_usage → usos, falhas e última vez na aba Capacidades",
         "Sem a volta, ligar uma capacidade era um ato de fé: o log existia desde a Spec 11 e nenhuma tela lia"
       ]
@@ -743,7 +846,7 @@
       "dot": "violet",
       "title": "São DOIS turnos por mensagem, não um",
       "items": [
-        "Turno 1 (Conversador): responde ao cliente e, no fechamento, DECLARA o que entendeu — duas chamadas de modelo, purpose 'agent_turn' e 'checkpoint'",
+        "Turno 1 (Conversador): responde ao cliente e, no fechamento, DECLARA o que entendeu — duas chamadas de modelo, purpose 'agent_turn' e 'checkpoint' (três quando o fechamento volta fora do contrato: uma correção só do fechamento, antes de a fila repetir o turno — fecharOTurno)",
         "Turno 2 (Operador): job próprio na fila, purpose 'operator_turn', modelo e capacidades próprios — roda DEPOIS do envio, o lead nunca espera o CRM",
         "O disparo é do RUNTIME, não do modelo: o Conversador nunca chama o Operador — se chamasse, o turno em que ele 'não achasse necessário' seria um lead parado em silêncio. Mas NÃO é incondicional: o job nasce depois de o checkpoint existir e SÓ com o papel ligado (decidirSeEnfileiraOperador), porque enfileirar com o papel desligado gastava fila e a vaga do lead para escrever uma linha de log",
         "A declaração ausente e a declaração vazia NÃO se confundem: vazia poupa a 2ª chamada; ausente a EXIGE, porque ausente significa que ninguém avaliou"
@@ -756,6 +859,16 @@
         "O Operador NÃO tem aresta para o canal: 'send_message' não está no toolset dele, e a ponte troca a lista em UM ponto só (operator-turn.ts). É ausência, não regra de prompt — a única forma que não depende de o modelo obedecer",
         "A projeção (§4) NÃO se aplica ao Operador: ele precisa do dado cru para operar, e não tem canal por onde vazar. Projetar os dois seria cegar quem opera para proteger quem não fala",
         "O Operador NÃO decide qual unidade atende: isso é do Intent Router. Os dois eixos convivem"
+      ]
+    },
+    {
+      "dot": "amber",
+      "title": "Promessas conferidas contra fontes consultadas",
+      "items": [
+        "Entrada: produtos ativos/disponíveis do catálogo e trechos das fontes habilitadas (FAQ, documento, catálogo; nunca Conversas anteriores) consultados no turno",
+        "Saída: candidata inteira + evidências limitadas → classificador → gates existentes; sem exceção automática",
+        "Sem fonte consultada mantém regra anterior; cliente, notas e prompt não autorizam oferta",
+        "Laço: impedimento no Teste → humano corrige Catálogo/Conhecimento → próxima consulta usa a fonte atualizada"
       ]
     }
   ]

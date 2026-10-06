@@ -20,9 +20,9 @@ import type { ServiceBoundary } from "@/lib/atendimento/fronteira";
 
 import { generateText, type LanguageModel } from "ai";
 
-import { DEFAULT_BOT_MODEL, gatewayConfig, gatewayHeaders } from "@/lib/ai/gateway";
+import { gatewayConfig, gatewayHeaders } from "@/lib/ai/gateway";
 import { embedText } from "@/lib/ai/embed";
-import { MODELO_DE_EMBEDDING } from "@/lib/ai/embeddings/chave";
+import { MODELO_DE_EMBEDDING_DO_GOOGLE } from "@/lib/ai/embeddings/chave";
 import { getBudgetStatus, type BudgetStatus } from "@/lib/ai/budget/check";
 import {
   AVISO_CORPO,
@@ -61,6 +61,20 @@ const RAG_TOP_K = 5;
 // Com 0.72 toda parafrase — que e como o cliente escreve — era descartada, e o RAG parecia quebrado funcionando.
 // O banco moveu o default; estes tres sitios de codigo ficaram para tras e venciam o banco, porque quem corta pelo limiar e o TypeScript.
 const RAG_THRESHOLD = 0.4;
+/**
+ * Limiar do gate G3 (bot inseguro) — era o `config` do agente, que a tela
+ * deixou de oferecer (issue #1660).
+ *
+ * O campo "Confidence threshold" prometia escalar para humano abaixo do limiar
+ * e não controlava nada: quem lia a chave era ESTE bloco, que roda depois de
+ * `if (!elegivelParaWorkerLegado(ctx.agent)) return ...`, e a régua devolve
+ * `false` desde 07/09 — ou seja, o valor gravado nunca foi ouvido. Em vez de
+ * deixar o worker lendo uma chave que nenhum formulário mais escreve
+ * (referência órfã), o gate fica com o número que já era o fallback quando a
+ * chave faltava. Religar o worker legado mantém o G3 funcionando; é este
+ * limiar que vale, e não mais o que estiver gravado no jsonb do agente.
+ */
+const LIMIAR_DE_CONFIANCA_G3 = 0.5;
 const WINDOW_24H_MS = 24 * 60 * 60 * 1000;
 const HANDOFF_RECENT_GUARD_MS = 5_000;
 
@@ -249,15 +263,11 @@ export async function processMessageReceived(row: EventRow): Promise<ProcessResu
     // zero é uma AFIRMAÇÃO ("o material é péssimo") que escala para humano toda
     // resposta que não consultou a base. Ver o cabeçalho de `checkG3`.
     const confidence = response.citations[0]?.similarity ?? null;
-    const confidenceThreshold =
-      typeof ctx.agent.config?.["confidence_threshold"] === "number"
-        ? (ctx.agent.config["confidence_threshold"] as number)
-        : 0.5;
     if (
       checkG3({
         confidence,
         outputText: response.text,
-        threshold: confidenceThreshold,
+        threshold: LIMIAR_DE_CONFIANCA_G3,
       })
     ) {
       const persisted = await persistAndDispatch(ctx, response, post.text, {
@@ -275,7 +285,7 @@ export async function processMessageReceived(row: EventRow): Promise<ProcessResu
           message_id: ctx.message_id,
           outbound_message_id: persisted.outbound_message_id,
           confidence,
-          confidence_threshold: confidenceThreshold,
+          limiar: LIMIAR_DE_CONFIANCA_G3,
           source: "g3_low_confidence",
         },
       });
@@ -529,10 +539,12 @@ async function vetoPorTetoDeGasto(alvo: {
 
 /**
  * Abre o item na Central, deduplicado por episódio ABERTO — mesmo predicado das
- * CTEs de `SQL_ORCAMENTO`. Não é atômico (o `select` e o `insert` são duas
- * idas), e o statement do engine também não trava nada: dois drains
- * simultâneos podem abrir dois itens iguais lá e aqui. Item repetido é ruído;
- * item ausente seria a IA parando sem nada na tela explicando.
+ * CTEs de `SQL_ORCAMENTO`. O `select` e o `insert` continuam sendo duas idas:
+ * dois drains simultâneos ainda passam pela busca juntos, mas agora o índice
+ * único parcial `agent_inbox_budget_aberto_unico` (migration 0540) sustenta o
+ * predicado no banco — quem chega segundo recebe `23505`, que o insert abaixo
+ * trata como "já havia item" (loga e segue). Item repetido é ruído; item
+ * ausente seria a IA parando sem nada na tela explicando.
  *
  * `ref_kind`/`ref_id` existem para que alguém possa FECHAR o item depois — o
  * PATCH de `/api/v1/ai/budget` e o retrato abaixo dependem deles.
@@ -568,11 +580,20 @@ async function abrirItemDeOrcamento(
     ref_id: orgId,
   });
   if (error) {
-    logger.warn("[ai-response] item de orçamento não pôde ser aberto na Central", {
-      organization_id: orgId,
-      kind: item.kind,
-      causa: error.message,
-    });
+    // `23505` = o índice único parcial da 0540 recusou a segunda linha: o item
+    // JÁ estava aberto (outro processo chegou primeiro). É desfecho normal, não
+    // falha — o log separa os dois para não caçar fantasma.
+    const jaEstavaAberto = error.code === "23505";
+    logger.warn(
+      jaEstavaAberto
+        ? "[ai-response] item de orçamento já estava aberto — segunda linha recusada"
+        : "[ai-response] item de orçamento não pôde ser aberto na Central",
+      {
+        organization_id: orgId,
+        kind: item.kind,
+        causa: error.message,
+      },
+    );
   }
 }
 
@@ -614,7 +635,7 @@ async function buildContext(input: BuildContextInput): Promise<GuardDecision> {
   const { data: conv, error: convErr } = await admin
     .from("conversations")
     .select(
-      "id, organization_id, contact_id, channel_session_id, last_inbound_at, bot_silenced_until, last_handoff_at, assignee_kind, contacts:contact_id(id, name, display_name, locale, is_blocked, force_human)",
+      "id, organization_id, contact_id, channel_session_id, last_inbound_at, bot_silenced_until, last_handoff_at, assignee_kind, contacts:contact_id(id, name, display_name, locale, is_blocked, is_personal, force_human)",
     )
     .eq("id", input.conversationId)
     .eq("organization_id", input.organizationId)
@@ -638,12 +659,15 @@ async function buildContext(input: BuildContextInput): Promise<GuardDecision> {
       display_name: string | null;
       locale: string | null;
       is_blocked: boolean;
+      /** Spec 21: contato pessoal nunca recebe turno (mesma família de guard do bloqueio). */
+      is_personal: boolean;
       force_human: boolean;
     } | null;
   };
   const c = conv as unknown as ConvRow;
   if (!c.contacts) return skip("conversation_not_found", "contact join missing");
   if (c.contacts.is_blocked) return skip("contact_blocked");
+  if (c.contacts.is_personal === true) return skip("contact_personal");
   if (c.contacts.force_human) return skip("force_human");
   // G3-02 — assignee de 1ª classe: humano atendendo (kind='user') veta o bot
   // deterministicamente, mesma família de guard de force_human/bot_silenced_until.
@@ -720,10 +744,12 @@ async function buildContext(input: BuildContextInput): Promise<GuardDecision> {
   // O agente legado desta organização.
   //
   // `is_active` sozinho NÃO é "quem atende", e tratá-lo como se fosse era o
-  // buraco: pausar um `mcp_agent` limpa `published_version_id` e deixa
+  // buraco: pausar um `mcp_agent` limpava `published_version_id` e deixava
   // `is_active` de pé, então este SELECT continuava trazendo o agente que o dono
   // acabara de pausar — e a trava `engine_owns_reply` logo abaixo, que é
-  // ORG-WIDE, deixa de valer exatamente quando o último publicado é pausado.
+  // ORG-WIDE, deixava de valer exatamente quando o último publicado era pausado.
+  // (Hoje pausar grava só `paused_at` e a versão segue publicada; a régua lê a
+  // pausa, e não depende de qual das duas formas a pausa tem.)
   // Resultado medido em produção: pausar o agente o fazia VOLTAR a responder,
   // com o `system_prompt` do cadastro no lugar do da versão publicada.
   //
@@ -835,7 +861,13 @@ async function buildContext(input: BuildContextInput): Promise<GuardDecision> {
         // decisão que a lê ("este agente atende?") ficava sem o dado.
         paused_at: agent.paused_at,
         id: agent.id,
-        model: agent.model || DEFAULT_BOT_MODEL,
+        // Sem `|| DEFAULT_BOT_MODEL` (issue #2377): aquele OU injetava um
+        // Claude da Anthropic num agente sem modelo — para uma empresa em
+        // OpenAI — no caminho que responde sozinho. `ai_agents.model` é NOT
+        // NULL com default no banco e a API exige min(1); vindo vazio mesmo assim,
+        // o resolvedor PULA com motivo no log (este ponto não pede queda para o
+        // par da organização).
+        model: agent.model,
         system_prompt: agent.system_prompt,
         config: (agent.config as Record<string, unknown>) ?? {},
         guardrails: (agent.guardrails as Record<string, unknown>) ?? {},
@@ -913,12 +945,14 @@ async function retrieveContext(input: RetrieveInput): Promise<RagHit[]> {
   if (fontes.length === 0 && !input.kbVersionId) return [];
 
   let embedding: number[];
+  let modelo: string;
   try {
-    const { embedding: e } = await embedText(input.query, {
+    const { embedding: e, model } = await embedText(input.query, {
       organizationId: input.organizationId,
       ponto: "embedding_consultar",
     });
     embedding = e;
+    modelo = model;
   } catch (err) {
     logger.warn("[ai-response-worker] embed falhou; segue sem RAG", {
       error: err instanceof Error ? err.message : String(err),
@@ -937,10 +971,13 @@ async function retrieveContext(input: RetrieveInput): Promise<RagHit[]> {
             p_embedding: embedding as unknown as string,
             p_k: RAG_TOP_K,
             p_threshold: RAG_THRESHOLD,
-            p_embedding_model: MODELO_DE_EMBEDDING,
+            p_embedding_model: modelo,
           } as never,
         )
-      : await admin.rpc(
+      : modelo === MODELO_DE_EMBEDDING_DO_GOOGLE
+        ? // Legado sem filtro de modelo e só com vetores OpenAI (ver search-knowledge.ts).
+          { data: [], error: null }
+        : await admin.rpc(
           "retrieve_top_k_chunks" as never,
           {
             p_organization_id: input.organizationId,

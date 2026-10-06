@@ -76,6 +76,38 @@ export interface DemandaSemProximoPasso {
   aberta_em: string;
   horas_aberta: number;
   origem: string;
+  /**
+   * Conversa VIGENTE da demanda (via `demanda_conversas`) — o deep-link que a
+   * tela abre para `#parte1` da #2035. `null` quando a demanda não tem conversa
+   * (o item cai na ficha do contato).
+   */
+  conversation_id: string | null;
+}
+
+/**
+ * N3 — negócio com proposta VENCIDA e sem proposta mais nova na cadeia. Lista
+ * paralela (como `sem_proximo_passo`), sem misturar com `items`: o radar
+ * classifica esfriamento, isto aqui é desfecho de proposta.
+ */
+export interface PropostaVencidaSemRetomada {
+  lead_id: string;
+  proposal_id: string;
+  numero: number | null;
+  ano: number | null;
+  valid_until: string | null;
+}
+
+/**
+ * C6 — rascunho com aviso `proposta_pronta_para_revisao` ABERTO. Lista
+ * paralela (como `propostas_vencidas_sem_retomada`), sem misturar com
+ * `items`: o radar classifica esfriamento, isto aqui é espera de revisão.
+ */
+export interface PropostaEsperandoRevisao {
+  proposal_id: string;
+  lead_id: string;
+  titulo: string | null;
+  contact_name: string | null;
+  created_at: string;
 }
 
 export interface RadarDeRisco {
@@ -89,6 +121,9 @@ export interface RadarDeRisco {
    */
   sem_proximo_passo: DemandaSemProximoPasso[];
   total_sem_proximo_passo: number;
+  propostas_vencidas_sem_retomada: PropostaVencidaSemRetomada[];
+  /** C6 — rascunhos com aviso de revisão aberto na Central. */
+  propostas_esperando_revisao: PropostaEsperandoRevisao[];
 }
 
 export interface OpcoesDoRadar {
@@ -98,6 +133,12 @@ export interface OpcoesDoRadar {
   now?: Date;
   /** Apenas a rota humana passa o papel efetivo; as consultas usam seu client RLS. */
   humanRole?: Role;
+  /**
+   * Só este contato — o escopo do turno do agente. Vai no WHERE de cada
+   * consulta que carrega dado de cliente (negócios, demandas, propostas), antes
+   * do `SCAN_CAP`.
+   */
+  contactId?: string;
 }
 
 export async function carregaRadarDeRisco(
@@ -140,6 +181,7 @@ export async function carregaRadarDeRisco(
   if (funisArquivados.length > 0) {
     consultaDeLeads = consultaDeLeads.not("pipeline_id", "in", `(${funisArquivados.join(",")})`);
   }
+  if (opts.contactId) consultaDeLeads = consultaDeLeads.eq("contact_id", opts.contactId);
   const { data: leads, error: leadsErr } = await consultaDeLeads
     .order("last_activity_at", { ascending: true, nullsFirst: true })
     .limit(SCAN_CAP);
@@ -284,12 +326,14 @@ export async function carregaRadarDeRisco(
   // IA usa (lib/mcp/tools/retencao.ts), e a tela e o agente têm de dizer a
   // mesma coisa sobre o mesmo negócio. Reescrevê-la agora arriscaria essa
   // paridade sem necessidade; acrescentar não arrisca nada.
-  const { data: semPasso, error: demandaError } = await admin
+  let consultaDeDemandas = admin
     .from("demandas")
     .select("id, lead_id, contact_id, aberta_em, origem, contacts(name, display_name)")
     .eq("organization_id", organizationId)
     .is("fechada_em", null)
-    .is("proximo_passo", null)
+    .is("proximo_passo", null);
+  if (opts.contactId) consultaDeDemandas = consultaDeDemandas.eq("contact_id", opts.contactId);
+  const { data: semPasso, error: demandaError } = await consultaDeDemandas
     .order("aberta_em", { ascending: true })
     .limit(SCAN_CAP);
   if (demandaError) throw new Error(`radar_demandas_failed: ${demandaError.message}`);
@@ -358,6 +402,36 @@ export async function carregaRadarDeRisco(
     demandasVisiveis = demandasVisiveis.filter(d => d.lead_id ? visibleLeads.has(d.lead_id) : visibleLeadless.has(d.id));
   }
 
+  // #2035 (Parte 1) — o deep-link do item. A conversa VIGENTE da demanda sai
+  // de `demanda_conversas` (mesma fonte da visibilidade acima); sem conversation,
+  // o item cai na ficha do contato. Prefere uma conversa ABERTA (qualquer uma
+  // serve para o link do inbox); sem nenhuma aberta, a última linha que achou
+  // (a conversa arquivada ainda é o lugar onde o atendimento aconteceu).
+  // #2294 — o invariante que encolhe esta lista de verdade:
+  // `tests/invariants/caso-encerrado-marca-o-proximo-passo-da-demanda.test.ts`
+  // prova no Postgres real que a 0505 preenche o `proximo_passo` da demanda
+  // aberta sem passo — e só dela, a mesma `agent_case_id` noutra organização
+  // fica intocada —, é o que tira o item da seção sem reescrever o passo que
+  // uma pessoa já marcou.
+  const STATUS_ABERTOS_DA_CONVERSA = new Set(["open", "pending", "claimed", "ai_handling"]);
+  const conversaPorDemanda = new Map<string, { id: string; aberta: boolean }>();
+  if (demandasVisiveis.length > 0) {
+    const { data: links, error: linksErr } = await admin
+      .from("demanda_conversas")
+      .select("demanda_id, conversation_id, conversations(status)")
+      .eq("organization_id", organizationId)
+      .in("demanda_id", demandasVisiveis.map((d) => d.id));
+    if (linksErr) throw new Error(`radar_demanda_conversa_failed: ${linksErr.message}`);
+    for (const l of links ?? []) {
+      const status = ((l.conversations as { status?: string } | null)?.status) ?? null;
+      const aberta = status !== null && STATUS_ABERTOS_DA_CONVERSA.has(status);
+      const prev = conversaPorDemanda.get(l.demanda_id);
+      if (!prev || (aberta && !prev.aberta)) {
+        conversaPorDemanda.set(l.demanda_id, { id: l.conversation_id, aberta });
+      }
+    }
+  }
+
   const semProximoPasso: DemandaSemProximoPasso[] = demandasVisiveis.map((d) => {
     // O join do PostgREST vem como ARRAY mesmo em relação um-para-um.
     const rel = d.contacts as unknown as ContatoNomeavel[] | ContatoNomeavel | null;
@@ -371,8 +445,101 @@ export async function carregaRadarDeRisco(
         (now.getTime() - new Date(d.aberta_em as string).getTime()) / 3_600_000,
       ),
       origem: d.origem as string,
+      conversation_id: conversaPorDemanda.get(d.id as string)?.id ?? null,
     };
   });
+
+  // N3 — negócio com proposta VENCIDA e sem proposta mais nova na cadeia.
+  // Consulta paralela (como `sem_proximo_passo`), sem misturar com `items`.
+  // Órfã (lead_id nulo) é descartada no JS abaixo, junto da ordenação
+  // defensiva: sem negócio, não há linha do radar para ela.
+  let consultaDePropostas = admin
+    .from("crm_proposals")
+    .select("id, lead_id, contact_id, titulo, status, numero, ano, valid_until, versao, created_at")
+    .eq("organization_id", organizationId);
+  if (opts.contactId) consultaDePropostas = consultaDePropostas.eq("contact_id", opts.contactId);
+  const { data: todasAsPropostas, error: propostasErr } = await consultaDePropostas
+    .order("lead_id", { ascending: true })
+    .order("created_at", { ascending: false })
+    .limit(SCAN_CAP);
+  if (propostasErr) throw new Error(`radar_propostas_failed: ${propostasErr.message}`);
+  // A "mais recente por lead" é por `created_at` desc — monotônico em
+  // QUALQUER proposta nova (cadeia nova ou versão nova dentro da mesma),
+  // ao contrário de `versao`, que só ordena dentro da mesma cadeia.
+  // O cruzamento com `crm_leads` reaproveita o `rows` já buscado (zero query
+  // extra): negócio perdido/ganho ou de funil arquivado não entra no radar.
+  const leadsValidos = new Set(rows.map((l) => l.id as string));
+  // Ordenação refeita em JS de propósito (não só confiada ao ORDER BY do
+  // fio): se alguém mexer nos `.order()` acima, a classificação continua
+  // certa — o preço é um sort sobre um array pequeno.
+  const ordenadas = [...(todasAsPropostas ?? [])].sort((a, b) => {
+    const porLead = String(a.lead_id).localeCompare(String(b.lead_id));
+    if (porLead !== 0) return porLead;
+    return String(b.created_at).localeCompare(String(a.created_at));
+  });
+  const maisRecentePorLead = new Map<string, (typeof todasAsPropostas)[number]>();
+  for (const p of ordenadas) {
+    // Órfã (lead_id nulo) cai aqui, não no fio — ver comentário acima.
+    if (p.lead_id == null) continue;
+    if (!leadsValidos.has(p.lead_id as string)) continue;
+    // a primeira ocorrência de cada lead_id É a mais recente (created_at desc).
+    if (!maisRecentePorLead.has(p.lead_id as string)) maisRecentePorLead.set(p.lead_id as string, p);
+  }
+  const propostas_vencidas_sem_retomada: PropostaVencidaSemRetomada[] = [...maisRecentePorLead.values()]
+    .filter((p) => p.status === "vencida")
+    .map((p) => ({ lead_id: p.lead_id as string, proposal_id: p.id as string, numero: p.numero as number | null, ano: p.ano as number | null, valid_until: p.valid_until as string | null }));
+
+  // C6 — "Propostas esperando revisão": RASCUNHO com aviso
+  // `proposta_pronta_para_revisao` ABERTO. Cruza o aviso com as propostas JÁ
+  // lidas acima (zero query extra de proposta) — órfã (lead_id nulo) é
+  // descartada aqui, sem negócio não há linha do radar para ela. O nome do
+  // contato segue o MESMO padrão das outras listas: o mapa `nameByContact`
+  // resolvido acima, complementado em um lote só para os contatos das
+  // propostas que ele ainda não conhece.
+  const { data: avisosDeRevisao, error: avisosErr } = await admin
+    .from("agent_inbox_items")
+    .select("ref_id")
+    .eq("organization_id", organizationId)
+    .eq("kind", "proposta_pronta_para_revisao")
+    .eq("status", "open");
+  if (avisosErr) throw new Error(`radar_avisos_failed: ${avisosErr.message}`);
+  const comAvisoAberto = new Set((avisosDeRevisao ?? []).map((a) => a.ref_id as string));
+  // Com `contactId` (turno do agente), o negócio da proposta também tem de ser
+  // do contato: a proposta guarda o contato de quando foi feita, e o negócio
+  // pode ter mudado de dono depois. Mesmo cruzamento de `leadsValidos` acima.
+  const rascunhosEsperando = (todasAsPropostas ?? []).filter(
+    (p) =>
+      p.status === "rascunho" &&
+      p.lead_id != null &&
+      comAvisoAberto.has(p.id as string) &&
+      (!opts.contactId || leadsValidos.has(p.lead_id as string)),
+  );
+  const nomePorContato = new Map<string, string | null>(nameByContact);
+  const contatosFaltando = [
+    ...new Set(
+      rascunhosEsperando
+        .map((p) => p.contact_id as string | null)
+        .filter((id): id is string => id !== null && !nomePorContato.has(id)),
+    ),
+  ];
+  if (contatosFaltando.length > 0) {
+    const { data: contatosExtras, error: contatosExtrasErr } = await admin
+      .from("contacts")
+      .select("id, name, display_name")
+      .eq("organization_id", organizationId)
+      .in("id", contatosFaltando);
+    if (contatosExtrasErr) throw new Error(`radar_proposta_contatos_failed: ${contatosExtrasErr.message}`);
+    for (const c of (contatosExtras ?? []) as Array<{ id: string; name: string | null; display_name: string | null }>) {
+      nomePorContato.set(c.id, nomeDoContato(c));
+    }
+  }
+  const propostas_esperando_revisao: PropostaEsperandoRevisao[] = rascunhosEsperando.map((p) => ({
+    proposal_id: p.id as string,
+    lead_id: p.lead_id as string,
+    titulo: (p.titulo as string | null) ?? null,
+    contact_name: (p.contact_id as string | null) ? (nomePorContato.get(p.contact_id as string) ?? null) : null,
+    created_at: p.created_at as string,
+  }));
 
   return {
     items: radar.slice(0, limit),
@@ -380,5 +547,7 @@ export async function carregaRadarDeRisco(
     total: radar.length,
     sem_proximo_passo: semProximoPasso.slice(0, limit),
     total_sem_proximo_passo: semProximoPasso.length,
+    propostas_vencidas_sem_retomada,
+    propostas_esperando_revisao,
   };
 }

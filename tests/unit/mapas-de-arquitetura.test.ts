@@ -179,6 +179,80 @@ describe("mapas de arquitetura — coerência interna", () => {
       expect(grau(peca), `${peca} com menos de 2 arestas — é ilha pelo invariante 1`).toBeGreaterThanOrEqual(2);
     }
   });
+
+  it("a suspensão que suspende está no mapa, e nenhuma peça dela é ilha", () => {
+    // O caso concreto do DoD 13 para a PR 1 da cobrança do revendedor. O laço
+    // de retorno é `fnReativar → itemCentral → central → fila`: é por ele que
+    // uma pessoa revisa o que chegou enquanto a IA estava calada.
+    const m = JSON.parse(
+      fs.readFileSync(path.join(DIR, "suspensao-de-organizacao.architecture.json"), "utf8"),
+    ) as Mapa;
+    const grau = (id: string) => (m.edges ?? []).filter((e) => e.from === id || e.to === id).length;
+    for (const n of m.nodes!) {
+      expect(grau(n.id), `${n.id} com menos de 2 arestas — é ilha pelo invariante 1`).toBeGreaterThanOrEqual(2);
+    }
+    const liga = (de: string, para: string) => (m.edges ?? []).some((e) => e.from === de && e.to === para);
+    expect(liga("fnReativar", "itemCentral"), "a reativação não deixa rastro para uma pessoa revisar").toBe(true);
+    expect(liga("central", "fila"), "o aviso de reativação não leva à Fila").toBe(true);
+    expect(liga("operante", "motor"), "a régua única não chega ao motor da IA").toBe(true);
+  });
+
+  it("o Jev está no mapa da escalação, com o laço de retorno", () => {
+    // O caso concreto do DoD 13 para o Jev. O genérico cobra ≥1 aresta; o
+    // invariante 7 pede o laço de retorno, e é ele que se nomeia aqui: a
+    // concordância medida em observação volta ao cartão onde o admin decide
+    // deixar o Jev decidir. Sem essa aresta, o modo observação mediria para
+    // ninguém ler.
+    const m = JSON.parse(
+      fs.readFileSync(path.join(DIR, "escalacao-ciclo-humano.architecture.json"), "utf8"),
+    ) as Mapa;
+    const arestas = m.edges ?? [];
+    const grau = (id: string) => arestas.filter((e) => e.from === id || e.to === id).length;
+    for (const peca of [
+      "jev",
+      "jevCartao",
+      "jevRota",
+      "jevConfig",
+      "jevChave",
+      "jevLlmCalls",
+      "jevMetadata",
+      "jevExecucoes",
+      "jevManipulacao",
+      "jevObservacoes",
+      "jevPedidos",
+      "jevFollowup",
+    ]) {
+      expect(grau(peca), `${peca} com menos de 2 arestas — é ilha pelo invariante 1`).toBeGreaterThanOrEqual(2);
+    }
+    const liga = (de: string, para: string) => arestas.some((e) => e.from === de && e.to === para);
+    expect(liga("jevMetadata", "jevRota"), "a concordância não chega à rota do cartão").toBe(true);
+    expect(liga("jevRota", "jevCartao"), "a rota do cartão não devolve nada à tela").toBe(true);
+    // O laço da manipulação (onda 2): a observação gravada no turno volta ao cartão.
+    expect(liga("jevObservacoes", "jevRota"), "a concordância da manipulação não chega à rota do cartão").toBe(true);
+    // O laço das tarefas em cascata (onda 3): os pedidos que o Jev percebe no
+    // worker de clima são gravados em jev_observacoes, que volta ao cartão.
+    expect(liga("jevPedidos", "jevObservacoes"), "os pedidos percebidos não chegam a jev_observacoes").toBe(true);
+    // O laço da resposta ao follow-up (onda 4): o estado da tarefa entra no
+    // turno do follow-up, e a observação dele vai a jev_observacoes, que volta ao cartão.
+    expect(liga("jevConfig", "jevFollowup"), "o estado da tarefa do follow-up não chega ao turno").toBe(true);
+    expect(liga("jevFollowup", "jevObservacoes"), "a resposta ao follow-up não chega a jev_observacoes").toBe(true);
+  });
+
+  it("o Jev está no mapa do turno, ao lado do roteador, com o laço de retorno", () => {
+    // O roteador mora no mapa do turno (lane `router`), e é lá que o Jev dele
+    // entra (onda 2, bloco 2.2): as intenções entram nele, a escolha dele sai
+    // para o turno, e a observação volta ao cartão onde se decide deixá-lo decidir.
+    const m = JSON.parse(fs.readFileSync(path.join(DIR, "agent-turn.workflow.json"), "utf8")) as Mapa;
+    const arestas = m.edges ?? [];
+    const grau = (id: string) => arestas.filter((e) => e.from === id || e.to === id).length;
+    for (const peca of ["jevRoteador", "jevObservacoesRoteador", "jevCartaoRoteador"]) {
+      expect(grau(peca), `${peca} com menos de 2 arestas — é ilha pelo invariante 1`).toBeGreaterThanOrEqual(2);
+    }
+    const liga = (de: string, para: string) => arestas.some((e) => e.from === de && e.to === para);
+    expect(liga("routerconfig", "jevRoteador"), "as intenções do roteador não chegam ao Jev").toBe(true);
+    expect(liga("jevObservacoesRoteador", "jevCartaoRoteador"), "a concordância do roteador não volta ao cartão").toBe(true);
+    expect(liga("jevCartaoRoteador", "jevRoteador"), "o cartão não muda o estado da tarefa").toBe(true);
+  });
 });
 
 /**

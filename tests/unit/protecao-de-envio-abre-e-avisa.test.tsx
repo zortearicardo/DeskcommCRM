@@ -84,8 +84,14 @@ function canal(over: Partial<ChannelSession> = {}): ChannelSession {
 const KNOBS: PacingKnobs = {
   throttleMs: 1_200,
   jitterMaxMs: 800,
+  atrasoNotarMs: 900,
+  msPorCaractere: 22,
+  atrasoMinimoMs: 1_200,
+  atrasoMaximoMs: 7_500,
   windowStartHour: 7,
   windowEndHour: 22,
+  respostaStartHour: 7,
+  respostaEndHour: 22,
   allowSunday: true,
   timezone: "America/Sao_Paulo",
   warmupDailyCaps: [
@@ -111,6 +117,8 @@ function itemDePacing(over: Partial<PacingKnobsItem> = {}): PacingKnobsItem {
     defaults: KNOBS,
     bounds: {
       intervalMaxMs: 600_000,
+      msPorCaractereMax: 200,
+      atrasoMaximoMsMax: 60_000,
       hourLastStart: 23,
       hourEnd: 24,
       daily_limit: { min: 1, max: 2_000 },
@@ -167,7 +175,8 @@ describe("#669 — painel não morre mudo quando a conexão sumiu da lista", () 
       /pode ter sido removida/,
     );
     expect(screen.getByRole("button", { name: "Tentar de novo" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Fechar" })).toBeInTheDocument();
+    // O "X" do painel também se chama "Fechar"; a saída do rodapé é a do teste.
+    expect(screen.getByTestId("anti-ban-fechar")).toHaveAccessibleName("Fechar");
     expect(screen.queryByTestId("anti-ban-form")).toBeNull();
   });
 
@@ -183,7 +192,7 @@ describe("#669 — painel não morre mudo quando a conexão sumiu da lista", () 
       expect(invalidar).toHaveBeenCalledWith({ queryKey: ["pacing-knobs"] }),
     );
 
-    fireEvent.click(screen.getByRole("button", { name: "Fechar" }));
+    fireEvent.click(screen.getByTestId("anti-ban-fechar"));
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 

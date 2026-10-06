@@ -4,6 +4,7 @@ import { createAdminClient } from "@/lib/supabase/admin";
 import { montarPayloadDeInbound, truncar } from "./push_payload";
 import { enviarPushAoUsuario, enviarPushDaOrg } from "./web_push";
 import { vapidPronto } from "./vapid";
+import { pushDoAvisoDaCentral } from "./push-dos-avisos";
 import type { PushPayload } from "./push_payload";
 import { rotuloDoContato, SEM_NOME } from "@/lib/contacts/rotulo-do-contato";
 
@@ -25,7 +26,7 @@ async function handleInbound(row: EventRow): Promise<HandlerResult> {
     const admin = createAdminClient();
     const { data } = await admin
       .from("contacts")
-      .select("display_name, name, phone_number, avatar_storage_path, is_anonymized")
+      .select("display_name, name, phone_number, avatar_storage_path, is_anonymized, is_personal")
       .eq("id", contactId)
       .eq("organization_id", row.organization_id)
       .maybeSingle();
@@ -35,7 +36,12 @@ async function handleInbound(row: EventRow): Promise<HandlerResult> {
       phone_number?: string | null;
       avatar_storage_path?: string | null;
       is_anonymized?: boolean | null;
+      is_personal?: boolean | null;
     } | null;
+    // Pessoal não empurra nada no bolso (spec 21, etapa 10, caminho 3): sem push.
+    if (c?.is_personal === true) {
+      return { consumer_key: WEB_PUSH_INBOUND_KEY, status: "skipped", detail: "contato_pessoal" };
+    }
     // A cadeia CANÔNICA, e não a de dois campos remontada aqui: aquela deixava
     // passar o identificador técnico do WhatsApp — a notificação chegaria à tela
     // de bloqueio do celular escrita "Contato 543134@lid". `rotuloDoContato`
@@ -63,6 +69,44 @@ async function handleInbound(row: EventRow): Promise<HandlerResult> {
     contactName,
     icon,
   });
+  const { sent } = await enviarPushDaOrg(row.organization_id, payload);
+  return { consumer_key: WEB_PUSH_INBOUND_KEY, status: "ok", detail: `sent:${sent}` };
+}
+
+/**
+ * `message.group_received` — MESMO payload de `message.received` (a
+ * conversa é a do GRUPO ligado, o "contato" é o placeholder de
+ * `kind='whatsapp_group'`), mas nunca a cópia do 1:1: não busca nome/avatar de
+ * contato (a IA não serve grupos, e a Task 8 não abre exceção só para a
+ * notificação), não cria nem roteia nada — só avisa o atendente que o grupo
+ * está falando. Título fixo, igual em toda organização.
+ */
+async function handleGroupInbound(row: EventRow): Promise<HandlerResult> {
+  const conversationId =
+    (typeof row.payload.conversation_id === "string" ? row.payload.conversation_id : null) ?? null;
+  const previewRaw = row.payload.body_preview;
+  const preview = typeof previewRaw === "string" && previewRaw.trim() ? previewRaw : "Nova mensagem";
+  const type = typeof row.payload.type === "string" ? row.payload.type : "text";
+  const body = type === "text" ? preview : "Mídia";
+
+  const payload: PushPayload = {
+    title: "Nova mensagem no grupo",
+    body: truncar(body),
+    tag: conversationId ? `msg:${conversationId}` : "msg",
+    href: conversationId ? `/app/inbox?id=${conversationId}` : "/app/inbox",
+  };
+  const { sent } = await enviarPushDaOrg(row.organization_id, payload);
+  return { consumer_key: WEB_PUSH_INBOUND_KEY, status: "ok", detail: `sent:${sent}` };
+}
+
+/** Os avisos da Central que pedem gente — ver `./push-dos-avisos.ts`. */
+async function handleAvisoQuePedeGente(row: EventRow): Promise<HandlerResult> {
+  const id = typeof row.payload.item_id === "string" ? row.payload.item_id : row.entity_id;
+  if (!id) return { consumer_key: WEB_PUSH_INBOUND_KEY, status: "skipped", detail: "sem_alvo" };
+  const payload = await pushDoAvisoDaCentral(createAdminClient(), row.organization_id, id);
+  if (payload === null) {
+    return { consumer_key: WEB_PUSH_INBOUND_KEY, status: "skipped", detail: "aviso_fora_do_celular" };
+  }
   const { sent } = await enviarPushDaOrg(row.organization_id, payload);
   return { consumer_key: WEB_PUSH_INBOUND_KEY, status: "ok", detail: `sent:${sent}` };
 }
@@ -109,12 +153,24 @@ async function enviarParaUsuario(
 
 export const webPushInboundHandler: EventHandler = {
   key: WEB_PUSH_INBOUND_KEY,
-  events: ["message.received", "lead.assigned", "lead.won", "lead.lost", "user.mentioned"],
+  naOrgParada: "pula",
+  events: [
+    "message.received",
+    "message.group_received",
+    "lead.assigned",
+    "lead.won",
+    "lead.lost",
+    "user.mentioned",
+    // Os avisos que pedem gente (migration 0442) — ver `./push-dos-avisos.ts`.
+    "central.aviso_criado",
+  ],
   async handle(row): Promise<HandlerResult> {
     if (!vapidPronto()) {
       return { consumer_key: WEB_PUSH_INBOUND_KEY, status: "skipped", detail: "vapid_ausente" };
     }
     if (row.event_type === "message.received") return handleInbound(row);
+    if (row.event_type === "message.group_received") return handleGroupInbound(row);
+    if (row.event_type === "central.aviso_criado") return handleAvisoQuePedeGente(row);
 
     if (row.event_type === "user.mentioned") {
       const toUserId = typeof row.payload.to_user_id === "string" ? row.payload.to_user_id : null;

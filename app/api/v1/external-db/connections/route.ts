@@ -29,13 +29,17 @@ import { checkRateLimit } from "@/lib/ai/dispatcher/rate-limit";
 import { createAdminClient } from "@/lib/supabase/admin";
 import { createClient } from "@/lib/supabase/server";
 
+import { seModuloDesligado } from "../_falha";
+
 export const dynamic = "force-dynamic";
 
 const COLUNAS_SEGURAS =
-  "id, organization_id, label, host, port, database_name, username, ssl_mode, enabled, max_rows, max_filters, max_response_bytes, last_tested_at, last_test_ok, last_test_error, created_by, created_at, updated_at";
+  "id, organization_id, label, host, port, database_name, username, ssl_mode, enabled, max_rows, max_filters, max_response_bytes, customer_key_column, customer_key_kind, last_tested_at, last_test_ok, last_test_error, created_by, created_at, updated_at";
 
 export async function GET(): Promise<Response> {
   const requestId = randomUUID();
+  const desligado = await seModuloDesligado(requestId);
+  if (desligado) return desligado;
   const authz = await requireRole("viewer", { requestId, resource: "external_db_connections" });
   if (!authz.ok) return authz.response;
   const { org: activeOrg } = authz;
@@ -58,6 +62,8 @@ export async function POST(req: NextRequest): Promise<Response> {
   if (supportDenied) return supportDenied;
 
   const requestId = randomUUID();
+  const desligado = await seModuloDesligado(requestId);
+  if (desligado) return desligado;
   const authz = await requireRole("admin", { requestId, resource: "external_db_connections" });
   if (!authz.ok) return authz.response;
   const t = (texto: string) => traduzir(texto, authz.user.idioma);
@@ -115,6 +121,8 @@ export async function POST(req: NextRequest): Promise<Response> {
       max_rows: input.max_rows,
       max_filters: input.max_filters,
       max_response_bytes: input.max_response_bytes,
+      customer_key_column: input.customer_key_column,
+      customer_key_kind: input.customer_key_kind,
       created_by: authUser.id,
     })
     .select(COLUNAS_SEGURAS)

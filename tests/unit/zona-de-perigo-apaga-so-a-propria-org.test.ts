@@ -45,12 +45,17 @@ const auditadas: Array<Record<string, unknown>> = [];
 
 let papel = "admin";
 let ehPlatformAdmin = false;
+let escopo: string | null = "full";
 let mfaPendente = false;
 let nomeNoBanco: string | null = NOME_DA_ORG;
 /** Quando setado, o DELETE nesta tabela devolve erro — simula a parada no meio. */
 let tabelaQueFalha: string | null = null;
 /** Quantas linhas cada DELETE afirma ter apagado. */
 const linhasPorTabela: Record<string, number> = {};
+/** D10: arquivos "existentes" na pasta da organização no bucket `propostas`. */
+let arquivosNoBucket: Array<{ name: string }> = [];
+const removidosDoBucket: string[][] = [];
+let listagemDoBucketFalha = false;
 
 vi.mock("next/headers", () => ({
   headers: async () => new Map<string, string>([["x-request-id", "req-teste"]]),
@@ -62,7 +67,7 @@ vi.mock("@/lib/audit", () => ({
   }),
 }));
 vi.mock("@/lib/auth/server", () => ({
-  loadAuthUser: vi.fn(async () => ({ id: USER, is_platform_admin: ehPlatformAdmin })),
+  loadAuthUser: vi.fn(async () => ({ id: USER, is_platform_admin: ehPlatformAdmin, platform_admin_scope: ehPlatformAdmin ? escopo : null })),
   resolveActiveOrg: vi.fn(async () => ({ orgId: ORG, name: NOME_DA_ORG, role: papel })),
   mfaEmDivida: vi.fn(async () => mfaPendente),
 }));
@@ -113,6 +118,38 @@ function clienteFalso() {
       };
       return construtor;
     },
+    storage: {
+      from(bucket: string) {
+        if (bucket !== "propostas") throw new Error(`bucket inesperado: ${bucket}`);
+        return {
+          // O `storage-js` real devolve a PRIMEIRA página quando não recebe
+          // offset — e o código de produção não manda offset, de propósito
+          // (comentário em `lib/settings/apagar-dados-operacionais.ts`): cada
+          // `remove()` já tira do bucket o que foi listado, então a chamada
+          // seguinte devolve o lote seguinte na mesma posição. Este dublê
+          // reproduz isso, e o `limit` porque sem ele o laço de paginação
+          // passaria por inteiro contra um dublê que devolve tudo de uma vez.
+          async list(pasta: string, options?: { limit?: number }) {
+            if (listagemDoBucketFalha) return { data: null, error: { message: "falhou" } };
+            // A pasta pedida TEM de ser a da própria organização — um teste
+            // chamado "apaga só a própria org" que não confere isso deixaria
+            // passar `list("")` (a raiz, de todas as organizações) sem acusar.
+            if (pasta !== ORG) return { data: [], error: null };
+            const limite = options?.limit ?? 100;
+            return { data: arquivosNoBucket.slice(0, limite), error: null };
+          },
+          async remove(caminhos: string[]) {
+            removidosDoBucket.push(caminhos);
+            // Simula a remoção de verdade: a listagem seguinte não pode
+            // devolver o mesmo arquivo de novo (senão o laço de paginação do
+            // código real vira loop infinito contra este dublê).
+            const nomes = new Set(caminhos.map((c) => c.split("/").pop()));
+            arquivosNoBucket = arquivosNoBucket.filter((a) => !nomes.has(a.name));
+            return { data: null, error: null };
+          },
+        };
+      },
+    },
   };
 }
 
@@ -123,10 +160,14 @@ beforeEach(() => {
   auditadas.length = 0;
   papel = "admin";
   ehPlatformAdmin = false;
+  escopo = "full";
   mfaPendente = false;
   nomeNoBanco = NOME_DA_ORG;
   tabelaQueFalha = null;
   for (const k of Object.keys(linhasPorTabela)) delete linhasPorTabela[k];
+  arquivosNoBucket = [];
+  removidosDoBucket.length = 0;
+  listagemDoBucketFalha = false;
 });
 
 describe("zona de perigo: o apagamento não sai da própria organização", () => {
@@ -150,13 +191,14 @@ describe("zona de perigo: o apagamento não sai da própria organização", () =
     }
   });
 
-  it("apaga exatamente as seis raízes declaradas — nem tabela a mais, nem a menos", async () => {
+  it("apaga exatamente as sete raízes declaradas — nem tabela a mais, nem a menos", async () => {
     await apagarDadosOperacionaisDaOrganizacao({ confirmNome: NOME_DA_ORG });
     expect(delecoes.map((d) => d.tabela)).toEqual([
       "messages",
       "conversations",
       "calendar_appointments",
       "orders",
+      "crm_proposals",
       "crm_leads",
       "contacts",
     ]);
@@ -217,6 +259,19 @@ describe("zona de perigo: quem pode puxar o gatilho", () => {
     const r = await apagarDadosOperacionaisDaOrganizacao({ confirmNome: NOME_DA_ORG });
     expect(r.ok).toBe(true);
     expect(delecoes.length).toBe(RAIZES_DO_APAGAMENTO.length);
+  });
+
+  it("platform admin SÓ LEITURA que é viewer na empresa não apaga nada", async () => {
+    // O acompanhamento já é barrado por `supportWriteError`; este é o outro
+    // caminho: o support_readonly que também é membro comum da empresa. O
+    // atalho de papel exige scope full (`escreveComoPlatformAdmin`).
+    papel = "viewer";
+    ehPlatformAdmin = true;
+    escopo = "support_readonly";
+    const r = await apagarDadosOperacionaisDaOrganizacao({ confirmNome: NOME_DA_ORG });
+    expect(r).toEqual({ ok: false, error: "forbidden_role" });
+    expect(delecoes).toEqual([]);
+    expect(auditadas).toEqual([]);
   });
 });
 
@@ -279,5 +334,47 @@ describe("zona de perigo: o apagamento deixa rastro", () => {
     const meta = auditadas[0]!.metadata as { counts: Record<string, number>; falhou_em?: string };
     expect(meta.counts.messages).toBe(7);
     expect(meta.falhou_em).toBe("crm_leads");
+  });
+});
+
+describe("zona de perigo: D10 — os PDFs de proposta somem junto (bucket `propostas`)", () => {
+  it("limpa a pasta da organização no bucket e audita a contagem", async () => {
+    arquivosNoBucket = [{ name: "p1.pdf" }, { name: "p2.pdf" }];
+    const r = await apagarDadosOperacionaisDaOrganizacao({ confirmNome: NOME_DA_ORG });
+
+    expect(r.ok).toBe(true);
+    expect(removidosDoBucket).toEqual([[`${ORG}/p1.pdf`, `${ORG}/p2.pdf`]]);
+    const meta = auditadas[0]!.metadata as { pdfs_removidos: number };
+    expect(meta.pdfs_removidos).toBe(2);
+  });
+
+  it("mais de 100 arquivos: pagina a listagem e remove TODOS (I7)", async () => {
+    arquivosNoBucket = Array.from({ length: 137 }, (_, i) => ({ name: `p${i}.pdf` }));
+    const r = await apagarDadosOperacionaisDaOrganizacao({ confirmNome: NOME_DA_ORG });
+
+    expect(r.ok).toBe(true);
+    const totalRemovido = removidosDoBucket.flat().length;
+    expect(totalRemovido).toBe(137);
+    const meta = auditadas[0]!.metadata as { pdfs_removidos: number };
+    expect(meta.pdfs_removidos).toBe(137);
+  });
+
+  it("pasta vazia: nao chama remove, pdfs_removidos = 0", async () => {
+    arquivosNoBucket = [];
+    const r = await apagarDadosOperacionaisDaOrganizacao({ confirmNome: NOME_DA_ORG });
+
+    expect(r.ok).toBe(true);
+    expect(removidosDoBucket).toEqual([]);
+    const meta = auditadas[0]!.metadata as { pdfs_removidos: number };
+    expect(meta.pdfs_removidos).toBe(0);
+  });
+
+  it("listagem do bucket falha: o reset dos dados nao falha por causa disso", async () => {
+    arquivosNoBucket = [{ name: "p1.pdf" }];
+    listagemDoBucketFalha = true;
+    const r = await apagarDadosOperacionaisDaOrganizacao({ confirmNome: NOME_DA_ORG });
+
+    expect(r.ok).toBe(true);
+    expect(removidosDoBucket).toEqual([]);
   });
 });

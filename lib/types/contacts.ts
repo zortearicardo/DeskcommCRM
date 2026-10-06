@@ -14,10 +14,14 @@ export interface Contact {
   birthdate: string | null;
   is_blocked: boolean;
   blocked_reason: string | null;
+  /** Spec 21: vida pessoal — escondido da operação e inutilizado para envio. */
+  is_personal: boolean;
   is_anonymized: boolean;
   anonymized_at: string | null;
   is_merged_into: string | null;
   merged_at: string | null;
+  /** Pessoa B2B (people.id); null = identidade só operacional (WhatsApp). */
+  person_id?: string | null;
   consent: Record<string, unknown>;
   tags: string[];
   source: string;

@@ -14,6 +14,7 @@ import { createSupabaseAdminClient, type FollowupJobRequest } from "@/lib/follow
 import type { EnrollmentRow } from "@/lib/followup/node-handlers";
 import { completeTurnForEnrollment, type TurnBridgeAdminClient } from "@/lib/followup/turn-bridge";
 import { logger } from "@/lib/logger";
+import { OrgNaoOperanteError } from "@/lib/organizacao/operante";
 
 function ponteSupabase(admin: SupabaseClient): TurnBridgeAdminClient {
   const base = createSupabaseAdminClient(admin);
@@ -41,6 +42,18 @@ function ponteSupabase(admin: SupabaseClient): TurnBridgeAdminClient {
   };
 }
 
+/**
+ * `run_after` é gravado pelo banco em MICROssegundos (`now()`); o relógio do JS só
+ * tem MILIssegundos. `lte(run_after, new Date())` trunca o instante atual e deixa
+ * invisível o job vencido há menos de 1 ms — medido: 62–80% de perda num
+ * `update ... run_after=now()` seguido do filtro, e é o vermelho intermitente de
+ * `agenda-presenca-recuperacao.spec.ts:872`. O instante do JS cobre o
+ * milissegundo inteiro, então "vencido" é `run_after` antes do FIM dele.
+ */
+function fimDoMilissegundoCorrente(): string {
+  return new Date(Date.now() + 1).toISOString();
+}
+
 /** Envia o texto fixo do fluxo neste request — sem cron e sem agent-worker. */
 export async function enviarTextoFixoPendente(
   admin: SupabaseClient,
@@ -51,7 +64,7 @@ export async function enviarTextoFixoPendente(
     .select("id, organization_id, contact_id, payload, attempts, max_attempts")
     .eq("kind", "followup_turn")
     .eq("status", "pending")
-    .lte("run_after",new Date().toISOString())
+    .lt("run_after",fimDoMilissegundoCorrente())
     .order("created_at", { ascending: true })
     .limit(5);
   if (error) throw new Error(error.message);
@@ -79,7 +92,7 @@ export async function enviarTextoFixoPendente(
       .eq("id", job.id)
       .eq("organization_id",job.organization_id)
       .eq("status", "pending")
-      .lte("run_after",new Date().toISOString())
+      .lt("run_after",fimDoMilissegundoCorrente())
       .select("id,locked_by,locked_at")
       .maybeSingle();
     if (claimErr) throw new Error(claimErr.message);
@@ -138,7 +151,13 @@ export async function enviarTextoFixoPendente(
     } catch (err) {
       const message = err instanceof ApiError ? err.message : err instanceof Error ? err.message : String(err);
       logger.warn("[dev.pipeline] envio inline falhou", { error: message });
-      await settle(job.organization_id,job.id,jobClaim.acquired_at,err instanceof StaleServiceBoundaryError,message,err instanceof AgendaDeferredError?err:undefined);
+      if (err instanceof OrgNaoOperanteError) {
+        // Turno que já rodava quando a org parou: o motor precisa do evento para
+        // enfileirar um turno novo na reativação (ver fn_followup_turno_descartado).
+        const { error: falhaDoDescarte } = await admin.rpc("fn_followup_turno_descartado", { p_org: job.organization_id, p_job: job.id });
+        if (falhaDoDescarte) throw falhaDoDescarte;
+      }
+      await settle(job.organization_id,job.id,jobClaim.acquired_at,err instanceof StaleServiceBoundaryError||err instanceof OrgNaoOperanteError,message,err instanceof AgendaDeferredError?err:undefined);
     }
   }
   return enviados;

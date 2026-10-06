@@ -11,7 +11,7 @@ import {
   type PipelineConfigPatch,
 } from "@/lib/schemas/settings";
 import { loadAuthUser, resolveActiveOrg } from "@/lib/auth/server";
-import { ROLE_RANK } from "@/lib/auth/types";
+import { podeAdministrarEmpresa } from "@/lib/auth/pode-administrar-empresa";
 
 export type UpdatePipelineConfigResult =
   | { ok: true }
@@ -34,7 +34,7 @@ export async function updatePipelineConfig(
   if (supportWriteError(authUser.support)) return { ok: false, error: "forbidden" };
   const activeOrg = await resolveActiveOrg(authUser);
   if (!activeOrg) return { ok: false, error: "forbidden_tenant" };
-  if (!authUser.is_platform_admin && ROLE_RANK[activeOrg.role] < ROLE_RANK.admin) {
+  if (!podeAdministrarEmpresa(authUser, activeOrg)) {
     return { ok: false, error: "forbidden_role" };
   }
 
@@ -61,6 +61,14 @@ export async function updatePipelineConfig(
   const nextSettings: Record<string, unknown> = { ...currentSettings };
   if (parsed.data.fields !== undefined) nextSettings.fields = parsed.data.fields;
   if (parsed.data.lost_reasons !== undefined) nextSettings.lost_reasons = parsed.data.lost_reasons;
+  if (parsed.data.won_reasons !== undefined) nextSettings.won_reasons = parsed.data.won_reasons;
+  if (parsed.data.won_reason_required !== undefined) {
+    nextSettings.won_reason_required = parsed.data.won_reason_required;
+  }
+  if (parsed.data.reabertura !== undefined) nextSettings.reabertura = parsed.data.reabertura;
+  if (parsed.data.reabertura_campos !== undefined) {
+    nextSettings.reabertura_campos = parsed.data.reabertura_campos;
+  }
 
   const { error } = await supabase
     .from("crm_pipelines")
@@ -79,6 +87,9 @@ export async function updatePipelineConfig(
       vocabulary_changed: !!parsed.data.vocabulary,
       fields_count: parsed.data.fields?.length ?? null,
       lost_reasons_count: parsed.data.lost_reasons?.length ?? null,
+      won_reasons_count: parsed.data.won_reasons?.length ?? null,
+      won_reason_required: parsed.data.won_reason_required ?? null,
+      reabertura: parsed.data.reabertura ?? null,
     },
   });
 

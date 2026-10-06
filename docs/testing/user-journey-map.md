@@ -15,6 +15,11 @@
 - `[P2]` exploração/edge.
 - Resultado: `PASS` / `FAIL(bug#)` / `WARN` (funciona mas UX ruim).
 - Evidência: screenshot/trace em `.superpowers/evidence/vps-qa/`.
+- **Caso que atravessa agente de IA mede o PAR** (lei em
+  [`../doctrine/prova-em-par.md`](../doctrine/prova-em-par.md), #489): além do `PASS` da tela, o
+  caso registra a medição da **ferramenta chamada direto, com o mesmo texto de entrada**, e só
+  conta como `PASS` quando as duas concordam. Discordou, o que se mediu foi o modelo — o defeito
+  continua onde estava.
 
 ---
 
@@ -65,6 +70,7 @@ fonte só (`lib/onboarding/passos.ts`) — eram três listas que discordavam. Ga
 | J1.33 | A verificação em duas etapas deixa de ser imposta | MEDIDO percorrendo o wizard: "Começar a usar" entregava o dono num bloqueador de tela cheia pedindo um aplicativo autenticador — um sétimo passo que a barra de progresso nunca anunciou, e que TODA instalação self-host recebia, porque o `install.sh` cria o dono como platform admin. Agora é escolha: `platform_admins.mfa_required` (que existia e **nunca era lido** — controle decorativo) e `organizations.settings.security.mfa_required`, ambos com padrão não-exigir · **PASS** (`tests/e2e/mfa-opcional.spec.ts`, `lib/auth/politica-mfa.test.ts`) |
 | J1.34 | Ligar e desligar a verificação, pela tela | o único ponto de cadastro do produto era o próprio bloqueador — sem um botão em Configurações › Segurança, tornar o cadastro opcional deixaria a proteção INALCANÇÁVEL. E desligar não existia em lugar nenhum: `enrollMfa` só apaga fator não verificado. Desligar o próprio fator exige sessão `aal2`, senão uma sessão roubada desliga a proteção com um clique · **PASS** (`tests/e2e/mfa-opcional.spec.ts`) |
 | J1.35 | Cadastrar e PROVAR são perguntas diferentes | `mfaEmDivida()` começava consultando a política, então quem ativasse a verificação por vontade própria teria o fator ignorado na sessão — o mesmo que não ter. Com o cadastro opcional isso viraria o buraco central da mudança. Agora quem TEM fator prova, sempre, qualquer que seja o papel · **PASS** (`tests/unit/require-role-mfa.test.ts` — o caso do manager INVERTEU, e a inversão aperta) |
+| J1.36 | A prova de crédito não reprova chave boa por causa do modelo de raciocínio | MEDIDO numa instalação fresca (2026-09-26, `baseline.sql` + `bootstrap-owner.ts`) com chave OpenAI válida e **com crédito**: o modelo curado padrão gasta o único token pensando e a API responde 400 "max_tokens or model output limit was reached" — que é a prova DANDO CERTO, porque chave recusada é 401 e modelo inexistente é 404. Lido como falha, a tela dizia que o teste não passou, com o **corpo cru do provedor** e a sugestão falsa de falta de crédito (a publicação do atendente não depende desta prova: ela exige WhatsApp conectado, `first-publication.ts:114`). Agora esse 400 conta como sucesso, e a tela diz em português o que fazer, por balde de erro · **PASS** (`lib/instalacao/prova-de-credito.test.ts`); a prova pela TELA não foi feita — exigiria chave real de um modelo de raciocínio, e é o que falta para fechar o caso. Evidência do #1697 (mesmo classificador, superado por este): `provarSaldo("openai", <chave real>, "gpt-5.6-terra")` → `{ ok: true }`, e a tela numa instalação fresca mostrou "Testei agora: a chave respondeu e tem crédito." — o caminho de SUCESSO; as frases novas de falha seguem sem prova em tela |
 
 > **Cobertura em camadas (J1.22/J1.23):** a decisão de *não provisionar* é provada por unitário, porque é uma função pura e roda no gate obrigatório. O caso de tela cobre o caminho visível (CTA → signup com o token → campos certos). O que **não** está coberto ponta a ponta é a volta do link de confirmação de e-mail: exigiria caixa de e-mail no e2e, e a spec que faria isso é a de instalação fresca, que está fora do CI.
 
@@ -112,7 +118,104 @@ fonte só (`lib/onboarding/passos.ts`) — eram três listas que discordavam. Ga
 
 ## Chaves de acesso à IA `[P0]`
 
+- Orçamento do E2E: 60 s para login com MFA, validação e limpeza; o polling da validação continua limitado a 15 s. Na execução CI `36079389278` do PR #1566, o trace registrou 24,6 s aguardando a próxima janela TOTP, consumindo quase todo o antigo limite global de 30 s. A nova execução do E2E deve confirmar o ajuste.
+
 - `[P0]` Colar chave inválida e entender o motivo — `tests/e2e/credenciais-de-ia.spec.ts`. Achados corrigidos em 2026-09-02: lista de modelos colada por vírgula no card; "Validando…" eterno após restart; erro em código (`auth_failed_401`, no card e no toast); diálogo sem dizer quando usar cada provedor nem onde pegar a chave; contagem "em uso" divergente do DELETE. **PASS** — executada de verdade contra browser real (Supabase local pg17 + baseline + Chromium) em 2026-09-02, depois que o Docker da máquina (antes indisponível) voltou. A própria execução achou um SEXTO defeito que a leitura de código não tinha achado: `descreverErroDeValidacao` não classificava `TypeError` (o nome que o `fetch()` do Node usa para falha de rede/DNS) como erro de rede, e o card mostrava "Falha na validação (TypeError)." cru em vez da frase amigável — corrigido em `lib/ai/credenciais/erro-de-validacao.ts`, com caso de teste. Evidência em `.superpowers/evidence/credenciais-de-ia.png`.
+
+## J32 — Ligar o Jev para perceber o cliente irritado `[P1]` (2026-09-23)
+
+O Jev (System One, da TypeSafe AI) mede o clima de cada mensagem do cliente,
+geralmente em menos de um segundo, no lugar ou ao lado da IA de sempre. Nasce desligado;
+ligar manda cada mensagem dos clientes aos EUA, uma de cada vez e sem o resto da
+conversa, então pede o aceite de quem administra. É `[P1]` e não `[P0]`: nada dele está no caminho de quem acabou de
+instalar.
+
+Specs: `tests/e2e/jev-decisoes-rapidas.spec.ts` (parte 5 do `e2e`, contra o dublê
+HTTP `scripts/duble-jev-e2e.mjs`, que grava cada chamada num arquivo que a spec lê) e
+`tests/e2e/jev-chave-real.spec.ts` (fora do CI: exige a chave paga; pula sem ela).
+
+| # | Caso | Expectativa | Resultado |
+|---|------|-------------|-----------|
+| J32.1 | Procurar "jev" no ⌘K | a busca leva a Provedores, onde está o cartão | **PASS** — `jev-decisoes-rapidas.spec.ts` verde em 2026-09-24 (bancada fresca: pg15 + `baseline.sql` + `bootstrap-owner.ts`, build de produção, dublê) e na prova manual em campo com a chave REAL (Chromium dirigido como leigo, clínica recém-instalada): ⌘K "Jev" → Provedores |
+| J32.2 | Cartão sem chave | diz o que o Jev é, leva à TypeSafe para pegar a chave e abre o diálogo de colar já no Jev (formato `apikey_…`) | **PASS** — `jev-decisoes-rapidas.spec.ts` verde em 2026-09-24 (bancada fresca: pg15 + `baseline.sql` + `bootstrap-owner.ts`, build de produção, dublê) e na prova manual em campo com a chave REAL (Chromium dirigido como leigo, clínica recém-instalada) |
+| J32.3 | Colar a chave | o teste da chave passa (o dublê recebeu o `GET /v1/models` com a chave certa) e o cartão fica pronto para ligar | **PASS** — `jev-decisoes-rapidas.spec.ts` verde em 2026-09-24 (bancada fresca: pg15 + `baseline.sql` + `bootstrap-owner.ts`, build de produção, dublê) e na prova manual em campo com a chave REAL (Chromium dirigido como leigo, clínica recém-instalada): validada na TypeSafe real |
+| J32.4 | Chave validada, Jev desligado, e uma mensagem do cliente chega e é drenada | nenhuma pergunta sai para o fornecedor (D6). O controle positivo é a J32.7: mesmo cliente, mesma conversa, só o interruptor muda | **PASS** — `jev-decisoes-rapidas.spec.ts` verde em 2026-09-24 (bancada fresca: pg15 + `baseline.sql` + `bootstrap-owner.ts`, build de produção, dublê); na prova de campo, desligado: 4 chamadas ao Jev antes, 4 depois |
+| J32.5 | Ligar sem marcar o aceite | o botão fica travado; a rota recusa com `jev_exige_aceite` (provado em `app/api/v1/ai/jev/route.test.ts`) | **PASS** em tela (prova de campo: "Ligar o Jev" desabilitado até marcar o aceite) e na rota (unit) |
+| J32.6 | Ligar com o aceite, e deixar o Jev decidir | observando (com IA de sempre), com o bloco de concordância na tela — o laço de retorno da observação — → **diálogo de confirmação da tarefa** (o efeito dela em produção e "Dá para voltar a só observar quando quiser"; cancelar não muda nada; pausar e voltar a observar não pedem confirmação) → decidindo; sozinho quando a empresa não tem a IA de sempre. O NÚMERO da concordância (acima de zero) não se alcança pela tela neste ambiente: a IA de sempre tem chave falsa; ele é provado em `CartaoDoJev.test.tsx` e `app/api/v1/ai/jev/route.test.ts` | **PASS** — `jev-decisoes-rapidas.spec.ts` verde em 2026-09-24 (bancada fresca: pg15 + `baseline.sql` + `bootstrap-owner.ts`, build de produção, dublê) (bloco de concordância em observação); "Decidindo sozinho" **PASS** em tela com a chave real. O diálogo de confirmação (prova em tela da onda 2 pediu: o clique decidia sem explicação): **PASS em unit/jsdom** (`CartaoDoJev.test.tsx`, as três tarefas e o cancelar); a spec (`helpers/jev.ts › ligarOJev`) passou a confirmar pelo diálogo, **sem ter sido executada depois do ajuste**. O NÚMERO da concordância acima de zero segue provado só em unit (sem IA de sempre real neste ambiente) |
+| J32.7 | Segunda mensagem do mesmo cliente pelo webhook do WhatsApp | o dublê recebe a pergunta do clima com a chave colada, a versão `jev-1.13.0` e SÓ a última mensagem (sem a da J32.4, que está na mesma conversa), com telefone e e-mail trocados por `[PHONE]`/`[EMAIL]` | **PASS** — `jev-decisoes-rapidas.spec.ts` verde em 2026-09-24 (bancada fresca: pg15 + `baseline.sql` + `bootstrap-owner.ts`, build de produção, dublê); com a chave real, a TypeSafe mediu irritada=0,0025 e feliz=0,745 (323/751 ms) |
+| J32.8 | IA › Execuções, "Ver as decisões do Jev" | a medição aparece com "Jev (TypeSafe AI)", o modelo devolvido e sem "falhou"; o filtro "Só o Jev" vem marcado | **PASS** — `jev-decisoes-rapidas.spec.ts` verde em 2026-09-24 (bancada fresca: pg15 + `baseline.sql` + `bootstrap-owner.ts`, build de produção, dublê) e na prova manual em campo com a chave REAL (Chromium dirigido como leigo, clínica recém-instalada): "Mostrando só o Jev" e "O Jev decidiu." |
+| J32.9 | O cartão depois da medição | "Mensagens medidas" sobe ao menos 1 (a nossa; outra que tenha voltado à fila depois do escoamento também conta — a prova de que foi a NOSSA é a do dublê, na J32.7) | **PASS** — `jev-decisoes-rapidas.spec.ts` verde em 2026-09-24 (bancada fresca: pg15 + `baseline.sql` + `bootstrap-owner.ts`, build de produção, dublê) e na prova manual em campo com a chave REAL (Chromium dirigido como leigo, clínica recém-instalada): mensagens medidas, **clientes irritados percebidos**, custo e tempo |
+| J32.10 | O Jev como IA que conversa | ausente do "Modelo padrão", do seletor do ponto "Medir o clima da conversa" e do seletor de IA do agente novo | **PASS** — `jev-decisoes-rapidas.spec.ts` verde em 2026-09-24 (bancada fresca: pg15 + `baseline.sql` + `bootstrap-owner.ts`, build de produção, dublê); derivação **PASS** (`tests/unit/provedores-de-decisao-catraca.test.ts`) |
+| J32.11 | O Jev no "Qual você contratou" do onboarding | ausente | **PASS** em tela — prova de campo numa instalação fresca SEM chave: "Qual você contratou" lista Anthropic, OpenAI, Google, OpenRouter e DeepSeek, sem o Jev |
+| J32.12 | Desligar | volta a pronto para ligar, e religar não pede o aceite de novo | **PASS** — `jev-decisoes-rapidas.spec.ts` verde em 2026-09-24 (bancada fresca: pg15 + `baseline.sql` + `bootstrap-owner.ts`, build de produção, dublê) e na prova manual em campo com a chave REAL (Chromium dirigido como leigo, clínica recém-instalada): "Envio aceito pela empresa em …", religar sem novo aceite |
+| J32.13 | A mesma jornada contra a API de verdade | a chave paga passa no teste, a versão fixada responde e a medição aparece em Execuções | **PASS** local em 2026-09-24 (`jev-chave-real.spec.ts`, 7,5 s, chave do dono) — segue **FORA DO CI** (exige `JEV_API_KEY`) |
+| J32.14 | Falha que pede ação (chave recusada, sem crédito) | aviso na Central dizendo o que fazer e se a IA de sempre de fato mediu; atualizado quando o desfecho piora; fechado sozinho quando o Jev volta a medir | **PASS** em tela na prova de campo: a TypeSafe real recusou a chave → aviso crítico na Central ("O Jev parou de medir o clima das conversas…") → chave certa colada pela tela → aviso fechado sozinho, com `resolved_at` |
+| J32.15 | Irritação percebida pelo Jev | a passagem para humano diz "(percebido pelo Jev)" só no que a equipe lê | **PASS** em tela na prova de campo: título e resumo da passagem dizem "(percebido pelo Jev)"; a mensagem ao cliente não cita o Jev |
+| J32.16 | A segunda tarefa: "Perceber tentativa de manipulação" (onda 2, bloco 2.1) | com o Jev ligado no aceite de cada mensagem, ela aparece no cartão com o selo "Nova" e a frase do que isso quer dizer, **observando sozinha** (R7), com os botões dela — inclusive "Pausar esta tarefa", a saída de quem não a quer sem desligar o Jev inteiro, e "Manter só observando", que tira o selo sem mudar nada; "Deixar o Jev decidir" do clima não muda a dela; a concordância dela ("deram o mesmo alerta (nenhum, leve ou forte) em X de Y", mais "só o Jev daria o alerta forte em N") sai de `jev_observacoes`; o cartão do ponto diz que o Jev SOMA quando ela decide; com a verificação "Detectar tentativa de manipular o assistente" desligada (aba "Confere antes de enviar" de qualquer agente, que o cartão nomeia e liga por link), a tarefa diz "Não roda" (sem comparação, sem "Deixar o Jev decidir", sem fazer o cartão "observar") e sai do "Usada em" da chave — e a Segurança passa a dizer que a verificação vem LIGADA do servidor, que é o que o worker faz | **PASS em unit/jsdom** (`CartaoDoJev.test.tsx`, `PainelDeProvedores.test.tsx`, `app/api/v1/ai/jev/route.test.ts`). **NÃO provado em tela**: o e2e do CI não sobe o agent-worker, e esta rodada não fez `next build`. A spec do CI foi ajustada para clicar o "Deixar o Jev decidir" DO CLIMA (com duas tarefas observando, o botão no cartão inteiro seriam dois), sem ter sido executada depois do ajuste |
+| J32.17 | O Jev no turno do agente (a camada anti-manipulação) | camada ligada, fora da prévia e no turno da mensagem nova (`inbound_turn`): o Jev recebe SÓ o que o cliente digitou na última mensagem — mídia não sai, nem a transcrição/texto lido dela nem a moldura do agente (achado da verificação 2.1: o `skillSignal` levava um laudo inteiro) — e a linha em `jev_observacoes` + `llm_calls` sai amarrada ao job, uma por mensagem (o retry não duplica); observando vale a IA de sempre; decidindo, o maior dos dois (nunca rebaixa o "high"); sem a IA de sempre, "nenhum sinal"; chave recusada vira linha de erro em Execuções (a "Última falha" do cartão, por tarefa) com origem `jev_observacao` — a tela NÃO afirma consequência nem "não havia outra IA", porque a IA de sempre decidiu (achado da verificação r2); o teto de gasto que derruba a IA de sempre não perde o custo do Jev já chamado (R8); camada desligada, tarefa desligada e prévia não chamam o Jev | **PASS** no `test:db` pelo emissor de produção (`tests/invariants/jev-manipulacao-no-turno.test.ts`, 12 casos: handler real do `inbound_turn` e `runAgentPreview`, Postgres real, `fetch` dublê do Jev). Sabotagem medida (r3, `3 failed \| 9 passed`): sem gravar o Jev no `LlmBudgetExceededError` reprova "o teto de gasto…"; a origem `jev` na linha de erro reprova "chave recusada: a linha de erro diz que a IA de sempre decidiu…"; tirar as DUAS guardas da prévia (`!preview` e `job?.kind === 'inbound_turn'`) reprova "a prévia não grava". Tirar SÓ `!preview` não reprova nada: a prévia roda com `job = null`, e a guarda do `inbound_turn` já a barra — `!preview` fica como defesa redundante, sem caso que a isole. A guarda de camada foi vista reprovar na verificação r2. A linha de Execuções: `app/api/v1/ai/runs/route.test.ts`. Sem prova e2e (o CI não sobe o agent-worker) |
+| J32.18 | A terceira tarefa: "Escolher qual agente atende" (onda 2, bloco 2.2), vista pela tela | com o Jev ligado no aceite de cada mensagem, ela aparece no cartão com o selo "Nova", **observando sozinha** (R7) — numa empresa sem roteador de intenção ativo com 1 a 254 intenções, "Não roda" com o link para os roteadores, sem comparação nem "Deixar o Jev decidir", e fora do "Usada em" da chave; em **Testar classificação** do roteador, "Sua IA escolheu … · O Jev escolheu … (X%)" lado a lado, com o AGENTE de cada um e o mínimo de confiança aplicado aos dois; o "Agente que atenderia" só vira o do Jev quando ele decide E a sua IA respondeu (R2); o clique não grava observação (R5), mas o custo dele entra em `llm_calls` (R8) | **Spec escrita, NÃO executada nesta rodada** (`tests/e2e/jev-roteador.spec.ts`, na `SPECS_PARTE_5`: cartão com as três tarefas + Testar classificação contra o dublê, com a escolha do Jev forçada por `DUBLE_JEV_RESPOSTAS`; a regra da rodada proibiu `next build`). **PASS em unit/jsdom**: `app/app/ai/routers/[id]/_client.test.tsx` (lado a lado, R2 na tela), `app/api/v1/ai/routers/[id]/test/route.test.ts` (sem observação, com custo; decide só com a IA respondendo), `CartaoDoJev.test.tsx` e `app/api/v1/ai/jev/route.test.ts` ("Não roda" sem roteador ativo) |
+| J32.19 | O Jev no roteamento do turno | com roteador ativo e mensagem nova: o Jev recebe SÓ a última mensagem (sem o contexto das 4 anteriores que a IA de sempre lê), passada pelo `scrubMessage`, numa chamada só dele, com as intenções do roteador (1 a 254) + "nenhuma"; **observando, o turno não espera por ele** e o par (agente dele × agente da IA de sempre, amarrado a `job_id` e `message_id`) é gravado quando ele responde — concordância = MESMO AGENTE FINAL (duas intenções do mesmo agente concordam); decidindo, vale a escolha dele com o `min_confidence` sobre a probabilidade dele, e a IA de sempre cobre quando ele não responde (a busca da chave e a pergunta a ele têm, juntas, o teto de 1,5 s — `decidirNoPonto`; a leitura do estado vai pelo banco do turno, como as demais consultas dele); **sem a IA de sempre, a regra de hoje (sticky ou o de reserva), nunca o Jev (R2)** — e a saída dela que não é resposta (sem JSON, intenção inventada) conta como sem ela; decidindo, a cobertura da IA de sempre vira linha em `llm_calls` com `reserva_do_jev` (o cartão a conta); conversa com lead em handoff ou não elegível para a IA não sai para o Jev nem para a IA de sempre (as travas vêm antes de escolher o agente); o retry sobre a mesma mensagem não conta em dobro | **PASS** no `test:db` pelo caminho do turno (`tests/invariants/jev-roteador-no-turno.test.ts`, 8 casos: `resolveConversationTurn` com Postgres real, roteador, membros e agentes publicados de verdade, o Jev num `fetch` dublê e a IA de sempre num `classifyIntent` dublê — o verdadeiro sairia para a rede pelo registry padrão). Sabotagem medida: o turno esperar o Jev observando reprova o caso "observando" (timeout); tirar a guarda `verdict !== null` reprova os dois casos de R2; comparar por intenção em vez de agente reprova 5 casos. A fiação do handler (`deps.jev` chega ao roteador): `tests/unit/autonomia-routing-selection.test.ts`. A saída ilegível como falha, a linha de cobertura e as travas antes da escolha: **PASS só em unit** (`resolve-turn-agent.test.ts`, `roteador.test.ts`, `autonomia-routing-selection.test.ts` — a última com sabotagem medida: o handler de antes reprova 5 casos), sem caso no `test:db`. Sem prova e2e (o CI não sobe o agent-worker) |
+| J32.20 | Os pedidos do cliente (onda 3, bloco 3.1): "Perceber pedido para falar com uma pessoa" e "…para parar de receber mensagens", vistos pela tela | com o Jev ligado no aceite de cada mensagem, as duas aparecem no cartão com o selo "Nova", **observando sozinhas** (R7), sem "Deixar o Jev decidir"; a mensagem que chega pelo WhatsApp só leva ao Jev a pergunta que a regra de hoje NÃO pegou ("PARAR" nunca leva a de parar de receber; "quero falar com um atendente" leva só a de parar de receber; "me deixa em paz", que no turno passa a conversa, não leva nenhuma), numa chamada separada da do clima, e só onde há um atendente automático no ar naquele número, sem pessoa no comando (o portão do dreno sem os pausados); o cartão conta **mensagens**, e não pedidos (o worker pergunta antes da janela do turno: duas frases naturais na mesma rajada contam duas) — "Nos últimos 30 dias, o Jev percebeu 1 mensagem pedindo para falar com uma pessoa em que a regra de hoje não reconheceu o pedido.", e com zero "…ainda não percebeu nenhuma mensagem…" —, com o link para a conversa, e a conversa segue sem passagem, silêncio nem bloqueio; numa empresa sem atendente automático no ar em número nenhum (ou com o atendimento num sistema de fora), as duas dizem "Não roda" com o motivo; em Execuções a chamada se chama "Perceber pedidos do cliente" e o porquê é uma pergunta ("…se esta mensagem traz um pedido que a regra de hoje não viu") | **PASS na tela** na primeira execução (orquestrador, HEAD 2c0181eff, bancada fresca: `jev-decisoes-rapidas jev-roteador jev-pedidos`, 3 passed); os passos novos do conserto 3 (a frase por mensagem, o zero, o aviso de parar de receber) **escritos, não executados** — `tests/e2e/jev-pedidos.spec.ts`, na `SPECS_PARTE_5`, contra o dublê com `DUBLE_JEV_RESPOSTAS` e `DUBLE_JEV_RESPOSTAS_POR_TRECHO`. **PASS em unit/jsdom**: `lib/ai/decisao/pedidos.test.ts` (cascata com a regra de verdade, denominador, corte por pedido (pessoa 0,9, parar 0,8), gravação sem texto), `tests/unit/clima-da-conversa-no-worker.test.ts` (o worker: chamada própria, fatos do turno, clima intacto), `lib/ai/decisao/ponto.test.ts` (a chave só sai com TODAS as tarefas da chamada rodando), `CartaoDoJev.test.tsx` (nenhuma/uma/várias mensagens, "Não roda" sem atendente, a frase de antes de ligar por combinação) e `app/api/v1/ai/jev/route.test.ts` (o motivo `sem_atendente`). **`test:db`**: `tests/invariants/jev-pergunta-so-com-quem-nao-esta-pausado.test.ts` (o agente pausado pela tela — a versão segue publicada — não conta como quem atende), `tests/invariants/jev-regra-da-rajada-le-o-que-o-turno-le.test.ts` (a regra olha as mensagens sem resposta que o turno lê, a rajada inclusa) e `tests/invariants/jev-nao-roda-sem-atendente.test.ts` (o "Não roda" do cartão é exatamente "nenhum número responde sim ao portão do worker") |
+| J32.21 | "Avisar a equipe" (onda 3, bloco 3.2): o `decidindo` das tarefas em cascata, visto pela tela | no cartão, a tarefa de pedido oferece **"Avisar a equipe"** (nunca "Deixar o Jev decidir"); o diálogo diz o efeito antes de valer ("abre um aviso na Central… nunca passa a conversa sozinho" / "…nunca bloqueia ninguém"); decidindo, o selo é "Avisa a equipe" e "Voltar a só observar" desfaz; a frase natural de um cliente novo abre **UM** aviso na Central (`jev_pedido_de_humano`, `warn`, título e corpo no idioma da organização, **sem a frase do cliente**) com "Abrir a conversa" → `/app/inbox/<id>`; a conversa segue sem dono, sem silêncio e o contato sem bloqueio, no mesmo estado da conversa só observada; depois do clique, o CARTÃO segue "observando" (avisar não é decidir); o de falar com uma pessoa fecha quando a conversa fica com uma pessoa por qualquer caminho (assumida ou passada) ou é encerrada; o de parar de receber — que pede à equipe assumir E pedir o "PARAR" — NÃO fecha ao assumir: só com o contato bloqueado, a conversa encerrada ou "Marcar resolvido"; o aviso de parar de receber aparece na Central com a instrução ("…peça que ele responda PARAR…", "O Jev nunca bloqueia ninguém.") | **PASS na tela** na primeira execução (orquestrador, HEAD 2c0181eff) para o aviso de falar com uma pessoa; o do parar de receber pela tela **escrito, não executado** (os passos novos de `tests/e2e/jev-pedidos.spec.ts`, na `SPECS_PARTE_5`). **PASS em unit/jsdom**: `lib/ai/decisao/pedidos.test.ts` (um aviso por conversa e pedido, idioma, corte, R3 pelas operações que rodam, Central recusando), `tests/unit/clima-da-conversa-no-worker.test.ts` (pelo worker, pt-BR e es), `CartaoDoJev.test.tsx`, `app/api/v1/ai/jev/route.test.ts`, `lib/ai/inbox-destino.test.ts`. **`test:db`**: `tests/invariants/jev-aviso-na-central.test.ts` (o CHECK aceita os dois kinds; assumir fecha só o de falar com uma pessoa e o de parar de receber fica; encerrar fecha; só o aviso da conversa certa; `ai_handling` não fecha), `tests/invariants/jev-aviso-fecha-sozinho-e-e-unico.test.ts` (a passagem do turno, a do clima e a pausa manual fecham o de pessoa; o bloqueio do contato fecha o de parar de receber; um aviso por conversa e pedido pelo índice único, com a deduplicação da migration), `tests/invariants/jev-parar-de-receber-sobrevive-a-assumir.test.ts` (assumir pelo `fn_conversation_assign` e a passagem fecham só o de pessoa; encerrar fecha os dois) e `tests/invariants/jev-pergunta-so-onde-o-dreno-atende.test.ts` (o worker e o dreno respondem igual sobre quem atende; as palavras de passagem de quem pode atender) |
+| J32.22 | A sexta tarefa: "Ler a resposta ao follow-up" (onda 4.1), vista pela tela | com o Jev ligado no aceite de cada mensagem, ela aparece no cartão com o selo "Nova", **observando sozinha** (R7) e **sem "Deixar o Jev decidir"**: a linha diz, em frase de leigo, por que só observa nesta versão (a saída move o cliente no fluxo, e primeiro se mede a concordância com respostas de verdade); a frase de "Nova" não promete o botão; a concordância é "…puseram a resposta do cliente na mesma saída do fluxo em X de Y mensagens." (a mesma unidade do "Ainda não há mensagens medidas"); com só ela comparando, a frase do cartão (antes e depois de ligar) não fala em deixar o Jev decidir; numa empresa sem follow-up PUBLICADO com o passo "Classificar (IA)" de duas saídas ou mais E sem inscrição andando numa versão com ele (desativar o follow-up não encerra as inscrições, e o motor segue mandando as respostas ao Jev), "Não roda" com o motivo e o link para Follow-ups, antes e depois de ligar; um passo de uma saída só não vai ao Jev (concordância certa por construção); e fora do "Usada em" da chave; a rota recusa `decidindo` nela (422 `jev_tarefa_so_observa`, com a mesma frase, no idioma de quem pede) e um `decidindo` gravado por outra versão vale observando; o cartão do ponto "Ler a resposta ao follow-up" diz que o Jev observa e o modelo decide; em Execuções a chamada tem o nome do ponto e a origem de observação | **PASS em tela** (26/09): `jev-followup.spec.ts` verde contra `pnpm e2e:build` numa bancada fresca, junto das specs do Jev e de follow-up (`21 passed`); e **prova de campo com as chaves reais** (instalação fresca, OpenAI e TypeSafe): a Marina respondeu "Agora não dá, estou viajando. Me chama semana que vem?" a um follow-up publicado pela API do construtor, a IA de sempre (gpt-5.6-terra, 1097 ms) e o Jev (0,99, 335 ms) escolheram "pediu para falar depois", o fluxo seguiu pela saída da IA de sempre, e o cartão mostrou "em 1 de 1 mensagens". O envio da ação foi concluído pelo seam `complete-turn` (a bancada não tem WAHA); daí em diante tudo rodou pelo caminho de produção. Unit/jsdom: `CartaoDoJev.test.tsx`, `route.test.ts`, `tarefas.test.ts`, `credenciais-aviso-so-decisao.test.tsx`. |
+| J32.23 | O Jev no passo "Classificar (IA)" do follow-up | com resposta do cliente ao envio do fluxo e a tarefa rodando: o Jev recebe SÓ o que o cliente digitou (passado pelo `scrubMessage`; sem o histórico nem a mensagem anterior), numa chamada só dele, com as saídas do passo como opções — sem "nenhuma" — e a dica do passo na instrução; **o fluxo segue SEMPRE pela saída da IA de sempre**, mesmo com o Jev discordando, e ninguém espera por ele; o par (saída dele × saída dela) vai para `jev_observacoes` amarrado ao `job_id` e ao `message_id` REAL da resposta (achado pela conversa, texto e segundo), com o custo em `llm_calls` (`followup_classify`, `jev_observacao`) no mesmo comando, sem texto do cliente; o retry do mesmo job não conta em dobro (a primeira resposta do Jev fica; o custo da segunda entra); a IA de sempre que falha deixa o par sem ela, e o retry o completa; tarefa pausada ou Jev desligado ⇒ nada sai; sem resposta (`awaiting_reply`) ou resposta em áudio transcrito ⇒ o Jev não é perguntado | **PASS** no `test:db` pelo caminho de produção (`tests/invariants/jev-followup-no-turno.test.ts`, 10 casos: tick do motor, `job_queue`, `claimJobs` e o handler real `createFollowupTurnHandler` com a ponte, Postgres real, a IA de sempre no registry dublê e o Jev num `fetch` dublê; mais a FK que o embed do cartão nomeia). Sabotagem medida: sem o `scrubMessage` reprova (a) e o unitário; perguntar com a tarefa desligada reprova os dois (d); a saída do Jev movendo o fluxo reprova (a)+(b) (`e_nao` no lugar de `e_quer`); gravar sem o `message_id` reprova (c) (duas observações); uma escrita em `conversations` no módulo reprova a cerca R3. **PASS em unit**: `lib/ai/decisao/followup.test.ts` (a pergunta, o contrato do fornecedor, a leitura da resposta, a gravação) e `tests/unit/followup-classificar-sem-resposta.test.ts`. Sem prova e2e (o CI não sobe o agent-worker) |
+
+| J32.24 | O Jev roteia sozinho, com a IA de sempre de reserva (PR #2061, @vitorlacerdadigital) | Provedores mantém a comparação e oferece o modo sob demanda **só onde a empresa tem a IA de sempre** (decisão B do mantenedor, doc 89): sem ela a opção não liga, o cartão diz por quê, o `PATCH` recusa com `jev_sem_ia_de_sempre` e o turno compara (R2); o editor salva a janela 0–16 da IA de sempre (novo padrão 8, legado 4), e o Jev segue recebendo só a mensagem atual (o histórico dele espera a TypeSafe, DEC-012); Testar classificação dispensa a IA de sempre quando o Jev tem intenção confiável; Execuções › Roteamento mostra decisões, custo conhecido, revisão humana e acesso à conversa. | Unit/API e Postgres real (`tests/invariants/jev-roteador-no-turno.test.ts`): turno sob demanda com e sem reserva, e sem a IA de sempre o modo não liga. Tela: `tests/e2e/jev-roteador.spec.ts` cobre configuração, prévia independente e revisão persistida com dados sintéticos. Não mede economia nem acurácia real do fornecedor. |
+
+**Achados da execução em campo (2026-09-24), todos consertados antes do PR:** a spec do CI
+recarregava a página com o POST da chave em voo e o salvamento morria (status `-1` no trace);
+aviso da Central fechado sem `resolved_at`; "Usada em" sumia depois de editar a chave; "Nome"
+obrigatório barrava quem só colava a chave; ⌘K com a descrição do resultado selecionado em
+**1,20:1** de contraste e cortando a palavra "Jev"; cartão espremido e custo fora da borda a
+375 px; aviso "falta a IA principal" dentro do cartão com o Jev funcionando; nenhum número de
+VALOR no cartão (entrou "Clientes irritados percebidos"); "Close" em inglês nos diálogos.
+Evidência (capturas numeradas, chave mascarada) na bancada local da sessão.
+
+"ESCRITA, NÃO EXECUTADA" quer dizer isso mesmo: a spec existe e passa pelas cercas
+estáticas (`e2e-cobertura-completa` e as irmãs), mas ninguém a rodou contra um app
+buildado ainda. Esta linha muda quando a primeira rodada da parte 5 medir.
+
+### Achados da integração (cada um com commit próprio)
+
+1. **O redator de segredo nunca apagou chave nenhuma** (`de7236805`). O padrão de
+   `redigirMensagemDoProvedor` tinha um byte de backspace onde devia estar `\b`, desde
+   2026-08-08: `sk-…`, `AIza…` e `Bearer …` chegavam inteiros à tela de Execuções.
+   Apareceu ao escrever o caso da chave do Jev.
+2. **O clima da conversa não media com a chave colada pela tela** (`3c3d4ccf5`). Um
+   portão olhava só as variáveis do `.env`; quem pulou a chave no `install.sh` e a
+   cadastrou depois ficava sem passagem por irritação, sem aviso nenhum.
+3. **Cadastrar a chave do Jev já mandava as mensagens para fora** (`87332b348`), antes
+   de alguém ligar ou aceitar. A guarda passou para onde toda chamada passa.
+4. **O `scrubMessage` não apagava telefone como se escreve no Brasil** (`625f895a6`):
+   `(11) 98765-4321` passava inteiro — para o Sentry e para a frase de aceite do Jev,
+   que prometia o contrário.
+5. **O aviso "falta a chave da sua IA principal" era falso** quando a chave estava no
+   `.env` (`65b8078c6`).
+6. **O filtro `?provider=` de Execuções** era afirmado no cabeçalho da rota e não
+   existia (`4a38195fc`).
+
+### Achados da prova em campo (2026-09-23, instalação zerada, chave real do Jev)
+
+Dirigida pela tela como leigo; capturas fora do repo (bancada do coordenador). Os
+consertos estão em commits próprios desta branch — procure pelas palavras abaixo em
+`git log main..HEAD`.
+
+1. **A spec abortava o próprio cadastro da chave** — recarregava a página logo depois
+   de "Salvar e validar", e o `POST` saía com status -1. Agora espera a resposta e o
+   cartão mudar sozinho.
+2. **Aviso do Jev fechado sem `resolved_at`**, fora da convenção da Central.
+3. **"Usada em" sumia depois de trocar a chave** até recarregar: vinha de uma foto
+   tirada no servidor com a chave nova ainda em teste. Hoje sai da lista viva.
+4. **O "Nome" obrigatório barrava quem colava só a chave.** Opcional; vazio vira o
+   nome do provedor.
+5. **⌘K ilegível no item destacado** (cinza sobre verde, 1,20:1) e a descrição de
+   Provedores cortada antes do "Jev". O "X" dos diálogos se anunciava "Close".
+6. **Cartão**: aviso de "falta a IA principal" repetido com o Jev funcionando, nada
+   dizendo que a chave foi conferida, sem número de valor ("Clientes irritados
+   percebidos"), um zero de reserva que nunca muda sem IA de sempre, cabeçalho e
+   números espremidos a 375 px, link com 20 px de alvo.
+7. **Execuções não dizia se o Jev decidiu ou observou**, e o motivo da passagem no
+   Inbox só atribuía ao Jev no resumo, não na frase em destaque.
 
 ## J4 — CRM e Pipelines `[P1]`
 
@@ -140,7 +243,7 @@ fonte só (`lib/onboarding/passos.ts`) — eram três listas que discordavam. Ga
 | J4.20 | Arquivar funil que é destino de formulário/automação | recusa NOMEANDO a fonte ou a regra (coberto por unit; `webhook_sources` cascateia) |
 | J4.21 | Lista de funis como `agent` | vê a lista e abre o quadro, sem nenhum controle de escrita (executado 2026-08-03) |
 | J4.22 | **Mensagem de contato desconhecido chega pelo webhook do WAHA** | card nasce no funil de entrada (`is_default`), na primeira etapa aberta, com o NOME de quem escreveu — nunca `@c.us`/`@lid` (executado 2026-08-06 · `conversa-vira-lead.spec.ts`) |
-| J4.23 | Timeline do card recém-nascido | diz **"Entrou pelo WhatsApp"** — card que aparece sem explicação destrói a confiança no automatismo (executado 2026-08-06) |
+| J4.23 | Timeline do card recém-nascido | diz **"Entrou no funil"**, com o canal no motivo ("primeira mensagem recebida no WhatsApp" / "no Instagram") — até 2026-10-03 dizia "Entrou pelo WhatsApp" para qualquer canal — card que aparece sem explicação destrói a confiança no automatismo (executado 2026-08-06) |
 | J4.24 | Segunda mensagem do MESMO contato | **não** abre um segundo card: um lead por demanda, não um por mensagem (executado 2026-08-06) |
 | J4.31 | **Marcar em que funis o assistente pode mexer** | nasce FECHADO (a tela explica: "conversa normalmente, mas não mexe em negócio"); a marcação sobrevive ao salvar E RECARREGAR — o defeito do campo que "se desmarca sozinho" (`escopo-de-funil-do-agente.spec.ts`, 2026-08-07) |
 | J4.32 | Funil marcado que o assistente não sabe percorrer | a lacuna de tradução aparece AO LADO da marcação, e só no funil marcado — fora do escopo ela não custa nada |
@@ -180,6 +283,38 @@ fonte só (`lib/onboarding/passos.ts`) — eram três listas que discordavam. Ga
 | J5.13 | Admin **reenvia** um convite | `POST /api/v1/team/invites/[id]/resend` re-assina o mesmo `invite_id`, renova 24h, audita `member.invited`; reconvidar o mesmo e-mail pendente pela tela de convite RENOVA a linha (índice único parcial) |
 | J5.14 | Manager vê a lista, mas não as ações | leitura é `team_invites_select` (manager+); reenviar/revogar são admin-only (403) |
 
+### J5.15 `[P0]` — Convite SMTP em Docker com hostname curto
+
+Falha observada na release 1.48.0: conexão e autenticação SMTP passavam, mas seis
+convites aceitos pelo servidor foram classificados como `filtered` pelo router
+HostGator `fightspamHG`. O Nodemailer, sem `name` explícito e com hostname Docker
+curto, usava EHLO `[127.0.0.1]`. `email_dispatched=true` atesta aceitação SMTP,
+não entrega na caixa de entrada.
+
+Correção: `lib/email/smtp.ts` identifica envio e verificação com o hostname de
+`env.NEXT_PUBLIC_APP_URL`, já configurado pelo instalador. A opção é lida do
+ambiente validado em runtime; não exige novo campo nem ajuste de compose.
+`tests/unit/smtp-identifica-a-instalacao.test.ts` usa Nodemailer real e receptor
+TCP local: mede EHLO, envio de mensagem, verificação sem envio, URL com porta/caminho,
+literais IPv4/IPv6, fallback local, cache e ausência de configuração.
+
+**Evidência externa em 25/09/2026:** teste controlado com FQDN recebeu `success` no
+rastreamento do provedor e confirmação de recebimento pelo destinatário. Após o
+workaround equivalente de hostname no contêiner da instalação, quatro convites
+reenviados pelo endpoint oficial tiveram `success` no gateway. Isso valida o
+mecanismo; o patch de código deste PR foi exercitado no receptor local. **Não medido:**
+entrega desses quatro convites nas caixas finais, todos os provedores e uma nova
+jornada Playwright em instalação fresca. Nenhum endereço ou token real é necessário
+para reproduzir o teste local.
+
+### J5.16 `[P0]` — O link de senha, convite e cadastro resiste ao verificador do Hotmail/Outlook (#2183)
+
+O verificador de links do Outlook/Hotmail abre o link do e-mail antes da pessoa e gastava o token de uso único: quem clicava depois recebia "link expirado". O link agora leva à tela **Confirmar acesso** (`/login/continuar`), e só o botão **Continuar** (POST) gasta o token. Prova pela tela, num build de produção com o `baseline.sql` (contribuição de @fabianmartinelli-fm):
+
+- `evidence/2026-10-03-link-resiste-a-verificador/01-confirmar-acesso.png` — a tela que o link abre, depois que o verificador já seguiu o link;
+- `evidence/2026-10-03-link-resiste-a-verificador/02-definir-nova-senha.png` — o Continuar leva à definição de senha com o token ainda válido;
+- `evidence/2026-10-03-link-resiste-a-verificador/03-confirmar-acesso-celular.png` — a mesma tela no celular.
+
 ## J6 — Webhooks: receber, automatizar, provar `[P0]`
 
 | # | Caso | Expectativa |
@@ -188,6 +323,7 @@ fonte só (`lib/onboarding/passos.ts`) — eram três listas que discordavam. Ga
 | J6.2 | "Enviar lead de teste" | toast de sucesso + lead visível no Kanban + feed atualiza |
 | J6.3 | POST externo real (curl de "Zapier") | lead entra; feed mostra recebimento; idempotência por external_id |
 | J6.4 | HMAC: fonte com secret + assinatura errada | 401; feed marca inválido |
+| J6.17 | **`[P0]` Ligar a assinatura da fonte pela tela, e ela valer de verdade** | quem administra gera o segredo em Automações › Receber dados, vê o valor UMA vez e copia. Com o valor lido da própria tela: sem segredo → 200 (controle), com segredo e sem assinar → 401, assinatura de outro segredo → 401, assinado → 200. Reabrir mostra o estado e nenhum valor; remover devolve o 200 · `tests/e2e/fonte-de-captacao-assina-os-envios.spec.ts` (SPECS_PARTE_6) + `tests/unit/fonte-de-webhook-assinatura-hmac.test.tsx` (12 casos). Evidência: `evidence/assinatura-da-fonte-de-captacao/1-assinatura-desligada.png`, `evidence/assinatura-da-fonte-de-captacao/2-segredo-uma-vez.png`, `evidence/assinatura-da-fonte-de-captacao/3-reaberto-sem-valor.png`, `evidence/assinatura-da-fonte-de-captacao/4-assinatura-removida.png`. **Achado da própria execução:** o rig do e2e não gravava `nuvemshop_oauth_key` em `private.app_secrets` — a chave que o `install.sh` cria em toda VPS —, então "Gerar segredo" respondia 422 `encryption_unavailable` aqui e funcionaria no cliente. O rig media um produto que não existe; corrigido em `scripts/gerar-env-e2e.sh` |
 | J6.5 | Criar regra: lead com utm instagram → tag | regra nasce pausada; ativar pelo switch |
 | J6.6 | Drain roda → regra executa | tag aplicada; aba Atividade mostra run Sucesso |
 | J6.7 | Ação call_webhook → receiver local REAL | payload chega no receiver; envelope sem org_id/cpf |
@@ -200,6 +336,12 @@ fonte só (`lib/onboarding/passos.ts`) — eram três listas que discordavam. Ga
 | J6.14 | **Formulário com campos que o mapeamento não reconhece** | a captação aparece como **Não entrou**, com o motivo em português e os campos crus — antes o site recebia 400 e não sobrava rastro nenhum na tela |
 | J6.15 | `viewer` tenta abrir o histórico | redirecionado; a RLS de `webhook_lead_captures` exige `manager` (o formulário é PII) |
 | J6.16 | Ação **"Mensagem escrita pela IA"** no ENTÃO | pede agente publicado + número + o contexto do que fazer com os dados; o agente sabe que é abordagem pós-formulário |
+| J6.17 | **Formulário do Elementor Pro** (ação "Webhook", `fields[id][value]`) | o lead ENTRA com nome, telefone e e-mail — antes o webhook respondia 400 "Nenhum campo mapeável" e nenhum lead nascia (achado de 2026-09-30, com envio real). **Unit verde** (`lib/webhooks/elementor.test.ts`, com sabotagem); **NÃO provado pela tela nem pela rota com banco** — sem Docker na sessão que escreveu |
+| J6.18 | **JetFormBuilder**, envio REAL (página publicada) | o lead entra sem `__refer`/`__form_id`/`__is_ajax` no card. **Medido em envio real** que name/phone/email já eram reconhecidos; o lixo interno só some com a mudança. Na PRÉVIA do editor o JetFormBuilder manda só os campos internos e a captação aparece "Não entrou" — é o comportamento dele, não defeito do CRM |
+| J6.19 | Painel da captação, campo **já cadastrado** no funil | a linha mostra o rótulo do funil, não a chave crua. Unit com RTL (`CapturaDetail.test.tsx`); **tela real NÃO executada** |
+| J6.20 | Painel da captação, campo **novo** → "Cadastrar como campo do lead" | grava o que já existia MAIS o campo, a partir da leitura fresca do funil; some o botão para nome que a API recusaria. Unit com RTL; **tela real NÃO executada** |
+| J6.21 | `{{servico}}` numa mensagem de automação | resolve o campo do lead; `{{nome}}` e o caminho longo seguem iguais. Unit (`template.test.ts`) |
+| J6.22 | Ação "Mensagem escrita pela IA" com campo cadastrado | a IA recebe "Serviço que precisa: …" em vez de `servico: …`. Unit com banco dublê (`dados-do-formulario.test.ts`) |
 
 ## J8 — O cliente não morre por falta de resposta `[P1]`
 
@@ -276,7 +418,13 @@ Provado por sabotagem em `evidence/handoff-avisa-antes/sabotagem-ordem-invertida
 
 Guardas: `tests/invariants/handoff-avisa-o-lead.test.ts` (turno real contra
 Postgres do baseline), `tests/unit/handoff-avisa-o-lead.test.ts` (varredura AST
-dos dois motores) e `tests/unit/aviso-ao-lead.test.ts` (o texto).
+dos dois motores), `tests/unit/aviso-ao-lead.test.ts` (o texto) e
+`tests/unit/aviso-so-quando-a-ia-falou.test.ts` (as duas guardas do lado do CRM:
+sem fala prévia da IA na conversa o aviso não sai — numa instalação real, o
+sentimento disparou a passagem numa organização sem agente publicado e o cliente
+recebeu "já acionei o time" do nada; a exceção é a passagem pedida por agente
+externo via MCP, cujas falas são gravadas como `system` —, e no máximo um aviso
+por conversa a cada 24 h, contado no banco, sem contar aviso `failed`).
 
 ---
 
@@ -446,6 +594,8 @@ ao cliente dele, e a tela de acesso é a primeira coisa que qualquer usuário v�
 | J10.6 | O instalador pergunta a cor da marca | `APP_ACCENT_HEX` no `install.sh`, com validação — o revendedor não recebe o verde do produto | PASS (`tests/shell/`) |
 | J10.7 | Nome com apóstrofo (`Sant'Ana Odontologia`) | o `.env` sobrevive: 18/18 nos três consumidores de compose | PASS |
 | J10.8 | Cor escura de marca não quebra o contraste | o anel de foco respeita o piso de 3:1 em ambos os temas | PASS (unit) |
+| J10.9 | Dois logos, um por tema, com remoção independente | arte escura sem moldura na prévia, menu e login; remover apenas a escura preserva o padrão com a proteção anterior | `tests/e2e/logo-moldura-no-tema-escuro.spec.ts`, caso (7); ver evidência da execução no PR |
+| J10.10 | Administrador salva CSS visual da instalação | CSS aparece no login sem sessão, em valor computado; salvar vazio remove; folha global afeta as organizações | SPEC adicionada em `tests/e2e/marca-logo.spec.ts`; execução pendente |
 
 **Bug de produto achado ao executar (2026-08-14), e é o que justifica esta jornada
 existir.** O caso J10.1 reprovou no CI, e não por defeito do teste: quem sobe o
@@ -573,7 +723,7 @@ uma, para a asserção poder ser sobre o CONJUNTO DE NOMES e não sobre a contag
 | J13.7 | A ida ao Google seleciona os pendentes (o filtro antigo devolvia HTTP 400) | **PASS** — medido contra o PostgREST real do ambiente e2e: filtro antigo `400 / 22007`, filtro novo `200` com as linhas pendentes |
 | J13.8 | Sincronizar tira a linha da fila, e editar recoloca (o laço dos dois relógios) | **PASS** — medido no Postgres real: `true` → `false` com delta `00:00:00` → `true` |
 | J13.9 | A credencial do Google não é servida pelo PostgREST | **PASS** — `anon` recebe `42501 permission denied`; `service_role` recebe 200 (controle positivo) |
-| J13.10 | Cadastrar a credencial do Google pela tela do admin | **NÃO EXERCITADO** — a tela e a server action existem e o `next build` passa, mas o ambiente e2e não tem a chave mestra de cifra semeada (`fn_encrypt_oauth` levanta `NUVEMSHOP_OAUTH_ENCRYPTION_KEY ausente`), que é justamente o caminho em que a action RECUSA gravar. Falta o caso pela tela com a chave presente |
+| J13.10 | Cadastrar a credencial do Google pela tela do admin | **PASS** (issue #370) — `admin-credencial-google.spec.ts`, contra o app real. O CI grava a chave mestra de cifra no ambiente do e2e desde `.github/workflows/e2e.yml` (o que faltava quando esta linha foi escrita "NÃO EXERCITADO"). Prova: dono cadastra em `/admin/google`, o `client_secret` NÃO volta ao navegador nem recarregando nem no HTML servido, o cartão da Agenda para de pedir SSH e passa a oferecer "Conectar Google", e admin de tenant é barrado (`redirect` para `/admin/forbidden` antes da página rodar). Evidência: `evidence/admin-credencial-google/1-nao-cadastrada.png`, `evidence/admin-credencial-google/2-cadastrada-segredo-nao-volta.png`, `evidence/admin-credencial-google/3-cartao-da-agenda-oferece-conectar.png` |
 | J13.11 | Compromisso do Google que começa antes do período desenhado aparece na grade, fatiado na borda | **NÃO COBERTO** — medido só por unidade sobre dublê do cliente Supabase (`tests/unit/agenda-recorte-do-google-atravessa-o-limite.test.ts`); falta prova pela tela num ambiente com Google conectado. ⚠️ O conserto morde na BORDA do período que a tela desenha (virada da semana na visão Semana, do mês na visão Mês, meia-noite na visão Dia). Dentro do período desenhado a grade continua atribuindo o bloco só à coluna do dia em que ele COMEÇA (`components/agenda/GradeDaAgenda.tsx`, `isSameDay(comeca, dia)`) — essa metade é item próprio |
 | J13.12 | Agendamento INTERNO que atravessa a meia-noite aparece na janela do dia seguinte | **NÃO COBERTO, e o defeito é conhecido** — `listaAgendamentos` recorta por começo e não por interseção (`lib/agenda/consulta.ts`, `.gte("starts_at", de).lt("starts_at", ate)`), enquanto `coletaOQueOcupa` no mesmo arquivo já usa interseção: mesma discordância tela↔motor da #525, do lado interno. Não consertado junto porque `listaAgendamentos` também alimenta a ferramenta MCP do agente (`lib/mcp/tools/agendamento.ts`) — mudar o recorte muda o que o agente enxerga, e isso é decisão de contrato
 | J13.13 | ⚠️ **`viewer`/`agent` continuam sem ver a ocupação do Google do COLEGA na grade** | **NÃO COBERTO, e o defeito é conhecido** — a leitura da tela é pela SESSÃO, com o embed `calendar_connections!inner` (`lib/agenda/ocupacao-externa.ts`), e a RLS `calendar_connections_dono_ou_manager_read` (`supabase/baseline.sql`) só libera `user_id = auth.uid()` ou `fn_role_at_least(org,'manager')`. O motor (`fn_agenda_ocupacao_google_do_dono`, migration 0260) é `security definer` e entrega a ocupação a TODO membro: para esses dois papéis a tela desenha livre todo compromisso do colega enquanto a marcação recusa. É a metade da #525 que o #915 **não** fecha — ele fecha a FRONTEIRA do recorte, não o PAPEL de quem olha (resíduo da #879). O dublê de `tests/unit/agenda-recorte-do-google-atravessa-o-limite.test.ts` não modela papel nem RLS, então a suíte não pode enxergar isto. Fechar é decisão de produto sobre QUEM vê |
@@ -606,6 +756,7 @@ Presença nunca vai medir isto; só geometria mede.
 | J14.4 | Abaixo de `lg` os horários empilham sob o calendário | **PASS** — caso de 900px |
 | J14.5 | O limiar de 1024px, onde as 3 colunas passam a valer com 44px de folga | **PASS** — é onde um ajuste de padding estoura primeiro |
 | J14.6 | "Ver na agenda" leva até o compromisso, inclusive em outra semana | **PASS** — `agenda-ver-na-agenda.spec.ts`. O botão não tinha `onClick` nenhum. Evidência: `evidence/calendario/d2-ver-na-agenda.png` |
+| J14.7 | Em janela larga e BAIXA (1024×560, 1280×500) o formulário rola com a roda do mouse até o Confirmar, e a marcação grava; 390×700 é o controle empilhado | **NÃO MEDIDO em tela local** — caso novo em `agenda-painel-cabe-na-tela.spec.ts` (roda do mouse, botão inteiro na viewport, teste de oclusão, `POST /api/v1/agenda/agendamentos` 2xx e "Marcado."); a prova é o `e2e` do CI. A forma é vigiada por `tests/unit/agenda-confirmar-alcancavel.test.ts`. Antes: Sheet com `lg:overflow-hidden` e painel em `lg:flex-1 lg:min-h-0`, com o formulário acima (vínculo, tipos, convidado, endereço, observação) comendo quase toda a altura — a conta das alturas deixa o painel com uma fresta em 1024×560 e sem espaço em 1280×500 |
 
 **Duas correções ao diagnóstico inicial, ambas medidas:**
 1. O defeito de largura **não sumia em tela grande** — em 1920 o transbordo era
@@ -991,7 +1142,7 @@ ação `send_ai_message`, retomada manual (`lib/escalacao/retomada.ts`).
 | J20.15 | Org SEM versão de agente publicada (caminho legado `ai-response-worker`), gate allowlist, contato não autorizado | IA NÃO responde por este caminho tampouco | **UNIT** — `ai-response-worker-elegibilidade.test.ts` (skip `nao_elegivel_para_ia` antes de ler mensagem/agente; fail-closed em erro de leitura) |
 | J20.16 | Follow-up de TEXTO FIXO drenado inline (`enviarTextoFixoPendente`, sem worker), contato não autorizado | NÃO envia; job vira `done` | **UNIT** — `enviar-texto-fixo.test.ts` "conversa NÃO elegível" (+ fail-closed volta pra `pending`) |
 | J20.17 | Cliente antigo irritado (gate allowlist, não autorizado) → worker de sentimento dispara `low_sentiment` | `triggerHandoff` NÃO dispara: sem "um humano vai te atender", sem mexer no estado da conversa | **UNIT** — `handoff-orchestrator-elegibilidade.test.ts` (`bloqueioPorAllowlist` e `conversa_silenciada` barram; fail-closed em erro) |
-| J20.18 | Eu respondo o cliente à mão pelo meu WhatsApp numa conversa autorizada | IA para naquela conversa por um PRAZO (`PRAZO_DO_SILENCIO_MS`, 60 min) renovado a cada nova fala humana, SEM apagar `ai_authorized_at`; volta sozinha quando o prazo vence, ou antes por "devolver ao automático" | **UNIT** — `atendimento-manual.test.ts` (as duas pontas do prazo medidas pelo motor real `decidirElegibilidade`, renovação, e o que NUNCA encurta: `'infinity'` do handoff formal e janela mais longa) + `waha-ingest-atendimento-manual.test.ts` (via `dispatchWahaEvent` real; eco do próprio envio NÃO pausa) + guarda de fonte no Zernio + fiação em `handoff-fantasma-fiacao.test.ts`; **E2E** — `tests/e2e/j20-elegibilidade-atendimento-manual.spec.ts` (webhook `fromMe` genuíno → `bot_silenced_until` finito e futuro, nunca `'infinity'`, + rastro; `ai_authorized_at` intacto; 2ª mensagem RENOVA o prazo; tela mostra o selo; "devolver ao automático" solta a trava e a autorização continua) |
+| J20.18 | Eu respondo o cliente à mão pelo meu WhatsApp numa conversa autorizada | IA para naquela conversa por um PRAZO renovado a cada nova fala humana — o da EMPRESA (`settings.routing.manual_reply_silence_minutes`, Configurações › Atendimento, 5 min a 24 h; padrão `PRAZO_DO_SILENCIO_MS`, 60 min; diagnóstico de @gaberaldo-svg no #2005: clínica que atende o dia inteiro pelo celular nunca via a IA voltar) —, SEM apagar `ai_authorized_at`; volta sozinha quando o prazo vence, ou antes por "devolver ao automático" | **UNIT** — `atendimento-manual.test.ts` (as duas pontas do prazo medidas pelo motor real `decidirElegibilidade`, renovação, e o que NUNCA encurta: `'infinity'` do handoff formal e janela mais longa) + `waha-ingest-atendimento-manual.test.ts` (via `dispatchWahaEvent` real; eco do próprio envio NÃO pausa) + guarda de fonte no Zernio + fiação em `handoff-fantasma-fiacao.test.ts` + o prazo da empresa em `atendimento-manual.test.ts` (15 min gravado; erro/exceção ao ler o ajuste ainda pausa com 60; `#off` nem consulta) e os valores inválidos em `prazo-silencio-knob.test.ts` + o campo em `app/app/settings/atendimento/_form.test.tsx`; **E2E** — `tests/e2e/j20-elegibilidade-atendimento-manual.spec.ts` (webhook `fromMe` genuíno → `bot_silenced_until` finito e futuro, nunca `'infinity'`, + rastro; `ai_authorized_at` intacto; 2ª mensagem RENOVA o prazo; tela mostra o selo; "devolver ao automático" solta a trava e a autorização continua) |
 | J20.19 | Worker parado acorda com backlog; dois inbound antigos com o MESMO `sent_at` | a "última inbound" é a mais RECENTE (por `created_at`), nunca a de maior uuid — o evento antigo é pulado | **INVARIANTE** — `tests/invariants/drain-recencia-inbound.test.ts` (Postgres real) + `drain.test.ts` guarda a cláusula `coalesce(sent_at, created_at)` |
 
 **Sabotagem que confirma:** removendo o veto `sem_autorizacao` de
@@ -1123,6 +1274,77 @@ espaço e acento, que era o gatilho do defeito #6.
 | 16 | `lib/audit/index.ts` | Falha de audit só fazia `console.error` — foi o que manteve #15 invisível | doutrina exige alerta no Sentry |
 | 17 | crons de follow-up/snooze | **95% do audit log** era batida de cron vazia (1.175 de 1.236 linhas em ~9h paradas) numa tabela append-only com retenção de 5 anos | contagem por `action` |
 
+## J35 — Achar onde se liga cada recurso opcional `[P1]` (2026-09-28)
+
+**Origem:** pedido do mantenedor (doc 73; desenho no doc 80) — "até agora não
+entendi onde ficam os lugares para ativar/desativar". Os módulos se ligavam numa
+tela chamada "Comportamento", as chaves da empresa em pelo menos nove telas, e
+os recursos que dependem do servidor em tela nenhuma.
+
+| Caso | Spec | Estado |
+|---|---|---|
+| Admin da empresa chega a Configurações › Recursos opcionais pelo hub, vê a lista e o **Ajustar** de "A conversa fica com quem atendeu" o leva a Distribuição de atendimento | `tests/e2e/recursos-opcionais.spec.ts` | CI (PARTE_2) |
+| Dono do servidor acha **Recursos opcionais** no menu do Admin; a tela tem Módulos, Comportamento e Depende do servidor (só leitura, "configurado"/"não configurado") | idem | CI (PARTE_2) |
+| Módulo/porta novo fora da lista reprova | `tests/unit/recursos-opcionais-catalogo.test.ts` | unit |
+
+**Não coberto pela tela:** gerente vendo a lista sem os botões de telas de admin
+(regra no `page.tsx`, sem spec); telefonia por SIP é "não dá para ver daqui" —
+ela vive nos contêineres, fora do alcance do app.
+
+## J36 — Perguntar ao acervo sem sair da conversa `[P1]` (2026-09-28)
+
+**Origem:** #1869 (F1+F2), contribuição de @webtecnica no #1877. O atendente
+consulta o material da empresa pela caixa "Acervo" no painel da conversa, com a
+mesma busca que a IA usa; a pergunta vira linha em `knowledge_searches` com
+`author_kind='human'`, e a Evolução a mostra num gráfico próprio.
+
+| Caso | Spec | Estado |
+|---|---|---|
+| Atendente abre a conversa, pergunta na caixa "Acervo" e recebe o diagnóstico (acervo vazio, ou 409 de chave ausente), nunca o erro genérico | `tests/e2e/busca-na-conversa.spec.ts` | CI (PARTE_3) |
+| 429 por pessoa/organização, pergunta > 1000 caracteres, agentId não-uuid, 409 sem chave | `app/api/v1/ai/knowledge/busca/route.test.ts` | unit |
+| Busca da equipe fora das lacunas do agente e numa série própria | `lib/ai/evolution/aggregate.test.ts` | unit |
+
+**Não coberto:** a busca com material indexado e chave de embedding real (nenhum
+e2e do CI tem chave); o gráfico "Consultas da equipe ao acervo" em tela.
+
+## J37 — Suspender uma empresa cala a IA e os envios dela `[P0]` (2026-09-29)
+
+**Origem:** PR 1 da cobrança do revendedor
+(`docs/superpowers/specs/2026-09-29-cobranca-do-revendedor-design.md`, §1.3, §4 e §9).
+Antes, suspender só tirava a pessoa da tela: a IA, o follow-up, as automações,
+o token de API e o MCP seguiam funcionando, e quem tinha acesso só de leitura ao
+painel suspendia e reativava empresas.
+
+| Caso | Spec | Estado |
+|---|---|---|
+| Quem só tem leitura clica em Suspender: a resposta é 403 `forbidden_scope`, a tela mostra o erro, e a empresa segue ativa | `tests/e2e/suspensao-administrativa.spec.ts` | CI (PARTE_6) |
+| O dono suspende pela tela; o turno agendado e a resposta na fila viram `failed`; o gate (pelo PostgREST real) passa a negar | idem | CI (PARTE_6) |
+| Status, fila e evento mudam numa transação só (`fn_suspender_organizacao`): dentro dela o evento já existe, e o rollback desfaz status, evento e o turno agendado juntos. A tela só confere o resultado depois | `tests/invariants/org-suspensa.test.ts` | test:db |
+| A admin da empresa suspensa cai no hub: pedido de LGPD abrindo no próprio hub; o clique em "Voltar para" a empresa que opera leva ao inbox dela | `tests/e2e/suspensao-administrativa.spec.ts` | CI (PARTE_6) |
+| `/app/inbox` volta para o hub; o token `dsk_` da empresa responde 403 `org_suspended` | idem | CI (PARTE_6) |
+| A captação por `webhooks/in/[token]` é gravada durante a suspensão; nenhuma `llm_calls` nem mensagem de saída nasce | idem | CI (PARTE_6) |
+| A atendente da empresa suspensa lê "Avise o administrador da sua empresa", sem LGPD; "Sair" encerra a sessão e `/app` manda ao login | idem | CI (PARTE_6) |
+| O dono reativa: nada sai em rajada, e a Central mostra o aviso que leva ao Inbox | idem | CI (PARTE_6) |
+| O aviso de reativação conta só conversa que não é de grupo, diz só o fato, e a orientação manda procurar nas abas Fila e Automático (numa empresa com IA a conversa sem dono está em Automático) | `tests/invariants/org-suspensa.test.ts`, `lib/ai/inbox-destino.ts` | test:db |
+| Hub: empresa que opera volta para `/app`, pedido inválido cai na lista, leitura que falha lança | `app/account-suspended/page.test.tsx` | unit |
+| O aviso de reativação leva ao Inbox só para quem atende, e nunca por referência | `lib/ai/inbox-destino.test.ts` | unit |
+| O agendador pula o follow-up da empresa parada, no Postgres real | `tests/invariants/cron-org-parada.test.ts` | test:db |
+| O lembrete da agenda não sai nem abre conversa para a empresa parada | `tests/unit/lembrete-pula-org-parada.test.ts` | unit |
+| Suspensão no meio do envio não pausa a prospecção nem tira o destinatário da campanha | `tests/unit/prospecting-worker.test.ts`, `tests/unit/suspensao-nao-dispara-campanha.test.ts` | unit |
+| Quem tem acesso só de leitura ao painel e é membro comum de uma empresa não apaga os dados dela | `tests/unit/zona-de-perigo-apaga-so-a-propria-org.test.ts` | unit |
+
+**Não coberto pela tela:** a suspensão por falta de pagamento e o painel de
+pagamento no hub (PR 3a); a IA calada com um agente publicado de verdade (a
+spec não publica agente — quem prova o veto é `lib/ai/elegibilidade/gate.test.ts`,
+`tests/invariants/org-suspensa.test.ts` e o controle do gate na própria spec);
+APROVAR um pedido de LGPD pelo hub (a spec abre o pedido, não aprova).
+
+**Evidência:** `evidence/suspensao-administrativa/leitura-recusada.png`,
+`evidence/suspensao-administrativa/hub-admin.png`,
+`evidence/suspensao-administrativa/hub-pedido-lgpd.png`,
+`evidence/suspensao-administrativa/hub-atendente.png`,
+`evidence/suspensao-administrativa/central-apos-reativar.png`.
+
 ## Jornadas exercitadas (instalação final, virgem)
 
 | Jornada | Resultado |
@@ -1170,7 +1392,7 @@ espaço e acento, que era o gatilho do defeito #6.
 | 19 | 🟠 **A regra de bloqueio no Caddy não valia**: fora de um bloco `route`, o Caddy reordena e `respond` vem depois de `reverse_proxy` — o catch-all atendia primeiro | após o deploy, o POST sem assinatura ainda respondia 200 | `route { }` para valer a ordem escrita |
 | 20 | 🔴 **Mudança no Caddyfile nunca chegava em quem já instalou.** Bind mount de um arquivo fica preso ao inode; `git pull` cria inode novo e o contêiner segue lendo o antigo | inode 3283869 no host x 3271833 no contêiner, com conteúdo velho, depois de um `update.sh` que disse "concluída" | `update.sh` recria o contêiner do proxy |
 
-**Nota de método:** medi o que o WAHA realmente envia **antes** de escrever o conserto. Os eventos reais chegam **sem assinatura** (2026.7.2 CORE não assina, mesmo com `WHATSAPP_HOOK_HMAC` no contêiner) — o único evento com header no log era a minha própria injeção. Passar a exigir assinatura por padrão derrubaria a ingestão de mensagens de todo mundo: por isso a defesa padrão é de rede, e a exigência de assinatura fica atrás de `WAHA_WEBHOOK_REQUIRE_SIGNATURE` para quem roda WAHA Plus.
+**Nota de método:** medi o que o WAHA realmente envia **antes** de escrever o conserto. Os eventos reais chegavam **sem assinatura** — na época li isso como "2026.7.2 CORE não assina", mas a medição de 2026-10-04 mostrou a causa real: o compose entregava `WHATSAPP_HOOK_HMAC`, nome que não existe na doc do WAHA (o certo é `WHATSAPP_HOOK_HMAC_KEY`), então ele ignorava e nunca assinava. O único evento com header no log era a minha própria injeção. Passar a exigir assinatura por padrão derrubaria a ingestão de mensagens de todo mundo: por isso a defesa padrão é de rede, e a exigência de assinatura fica atrás de `WAHA_WEBHOOK_REQUIRE_SIGNATURE` para quem tem o WAHA assinando.
 
 **Efeito colateral no mundo real, registrado:** ao conectar o WhatsApp **pessoal** do dono, o agente começou a responder contatos reais (4 respostas automáticas para 2 pessoas) assinando "assistente virtual da loja". O agente foi despublicado. Recomendação: testar agente com número descartável, e avaliar um modo "só observa" para primeira conexão.
 
@@ -1579,6 +1801,24 @@ grupo IA já usava.
 grampeado no `clientHeight`, então "excesso 0" e "sobra 200px" dão o MESMO número.
 Quem quiser saber quanta folga restou tem de medir o `bottom` do último filho
 contra a caixa de conteúdo da `<nav>` — foi assim que os 19px saíram.
+
+## Os contadores do menu: Casos e a Fila (2026-09-27)
+
+Origem: numa loja que vende pelo WhatsApp, a IA abriu um caso e passou duas
+conversas para a equipe numa manhã, e o dono só soube abrindo cada tela e
+procurando. «Casos» sobe para o menu da IA com o número de casos em
+`awaiting_human`, e «Inbox» ganha o número da aba Fila. Para o menu seguir
+cabendo em 1280×900 — a folga medida acima é de 19px, menos de uma linha —,
+«Roteadores» sai do menu no mesmo passo e fica no hub «Ver tudo em IA».
+
+| caso | prioridade | estado |
+|---|---|---|
+| O número de Casos é o da lista de Casos (itens «Aguardando você»), sobe com um caso novo e desce quando ele fecha | `[P1]` | **PASS** (2026-09-27), `tests/e2e/contadores-do-menu.spec.ts` — semeia o próprio caso. Medido: 1 → 2 com o caso, de volta a 1 ao fechar. Evidência: `evidence/contadores-no-menu/01-casos-com-contador.png`, `evidence/contadores-no-menu/02-casos-depois-de-fechar.png` e `evidence/contadores-no-menu/medidas-casos.json` |
+| O número de Inbox é o da aba Fila e desce quando a conversa sai dela | `[P1]` | **PASS** (2026-09-27), mesma spec: 3 na aba e no menu, 2 depois. Evidência: `evidence/contadores-no-menu/03-inbox-com-contador-da-fila.png`, `evidence/contadores-no-menu/04-inbox-depois-de-sair-da-fila.png` e `evidence/contadores-no-menu/medidas-fila.json` |
+| Zero não desenha nada | `[P1]` | `tests/unit/contador-de-casos.test.tsx` e `tests/unit/contador-da-fila.test.tsx`; na spec, quando a organização fica sem pendência |
+| O selo mora dentro do item e não quebra a linha | `[P1]` | **PASS**, medido por `getBoundingClientRect` na spec: selo contido no item, altura do item **28px** = a do vizinho sem selo |
+| O menu continua cabendo em 900px com Casos no lugar de Roteadores | `[P1]` | **PASS**, `tests/e2e/navegacao.spec.ts` (o caso da dobra); a folga medida pela spec nova segue **19px**, sem rolar |
+| Roteadores continua tendo porta (DoD 14) | `[P1]` | `tests/unit/navegacao-completude.test.ts` e o hub «Ver tudo em IA» |
 
 ## O inbox em tempo real — o defeito que veio de fora (2026-08-24)
 
@@ -2853,3 +3093,194 @@ que dirige o browser resolviam `E2E_PORT` para valores **diferentes** — servid
 `page.goto` em outra, e `ERR_CONNECTION_REFUSED` com um servidor saudável no ar. O CI nunca
 pisou nisso porque o gerador não escreve `E2E_PORT`; quem monta bancada em porta própria,
 sim. Consertado pela ordem: publicar primeiro, decidir a porta depois.
+
+
+## Conversões de anúncios — reprocessamento
+
+[P1] `tests/e2e/conversoes-reprocessamento.spec.ts`: administrador abre Conversões sem credenciais opcionais, vê o que falta, identifica origem de uma venda pendente e agenda reprocessamento pela tela. A spec confere o evento exclusivo e captura screenshot; integra o CI. O teste não prova aceite/atribuição por contas reais de anúncios.
+
+### Conversões Google: captura e qualificação
+
+- [P1] `tests/e2e/conversoes-reprocessamento.spec.ts`: salvar captura Google pela tela, recarregar configuração, abrir endereço com wbraid e verificar a referência criada. Destino WhatsApp interceptado; não envia mensagem nem comprova atribuição externa.
+- Componentes: `tests/unit/conversoes-formularios.test.tsx` cobre escolha de etapa/ação, bloqueio da mesma ação de compra e formulário de captura.
+- Banco: `tests/invariants/conversoes-qualificacao-isolada.test.ts` cobre identificadores, isolamento da etapa, snapshot e reprocessamento por evento.
+- Piloto real ainda necessário: anúncio → mensagem → etapa → recibo e diagnóstico da plataforma.
+
+- Script do site: `tests/unit/script-do-site.test.ts` executa o JS distribuído, cobre navegação, filtros, storage bloqueado, links dinâmicos e exclusão. `tests/e2e/conversoes-reprocessamento.spec.ts` instala o snippet copiado da tela em uma página de teste, navega sem query e segue até a captura real, com WhatsApp interceptado.
+
+## J33 — Um roteiro de atendimento coleta dados e a ficha mostra `[P1]` (2026-09-24)
+
+Port do #1130 (@vgamkt), PR 3 de 4. Spec: `tests/e2e/fluxo-de-atendimento.spec.ts` (job e2e, parte 5).
+
+| Caso | Esperado |
+|---|---|
+| J33.1 | O dono do servidor liga «Fluxos de atendimento» em /admin/sistema e a chave fica gravada na instalação |
+| J33.2 | O gerente cria o roteiro em IA › Fluxos de atendimento; a paleta tem SÓ Início, Pergunta, Skill e Fim (medido no DOM) |
+| J33.3 | Palavra-gatilho no Início, uma Pergunta de CPF e uma de lista; publicar grava o gatilho na versão ativa |
+| J33.4 | Três mensagens pelo webhook do WAHA; a ficha mostra o roteiro «Concluído» com CPF e modelo (caixa medida por `boundingBox` e estilo computado) |
+
+**NÃO coberto por esta spec:** o turno do agente roda com o worker e o modelo de verdade — no CI não há nenhum dos dois, e a spec chama as mesmas funções do motor (`prepararRoteiroDoTurno`, `garantirPerguntaDoRoteiro`) com o validador devolvendo `indefinido`. A pergunta enviada ao cliente pelo WhatsApp e a leitura pelo validador de modelo ficam para a prova do PR 4.
+
+## Avisos que pedem gente — a etapa que avisa na Central `[P1]` (2026-09-27)
+
+Migration 0440. Spec: `tests/e2e/etapa-avisa-na-central.spec.ts` (job e2e, parte 2). Organização, administrador, funil e negócio criados pela service role no Supabase local; o movimento do card pela rota do quadro com a sessão do usuário; o dreno do `event_log` chamado pela rota do cron.
+
+| Caso | Esperado |
+|---|---|
+| AV.1 | Em Configurações › Funis, cada etapa mostra «Avisar a equipe na Central quando um negócio entrar aqui», desligada |
+| AV.2 | Ligar a chave numa etapa grava só ela: recarregar a tela mostra a mesma coisa, e a etapa vizinha segue desligada |
+| AV.3 | O negócio que entra na etapa marcada abre na Central «Negócio entrou em «<etapa>»», sem o nome do cliente |
+| AV.4 | O negócio que entra numa etapa SEM a marca não abre aviso |
+| AV.5 | «Abrir negócio» leva ao negócio dentro do funil (`/app/pipelines/<funil>?lead=<id>`) |
+
+**NÃO coberto por esta spec:** o movimento pelo assistente de IA (o mesmo evento `lead.stage_changed`, emitido por `agent-stage-sync.ts`) e o arrasto do card com o mouse — os dois têm spec própria e chegam ao mesmo handler.
+
+Evidência: `evidence/etapa-avisa-na-central/01-chave-ligada-na-etapa.png` (a chave ligada na etapa), `evidence/etapa-avisa-na-central/02-aviso-na-central.png` (o aviso na Central, sem o nome do cliente) e `evidence/etapa-avisa-na-central/03-abrir-negocio.png` (o negócio aberto pelo botão).
+
+### Os sons dos avisos `[P1]` (2026-09-27)
+
+Migration 0441. Spec: `tests/e2e/sons-dos-avisos.spec.ts` (job e2e, parte 1). O som é medido trocando, antes de a página carregar, `HTMLMediaElement.prototype.play` e `AudioContext.prototype.createOscillator` por versões que anotam a chamada — a decisão de tocar, qual som e quando são do produto.
+
+| Caso | Esperado |
+|---|---|
+| AV.6 | A gestora vê «Sons dos avisos» em Configurações › Notificações, com «Etapa que avisa» e «Precisa de uma pessoa» no som do sistema |
+| AV.7 | Um arquivo de texto com nome `.mp3` é recusado («O som precisa ser MP3, OGG ou WAV.») e nada muda no banco |
+| AV.8 | Um WAV entra: a tela diz «Som personalizado», o caminho fica em `settings.sons_de_aviso` sob a pasta da organização e o arquivo está no bucket `org-sounds` |
+| AV.9 | «Usar o do sistema» tira a chave e apaga o arquivo |
+| AV.10 | A visualizadora vê o som que vale e o botão «Ouvir», mas não vê «Trocar som» nem «Usar o do sistema» |
+| AV.11 | Com o site aberto, o aviso antigo não toca; a passagem NOVA toca o arquivo da organização (URL assinada); a etapa que avisa NOVA, sem arquivo, toca o bipe do produto |
+
+**NÃO coberto por esta spec:** o som saindo de um alto-falante de verdade, e o navegador que recusa áudio antes de a pessoa interagir (o hook cai no bipe e, se nem isso, o aviso segue visível).
+
+Evidência: `evidence/sons-dos-avisos/01-som-personalizado.png` (a gestora com o som escolhido para «Precisa de uma pessoa») e `evidence/sons-dos-avisos/02-visualizadora.png` (a visualizadora, sem o botão de trocar).
+
+### O push dos avisos no celular `[P1]` (2026-09-27)
+
+Migration 0442. **Sem spec de tela, e é declarado:** o que muda é o que chega a um celular com o CRM fechado, e o CI não tem aparelho nem serviço de push de navegador. A regra (quais avisos, texto no idioma da organização, sem dado do cliente, destino da Central) está em `tests/unit/push-dos-avisos.test.ts`; o anúncio do aviso no barramento, contra Postgres, em `tests/invariants/aviso-da-central-no-barramento.test.ts`.
+
+**NÃO coberto:** a notificação aparecendo num celular de verdade (Android/iPhone), com o par VAPID configurado.
+
+### Continuação de conversões: links nomeados (27/09/2026)
+
+- [P1] Configurações → Conversões → Links rastreáveis: criar, recarregar, editar/desativar, copiar link/script e verificar instalação.
+- Unidade: `tests/unit/links-rastreaveis.test.ts`, `tests/unit/links-rastreaveis-action.test.ts`, `tests/unit/script-do-site.test.ts` cobrem captura, fallback, tenant, MFA e compatibilidade.
+- Banco: `tests/invariants/links-rastreaveis-isolados.test.ts` cobre ACL e FK composta; execução local pendente por ausência de Docker.
+- Prova visual em ambiente fresco e envio real ao Google/Meta ainda pendentes; unitários não substituem estes aceites.
+
+## J34 — Achar uma mensagem dentro da conversa aberta `[P1]` (2026-09-27)
+
+Busca nas mensagens já carregadas (#1795, extraída do #1793 de @gustavorodcruz96).
+Spec: `tests/e2e/busca-na-conversa.spec.ts` (job e2e, parte 3; seed próprio: um
+canal e duas conversas, a B também contém o termo para o "não vaza" não passar por
+falta do que marcar). Evidência: `evidence/busca-na-conversa/` (gerada no job;
+o CI só publica artefato em falha). Medido no run 36309605444, parte 3, head
+`5ece7265f`: `✓ busca-na-conversa.spec.ts (8.8s)`, parte `90 passed`.
+
+| # | Caso | Expectativa | Resultado |
+|---|------|-------------|-----------|
+| J34.1 | A lupa não faz a barra de ações quebrar | `aria-expanded="false"`; fileiras da barra com a lupa = sem ela (1280px, `getBoundingClientRect`, filhos sem caixa fora da conta) | PASS — a lupa não acrescenta fileira: 2 com ela e 2 sem ela (contrafactual `display:none`); a barra já quebrava em 2 nesse estado (Arquivar desce) |
+| J34.2 | Clicar abre o campo com o foco | `searchbox` "Buscar nas mensagens carregadas" focado | PASS |
+| J34.3 | Termo em 2 de 4 mensagens (uma em maiúsculas) | contador "Resultados nas mensagens carregadas: 2"; as 2 bolhas com o anel no `box-shadow` COMPUTADO (`0 0 0 4px`, cor ≠ fundo), uma enviada e uma recebida; as outras 2 sem anel | PASS — anel `rgb(28, 26, 22) 0 0 0 4px` sobre recebida `rgb(245, 243, 238)` e enviada `rgb(80, 109, 72)`; sem anel nas outras |
+| J34.4 | Esc fecha | campo, contador e marcas somem; o foco volta à lupa | PASS |
+| J34.5 | Trocar de conversa pela lista, sem recarregar | a conversa B (que tem o termo) abre sem campo, sem contador e sem marca; abrir a busca nela começa vazia | PASS |
+
+## J38 — Enviar e classificar a resposta: o cliente tem o prazo inteiro `[P1]` (2026-09-26)
+
+O fluxo mais natural do construtor: uma mensagem e, logo depois, o passo
+"Classificar resposta" com um prazo de espera. A tela promete que o cliente tem
+esse prazo para responder; só depois dele o fluxo segue por "Sem resposta".
+
+**Achado de origem (medido na `main` 610142d21):** o turno de classificar rodava
+segundos depois do envio, não via resposta e concluía `no_reply` sozinho — o
+fluxo saía por "Sem resposta" sem o prazo correr. Consertado em
+`lib/agent-engine/agent/followup-turn.ts`; a verificação cética do conserto
+achou três defeitos irmãos, consertados na mesma branch:
+
+1. **O desfecho sumia.** Com a saída "sem resposta" acontecendo só pela carência
+   vencida (tick do motor), o evento era `node_advanced` sem classe, e a
+   condição "Desfecho do passo anterior" (#527) lia `null` — o mesmo grafo e o
+   mesmo lead iam para `e_sim` na `main` e para `e_nao` depois do 1º conserto.
+   Agora o avanço grava `class: "no_reply"` e `ultimoDesfechoDe` o lê.
+2. **A resposta sumia quando o agente respondia primeiro.** O candidato era "a
+   última inbound depois do último outbound de QUALQUER um". Numa organização
+   com agente ativo, o agente responde na hora e o job de classificar sai no
+   tick seguinte: nenhum candidato, carência recomeçando, saída por "Sem
+   resposta" com o cliente tendo respondido. Agora é a resposta do lead ao
+   ENVIO DO FLUXO (o último outbound até o `action_sent`), pela posição no
+   histórico.
+3. **A espera parecia travamento.** O dossiê mostrava "Pediu ao agente para
+   interpretar a resposta" e mais nada por até o prazo inteiro. Agora o turno
+   que espera grava `classify_waiting`, lido como "Esperando a resposta do
+   cliente — se ele não responder até <hora>, o fluxo segue sem a resposta"; e a
+   saída pelo prazo vencido é lida como "O cliente não respondeu dentro do prazo".
+
+| # | Caso | Esperado | Resultado |
+|---|------|----------|-----------|
+| J38.1 | Sem resposta, o 1º job roda | o enrollment segue no classificar, em `waiting_reply`, com o prazo inteiro; job `done` em 1 tentativa; uma linha "Esperando a resposta do cliente" no dossiê | PASS no `test:db` (`followup-classificar-espera-a-resposta.test.ts`, catraca; `followup-classificar-ciclo-completo.test.ts`, caso D) |
+| J38.2 | A resposta chega DEPOIS do job vazio | reatividade (linha REAL de `event_log`) acorda o nó, o tick enfileira o 2º job sem forçar relógio, e ele classifica pela classe | PASS no `test:db` (ciclo completo, caso A) |
+| J38.3 | O lead responde e o AGENTE responde antes do job | a resposta do lead ao envio do fluxo é a classificada; o texto do agente não vai ao modelo | PASS no `test:db` (caso C) e em unit (`tests/unit/followup-classificar-sem-resposta.test.ts`) |
+| J38.4 | A resposta chega entre o envio e a 1ª entrada no classificar | o 1º job já classifica | PASS no `test:db` (caso E) |
+| J38.5 | Ninguém responde até o prazo vencer | o motor sai por "Sem resposta" sem chamar o modelo e grava o desfecho `no_reply` | PASS no `test:db` (caso B; controle 2 do arquivo irmão) |
+| J38.6 | Condição "Desfecho do passo anterior" depois de "Sem resposta" | `last_outcome = no_reply`; com a classe "não quer", a mesma condição vai para o outro ramo | PASS no `test:db` (ciclo completo, `describe` do #527) e em unit (`followup-desfecho-do-passo-anterior.test.ts`) |
+| J38.7 | O dossiê do enrollment pela TELA | as duas linhas novas aparecem em português | **PASS** em tela — as duas specs verdes contra `pnpm e2e:build` numa bancada fresca com as sementes do CI (26/09, `5 passed`; capturas `evidence/followup-dossie/08-classificar-sem-resposta.png` e `e2e-artifacts/followup-8.3-035-dossie-esperando-resposta.png`): "Esperando a resposta do cliente" na jornada (`followup-journey.spec.ts`, passo 6 — `awaiting_reply` injetado pelo seam `complete-turn`, dossiê aberto pela fila) e as duas frases em `followup-dossie.spec.ts` (classificar sem resposta → carência vencida pelo cron). Até rodar, a prova é a mesma `descreveEvento` que a tela chama, sobre a linha REAL do banco (caso D/B), e `lib/followup/eventos-legiveis.test.ts` |
+| J38.8 | Dois envios e dois classificar: sem resposta à 2ª oferta | o 2º classificar espera — a resposta à 1ª oferta NÃO é classificada de novo; com resposta à 2ª, é ela a lida | PASS no `test:db` (`followup-classificar-le-o-envio-mais-recente.test.ts`); sabotado `max` → `min` em `envioDoFluxoFechadoEm`, o caso sem resposta reprova (`e_nao`) |
+
+Sabotagens medidas (cada conserto desfeito, o teste fica vermelho, restaurado com
+`cp -p` e conferido com `cmp`): sem a classe no avanço, B e o desfecho reprovam
+(`e_nao` no lugar de `e_sim`); `ultimoDesfechoDe` lendo só `ai_classified`, o
+desfecho reprova; o candidato antigo, C reprova (e 3 casos em unit); a janela por
+horário em vez de posição, o caso do mesmo segundo reprova; sem o rastro, D
+reprova; o nó sem reenfileirar no despertar, A e C reprovam.
+
+**Fica declarado:** sem nenhum envio do fluxo antes do classificar (classificar
+logo depois do acionamento), vale a regra antiga — a inbound que ninguém
+respondeu; se a mensagem do fluxo saiu da janela do histórico (`historyLimit`),
+vale o horário, no segundo. Uma inbound sem texto acorda o nó, não é
+classificada, e a carência recomeça desse despertar (comportamento anterior do
+motor, não mexido aqui).
+
+## J39 — O fluxo de silêncio espera antes de recomeçar para quem já passou por ele `[P1]` (2026-09-27)
+
+Contexto do código: num fluxo de silêncio com `cancel_on_reply`, cada resposta do
+cliente cancelava a inscrição e a varredura seguinte o inscrevia de novo, do
+primeiro passo, depois do limiar (medido numa instalação real: uma oferta nova a
+cada "obrigado"; dois contatos em laço de ~95 reinscrições). O cooldown da
+varredura não segura esse caso: ele conta o limiar desde o fim da tentativa, e a
+resposta que encerra a inscrição é a mesma que começa o silêncio. A pausa
+(`trigger_config.params.reentry_pause_minutes`, regra em
+`lib/followup/pausa-de-reentrada.ts`) só vale se a TELA a grava e a preserva — o
+formulário do gatilho remonta os `params` a partir dos campos.
+
+Spec: `tests/e2e/pausa-de-reentrada.spec.ts`.
+
+| # | Caso | Expectativa | Resultado |
+|---|------|-------------|-----------|
+| J39.1 | Pôr 48 h no campo «Pausa antes de recomeçar (horas)» e salvar | o banco guarda `reentry_pause_minutes: 2880`; o botão diz «pausa de 48 h» | **PASS pela tela** — Evidência: `evidence/triagem-16set-l12/pausa-01-campo-preenchido.png`, `evidence/triagem-16set-l12/pausa-02-rotulo-com-pausa.png` |
+| J39.2 | Editar OUTRO campo do gatilho | a pausa sobrevive | **PASS pela tela** |
+| J39.3 | Zerar a pausa | a chave sai do gatilho (comportamento de antes) | **PASS pela tela** |
+| J39.4 | Quem encerrou uma inscrição há menos que a pausa / quem nunca passou / conversa com pessoa no comando / sem pausa (só o cooldown) | pula / entra / pula (salvo `handoff_policy='allow'`) / entra de novo no limiar | **PASS (invariante)** — `tests/invariants/followup-silence-sweep.test.ts` |
+| J39.5 | Teto do silêncio: 5 com mínimo 10 é recusado; 60 é gravado e o botão mostra «10–60 min»; na varredura, quem está calado há 20 min entra e há 3 h fica de fora | tela + invariante | **PASS pela tela** — Evidência: `evidence/triagem-16set-l12/silencio-01-teto-de-60.png`; invariante no mesmo arquivo de J39.4 |
+| J39.6 | Pausa de 24 h contada do último envio (a opção só aparece com pausa > 0) | o banco guarda `reentry_pause_basis: "ultimo_envio"`; o botão diz «no máximo 1× a cada 24 h»; desligar tira a chave; na varredura, quem encerrou há 25 h e escreveu há 20 min entra (pela base padrão, fica na pausa) | **PASS pela tela** — Evidência: `evidence/triagem-16set-l12/pausa-03-base-do-ultimo-envio.png`; invariante no mesmo arquivo de J39.4 |
+
+## J40 — O pino de localização chega com a rua e a cidade aproximadas `[P1]` (2026-09-28)
+
+Contexto: medido numa loja, 10 de 10 pinos do mês chegaram só com coordenadas —
+o agente lia um link e perguntava a cidade de novo. Com a chave da Geocoding API
+(Agente de IA › Provedores, cartão «Mapas (Google)»; tabela
+`map_provider_credentials`, migration 0504; regra em `lib/mapas/`), o pino ganha
+o endereço aproximado no corpo (o que o agente lê) e no cartão do pino da
+conversa. Os nomes vêm no idioma da organização (`organizations.locale`, pelo
+registro de idiomas).
+
+Spec: `tests/e2e/mapas-em-provedores.spec.ts`.
+
+| # | Caso | Expectativa | Resultado |
+|---|------|-------------|-----------|
+| J40.1 | Admin cola a chave e grava | o banco guarda a chave CIFRADA e os 4 últimos; a tela mostra «Chave gravada ···XXXX», limpa o campo, e a chave não aparece no HTML | **PASS pela tela** — Evidência: `evidence/triagem-16set-l12/mapas-01-chave-colada.png` |
+| J40.2 | «Testar» com chave recusada pelo Google | a tela explica a recusa (API não habilitada × chave recusada são mensagens diferentes), nunca «Funcionou» | **PASS pela tela** — Evidência: `evidence/triagem-16set-l12/mapas-02-teste-explica-a-recusa.png` |
+| J40.3 | Remover a chave | a linha sai do banco e o cartão volta a «Sem chave» | **PASS pela tela** |
+| J40.4 | Pino recebido com chave / sem chave / Google fora | corpo com «… (aprox.)» / corpo idêntico ao de antes e nenhuma chamada ao Google / corpo de antes | **PASS (unit)** — `tests/unit/mapas-pino-com-endereco.test.ts` |
+| J40.5 | A tabela não é servida pelo PostgREST | `anon`/`authenticated` sem privilégio, `permission denied`, RLS ligada sem policy | **PASS (invariante)** — `tests/invariants/credencial-de-mapas-e-server-side.test.ts` |
+| J40.6 | O que o Google diz × o endereço anotado em 8 pedidos confirmados (28/09/2026, numa instalação real) | município 8/8, região 8/8, localidade 7/8 (na zona rural virou o povoado), rua 3/5, bairro 1/8, número interpolado → a cidade é o MUNICÍPIO; bairro e número não saem | **MEDIDO em produção** (fora deste repositório); regra em `tests/unit/mapas-pino-com-endereco.test.ts` |
+| J40.7 | O pino com endereço aproximado, aberto na conversa pela equipe | o cartão do pino mostra «Rua, Cidade, Estado (aprox.)», com o texto inteiro no `title` (o cartão corta com …) e o toque abre as COORDENADAS no mapa | **PASS pela tela** — Evidência: `evidence/triagem-16set-l12/mapas-03-pino-na-conversa.png` |
+| J40.8 | A API do canal intermediado não responde a tempo na ingestão do pino (medido 29/09/2026: timeout duas vezes seguidas) | a mensagem entra com o marcador e pede nova busca (`message.location_retry_requested`); 1 min depois, e a cada 2 min até 15, busca de novo e grava tipo `location` + link (+ endereço aproximado com chave); nunca rebaixa um pino que já tem coordenadas; desiste sem virar incidente | **PASS (unit)** — `tests/unit/pino-reintento.test.ts`, `tests/unit/channel-ingest-zernio.test.ts` |
